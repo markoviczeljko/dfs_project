@@ -1,0 +1,37 @@
+# Build output
+build/
+cmake-build-*/
+out/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled objects / binaries
+*.o
+*.obj
+*.so
+*.a
+*.exe
+*.out
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Local design/planning docs — kept local only, not pushed to GitHub
+/dfs_design_notes.md
+/IMPLEMENTATION_PLAN.md
+
+# Logs / runtime data
+*.log
+/data/
+/logs/
