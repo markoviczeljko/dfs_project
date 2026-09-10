@@ -12,5 +12,13 @@ FetchContent_MakeAvailable(googletest)
 add_executable(test_common_types unit/test_common_types.cpp)
 target_link_libraries(test_common_types PRIVATE common gtest_main)
 
+add_executable(test_protocol unit/test_protocol.cpp)
+target_link_libraries(test_protocol PRIVATE network gtest_main)
+
+add_executable(test_serialization unit/test_serialization.cpp)
+target_link_libraries(test_serialization PRIVATE network gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
+gtest_discover_tests(test_protocol)
+gtest_discover_tests(test_serialization)

@@ -39,3 +39,33 @@ Dizajn dokument predviđa da ceo kod živi u pod-folderu
 `distributed-file-system/`. Pošto se git repo već zove `dfs_project`,
 taj dodatni nivo ugnježdenosti je izostavljen — sav kod ide direktno u
 koren repoa.
+
+## 5. Faza 1 — Network Protocol
+
+**Payload limiti.** §5.17 pominje `MAX_CONTROL_MESSAGE_SIZE` i
+`MAX_DATA_MESSAGE_SIZE` samo konceptualno, bez konkretnih vrednosti.
+Usvojeno: `MAX_CONTROL_MESSAGE_SIZE = 64 KB` (dovoljno za metadata/LIST
+odgovore), `MAX_DATA_MESSAGE_SIZE = BLOCK_SIZE + 4 KB` (pun 64 MB blok
+plus mali overhead za block_id/checksum/veličinu polja).
+
+**Prošireni `MessageType` enum.** §5.8 daje početnu listu tipova i
+najavljuje da će se dopunjavati kasnije. Da bi wire format ostao
+stabilan kroz sve naredne faze, enum je odmah proširen svim tipovima
+pomenutim kroz §5/§6/§7/§8/§9: `REPLICATE_BLOCK`, `GET_BLOCK_INFO`
+(§5.23), `WRITE_COMMIT`, `APPEND_COMMIT`, `COPY_BLOCK`, i `READ_OK`,
+`NOT_MODIFIED`, `STALE_VERSION` (§9.8, conditional READ). Handleri za
+većinu ovih tipova ne postoje još — samo je rezervisan slot u protokolu.
+
+**Error-handling stil u network sloju.** §17.10 skicira `void
+connect(...)` i `Socket accept()`. Umesto toga, `Socket::connect/bind/listen`
+vraćaju `ErrorCode` (ne `void`), a `Socket::accept()` vraća `Result<Socket>`
+— u duhu odluke iz Faze 0 da se greške eksplicitno signaliziraju, a ne
+gutaju ćutke. `TCPConnection::sendMessage`/`receiveMessage` prate doslovne
+signature iz §5.16 (`bool` / `std::optional<Message>`), pošto su tamo već
+eksplicitno date.
+
+**Payload strukture po operaciji nisu deo ove faze.** Dokument ne
+definiše CREATE/READ/WRITE/APPEND/DELETE/LIST/STAT payload formate na
+nivou bajtova nigde (§6/§7 opisuju tok, ne wire layout). Payload ostaje
+opaque `std::vector<std::byte>` na nivou `Message` strukture; konkretni
+formati se definišu u fazama koje implementiraju te operacije.
