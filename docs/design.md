@@ -69,3 +69,33 @@ definiše CREATE/READ/WRITE/APPEND/DELETE/LIST/STAT payload formate na
 nivou bajtova nigde (§6/§7 opisuju tok, ne wire layout). Payload ostaje
 opaque `std::vector<std::byte>` na nivou `Message` strukture; konkretni
 formati se definišu u fazama koje implementiraju te operacije.
+
+## 6. Faza 2 — BlockStorage
+
+**Koja `BlockStorage` API verzija je usvojena.** Dokument sadrži tri
+međusobno različita sketch-a (§4.7: camelCase + `std::optional`, §17.4:
+snake_case + goli `vector`, §7: camelCase + `copyBlock`). Usvojena je
+snake_case verzija iz §17.4 (`write_block`/`read_block`/`delete_block`/
+`block_exists`), sa Faza 0/1 `ErrorCode`/`Result<T>` konvencijom umesto
+doslovnog `bool`/goli `vector`, pošto nijedan sketch nije uzimao u obzir
+tu (kasniju) odluku. `copyBlock` iz §7 je van obima — pripada replikaciji
+(kasnija faza).
+
+**Checksum algoritam: CRC-32.** Dokument nigde ne imenuje konkretan
+algoritam. CRC-32 (IEEE 802.3 polinom) je dovoljan jer dokument
+eksplicitno kaže da checksum služi samo za detekciju slučajne korupcije,
+ne za bezbednost (§4.6).
+
+**Dodatni fsync direktorijuma posle rename().** §4.10 opisuje
+`write+fsync+rename`, ali ne pominje da i sam direktorijum treba
+`fsync`-ovati da bi `rename()` bio garantovano trajan posle pada sistema
+(POSIX zahtev). Dodato kao svesno poboljšanje u odnosu na doslovni tekst.
+
+**Nema posebnog `local_index` fajla.** §4.3 prikazuje
+`metadata/local_index` u strukturi direktorijuma, ali format nigde nije
+definisan, a §4.15 recovery procedura eksplicitno radi pun disk-scan.
+Odlučeno je da se ne uvodi nespecifikovan format — recovery je uvek
+potpuno rekonstruisan skeniranjem `blocks/` fajlova.
+
+**`.tmp` fajlovi se brišu pri recovery-ju**, ne samo ignorišu — sprečava
+gomilanje zaostalih fajlova od prekinutih write operacija.

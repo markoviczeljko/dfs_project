@@ -1,4 +1,5 @@
 # Architecture
+Posljednja sesija:  /home/zeljko/.claude/session-data/2026-09-12-dfs-phase1-network-session.tmp
 
 Sistem se sastoji od tri tipa procesa:
 
