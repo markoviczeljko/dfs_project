@@ -25,5 +25,11 @@ add_library(storage
 target_include_directories(storage PUBLIC include)
 target_link_libraries(storage PUBLIC common Threads::Threads)
 
+add_library(master
+    src/master/namespace.cpp
+)
+target_include_directories(master PUBLIC include)
+target_link_libraries(master PUBLIC common Threads::Threads)
+
 enable_testing()
 add_subdirectory(tests)

@@ -125,3 +125,38 @@ na `BlockStorage` nivou; ne izmišlja se nespecifikovan API sloj.
 **`release_block` vraća `ErrorCode`, ne `bool`** (ista adaptacija kao
 za `BlockStorage::write_block`/`delete_block` u Fazi 2), i idempotentan
 je — brisanje već obrisanog/nepostojećeg bloka nije greška.
+
+## 8. Faza 4 — NamespaceManager
+
+**`BlockMetadata`: usvojena §7.3 verzija nad §3.4.** Dokument ima dve
+definicije — §3.4 (bez `version`/`state`) i §7.3 (kasnija, dodaje oba
+polja). Usvojena je §7.3 verzija, sa `StorageNodeId` umesto `NodeId`
+(dosledno sa `common/types.h` iz Faze 0).
+
+**`BlockState` je definisan kao tip sada, logika dolazi u Fazi 12.**
+Enum (`ALLOCATED/WRITING/COMMITTED/UNDER_REPLICATED/RECOVERING/
+CORRUPTED/DELETING`) postoji u `master/metadata.h`, ali tranzicije
+između stanja implementira Master-ovo recovery knjigovodstvo — ova
+faza ga ne koristi aktivno.
+
+**Direktorijumi su implicitni prefiksi putanja, ne posebni entiteti.**
+Dokument nigde ne definiše `MKDIR` niti direktorijum-kao-entitet.
+`list_files("/data")` pronalazi decu na osnovu toga koje putanje
+postojećih fajlova počinju sa `/data/` — nema eksplicitnog kreiranja
+direktorijuma, pa prazan/nepostojeći prefiks uvek vraća praznu listu,
+nikad grešku.
+
+**Pravila validacije putanje** (potpuno nespecifikovana u dokumentu):
+mora početi sa `/`; bez praznih segmenata (dupli `/`); bez `.`/`..`
+segmenata; nevalidna putanja → `INVALID_REQUEST`. `"/"` je validan
+argument za `list_files` (koren), ali ne i za `create_file`/
+`delete_file` (koren nije fajl).
+
+**`create_file`/`delete_file` vraćaju `ErrorCode`, ne `bool`** (§17.3
+sketch koristi goli `bool`, nedovoljno da razlikuje
+`FILE_ALREADY_EXISTS`/`FILE_NOT_FOUND`) — ista adaptacija kao svuda
+dosad.
+
+**`FileId` brojač je trajan izvor istine**, za razliku od `BlockId`-a
+u Fazi 3 — `NamespaceManager` jeste sâm Master-ov namespace sloj, nema
+spoljne komponente koja bi kasnije preuzela generisanje `FileId`-a.

@@ -24,9 +24,13 @@ target_link_libraries(test_block_storage PRIVATE storage gtest_main)
 add_executable(test_block_manager unit/test_block_manager.cpp)
 target_link_libraries(test_block_manager PRIVATE storage gtest_main)
 
+add_executable(test_namespace unit/test_namespace.cpp)
+target_link_libraries(test_namespace PRIVATE master gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
 gtest_discover_tests(test_protocol)
 gtest_discover_tests(test_serialization)
 gtest_discover_tests(test_block_storage)
 gtest_discover_tests(test_block_manager)
+gtest_discover_tests(test_namespace)
