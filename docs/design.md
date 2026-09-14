@@ -99,3 +99,29 @@ potpuno rekonstruisan skeniranjem `blocks/` fajlova.
 
 **`.tmp` fajlovi se brišu pri recovery-ju**, ne samo ignorišu — sprečava
 gomilanje zaostalih fajlova od prekinutih write operacija.
+
+## 7. Faza 3 — BlockManager
+
+**`allocate_block()` je privremeni lokalni generator, ne finalni izvor
+`BlockId`-a.** Dizajn dokument (§3.7, §3.9, §6.4) eksplicitno kaže da je
+generisanje `BlockId`-eva Master-ova odgovornost. Ovde implementiran
+rastući brojač zaštićen mutex-om služi isključivo za samostalno
+testiranje ove faze. Kad se u Fazi 5 umreži pravi tok, Master postaje
+izvor `BlockId`-eva, a ovaj lokalni generator prestaje da bude
+relevantan za stvarni sistem.
+
+**`write_block`/`read_block` namerno ne zahtevaju prethodnu lokalnu
+alokaciju.** Storage Node će u Fazi 5 primati `WRITE_BLOCK` sa ID-em
+koji je Master već dodelio — nikad lokalno alociranim. Zato ove dve
+metode čisto prosleđuju pozive `BlockStorage`-u, bez provere da li je
+`id` prošao kroz `allocate_block()`.
+
+**Bez `used_space`/`free_space`/`block_exists` na `BlockManager`
+nivou.** §17.5 prozni opis pominje "free-space accounting" kao
+odgovornost, ali ni C++ sketch ni `IMPLEMENTATION_PLAN.md`-ova lista
+metoda za ovu fazu to ne uključuju. Accounting ostaje dostupan direktno
+na `BlockStorage` nivou; ne izmišlja se nespecifikovan API sloj.
+
+**`release_block` vraća `ErrorCode`, ne `bool`** (ista adaptacija kao
+za `BlockStorage::write_block`/`delete_block` u Fazi 2), i idempotentan
+je — brisanje već obrisanog/nepostojećeg bloka nije greška.

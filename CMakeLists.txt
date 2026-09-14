@@ -20,6 +20,7 @@ target_link_libraries(network PUBLIC common Threads::Threads)
 
 add_library(storage
     src/storage/block_storage.cpp
+    src/storage/block_manager.cpp
 )
 target_include_directories(storage PUBLIC include)
 target_link_libraries(storage PUBLIC common Threads::Threads)
