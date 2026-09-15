@@ -134,10 +134,10 @@ ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& dat
     block_ids.reserve(chunk_count);
 
     for (size_t i = 0; i < chunk_count; ++i) {
-        size_t offset = i * config_.block_size;
-        size_t len = std::min<size_t>(config_.block_size, total - offset);
+        size_t chunk_offset = i * config_.block_size;
+        size_t len = std::min<size_t>(config_.block_size, total - chunk_offset);
 
-        // Step 1: ask Master for a BlockId + target Storage Node.
+        // Step 1: ask Master for a BlockId + replica locations.
         Message alloc_request{MessageType::ALLOCATE_BLOCK, next_request_id(), string_to_bytes(path)};
         auto alloc_result = call_master(alloc_request);
         if (alloc_result.is_error()) {
@@ -151,48 +151,64 @@ ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& dat
             return ErrorCode::INTERNAL_ERROR;
         }
         BlockId block_id = get_u64(alloc_response.payload.data());
-        uint32_t host_length = get_u32(alloc_response.payload.data() + sizeof(uint64_t));
-        size_t host_offset = sizeof(uint64_t) + sizeof(uint32_t);
-        if (alloc_response.payload.size() != host_offset + host_length + sizeof(uint16_t)) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        std::string host(reinterpret_cast<const char*>(alloc_response.payload.data() + host_offset),
-                          host_length);
-        uint16_t port = get_u16(alloc_response.payload.data() + host_offset + host_length);
+        uint32_t replica_count = get_u32(alloc_response.payload.data() + sizeof(uint64_t));
+        size_t resp_offset = sizeof(uint64_t) + sizeof(uint32_t);
 
-        // Step 2: write this chunk directly to the Storage Node (data
-        // plane — never routed through Master). A fresh connection per
-        // chunk, consistent with the existing no-pooling decision (see
-        // docs/design.md §11).
-        auto socket_result = Socket::create();
-        if (socket_result.is_error()) {
-            return socket_result.error();
-        }
-        Socket socket = std::move(socket_result.value());
-        if (ErrorCode err = socket.connect(host, port); err != ErrorCode::OK) {
-            return err;
-        }
-        TCPConnection node_connection(std::move(socket));
+        // Step 2: write this chunk directly to every replica Storage Node
+        // (data plane — never routed through Master), one fresh connection
+        // per replica (no pooling, see docs/design.md §11). Commit
+        // requires ALL replicas to ACK (strict 3/3, see docs/design.md
+        // §13), so abort immediately on the first failure — no point
+        // trying the remaining replicas once commit is already impossible.
+        for (uint32_t r = 0; r < replica_count; ++r) {
+            if (alloc_response.payload.size() < resp_offset + sizeof(uint32_t)) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            uint32_t host_length = get_u32(alloc_response.payload.data() + resp_offset);
+            resp_offset += sizeof(uint32_t);
+            if (alloc_response.payload.size() < resp_offset + host_length + sizeof(uint16_t)) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            std::string host(
+                reinterpret_cast<const char*>(alloc_response.payload.data() + resp_offset),
+                host_length);
+            resp_offset += host_length;
+            uint16_t port = get_u16(alloc_response.payload.data() + resp_offset);
+            resp_offset += sizeof(uint16_t);
 
-        std::vector<std::byte> write_payload;
-        put_u64(write_payload, block_id);
-        put_u32(write_payload, static_cast<uint32_t>(len));
-        const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data() + offset);
-        write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
+            auto socket_result = Socket::create();
+            if (socket_result.is_error()) {
+                return socket_result.error();
+            }
+            Socket socket = std::move(socket_result.value());
+            if (ErrorCode err = socket.connect(host, port); err != ErrorCode::OK) {
+                return err;
+            }
+            TCPConnection node_connection(std::move(socket));
 
-        if (!node_connection.sendMessage(
-                Message{MessageType::WRITE_BLOCK, next_request_id(), std::move(write_payload)})) {
-            return ErrorCode::INTERNAL_ERROR;
+            std::vector<std::byte> write_payload;
+            put_u64(write_payload, block_id);
+            put_u32(write_payload, static_cast<uint32_t>(len));
+            const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data() + chunk_offset);
+            write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
+
+            if (!node_connection.sendMessage(
+                    Message{MessageType::WRITE_BLOCK, next_request_id(), std::move(write_payload)})) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            auto write_response = node_connection.receiveMessage();
+            if (!write_response.has_value()) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (write_response->type != MessageType::ACK) {
+                // Abort without committing — the old file version stays
+                // intact (see docs/design.md §12); already-written
+                // replicas for this attempt become orphans (GC deferred).
+                return error_from_payload(write_response->payload);
+            }
         }
-        auto write_response = node_connection.receiveMessage();
-        if (!write_response.has_value()) {
+        if (alloc_response.payload.size() != resp_offset) {
             return ErrorCode::INTERNAL_ERROR;
-        }
-        if (write_response->type != MessageType::ACK) {
-            // Abort without committing — the old file version stays intact
-            // (see docs/design.md §12); already-allocated/written blocks
-            // for this attempt become orphans (GC deferred).
-            return error_from_payload(write_response->payload);
         }
 
         block_ids.push_back(block_id);
@@ -240,16 +256,19 @@ Result<std::vector<uint8_t>> Client::read(const std::string& path) {
         return Result<std::vector<uint8_t>>::ok({});  // empty file — nothing written yet
     }
 
-    // Parse every (block_id, host, port) tuple, in order — the metadata
-    // response was already N-block-ready before this phase (see
-    // docs/design.md §12).
-    struct BlockLocation {
-        BlockId block_id;
+    // Parse every block's (block_id, replica list) entry, in order — each
+    // block now carries a list of candidate replicas rather than exactly
+    // one location (see docs/design.md §13).
+    struct Location {
         std::string host;
         uint16_t port;
     };
-    std::vector<BlockLocation> locations;
-    locations.reserve(block_count);
+    struct BlockLocations {
+        BlockId block_id;
+        std::vector<Location> replicas;
+    };
+    std::vector<BlockLocations> blocks;
+    blocks.reserve(block_count);
     size_t offset = 3 * sizeof(uint64_t) + sizeof(uint32_t);
     for (uint32_t i = 0; i < block_count; ++i) {
         if (meta_response.payload.size() < offset + sizeof(uint64_t) + sizeof(uint32_t)) {
@@ -257,64 +276,83 @@ Result<std::vector<uint8_t>> Client::read(const std::string& path) {
         }
         BlockId block_id = get_u64(meta_response.payload.data() + offset);
         offset += sizeof(uint64_t);
-        uint32_t host_length = get_u32(meta_response.payload.data() + offset);
+        uint32_t replica_count = get_u32(meta_response.payload.data() + offset);
         offset += sizeof(uint32_t);
-        if (meta_response.payload.size() < offset + host_length + sizeof(uint16_t)) {
-            return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
+
+        std::vector<Location> replicas;
+        replicas.reserve(replica_count);
+        for (uint32_t r = 0; r < replica_count; ++r) {
+            if (meta_response.payload.size() < offset + sizeof(uint32_t)) {
+                return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
+            }
+            uint32_t host_length = get_u32(meta_response.payload.data() + offset);
+            offset += sizeof(uint32_t);
+            if (meta_response.payload.size() < offset + host_length + sizeof(uint16_t)) {
+                return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
+            }
+            std::string host(reinterpret_cast<const char*>(meta_response.payload.data() + offset),
+                              host_length);
+            offset += host_length;
+            uint16_t port = get_u16(meta_response.payload.data() + offset);
+            offset += sizeof(uint16_t);
+            replicas.push_back(Location{std::move(host), port});
         }
-        std::string host(reinterpret_cast<const char*>(meta_response.payload.data() + offset),
-                          host_length);
-        offset += host_length;
-        uint16_t port = get_u16(meta_response.payload.data() + offset);
-        offset += sizeof(uint16_t);
-        locations.push_back(BlockLocation{block_id, std::move(host), port});
+        blocks.push_back(BlockLocations{block_id, std::move(replicas)});
     }
     if (meta_response.payload.size() != offset) {
         return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
     }
 
-    // Step 2: read every block directly from its Storage Node, in order,
-    // and concatenate. A fresh connection per block, consistent with the
-    // existing no-pooling decision (see docs/design.md §11).
+    // Step 2: read every block directly from a Storage Node, in order, and
+    // concatenate. Try replicas in the order Master returned them, falling
+    // back to the next on any failure (connect failure, non-ACK response,
+    // or a malformed response) — fail the whole read only if every replica
+    // for a block fails (see docs/design.md §13). A fresh connection per
+    // attempt, consistent with the existing no-pooling decision (see
+    // docs/design.md §11).
     std::vector<uint8_t> result;
     result.reserve(total_size);
-    for (const BlockLocation& location : locations) {
-        auto socket_result = Socket::create();
-        if (socket_result.is_error()) {
-            return Result<std::vector<uint8_t>>::err(socket_result.error());
-        }
-        Socket socket = std::move(socket_result.value());
-        if (ErrorCode err = socket.connect(location.host, location.port); err != ErrorCode::OK) {
-            return Result<std::vector<uint8_t>>::err(err);
-        }
-        TCPConnection node_connection(std::move(socket));
+    for (const BlockLocations& block : blocks) {
+        bool block_read = false;
+        for (const Location& location : block.replicas) {
+            auto socket_result = Socket::create();
+            if (socket_result.is_error()) {
+                continue;
+            }
+            Socket socket = std::move(socket_result.value());
+            if (ErrorCode err = socket.connect(location.host, location.port); err != ErrorCode::OK) {
+                continue;
+            }
+            TCPConnection node_connection(std::move(socket));
 
-        std::vector<std::byte> read_payload;
-        put_u64(read_payload, location.block_id);
-        if (!node_connection.sendMessage(
-                Message{MessageType::READ_BLOCK, next_request_id(), std::move(read_payload)})) {
-            return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
-        }
-        auto read_response = node_connection.receiveMessage();
-        if (!read_response.has_value()) {
-            return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
-        }
-        if (read_response->type != MessageType::ACK) {
-            return Result<std::vector<uint8_t>>::err(error_from_payload(read_response->payload));
-        }
-        if (read_response->payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
-            return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
-        }
+            std::vector<std::byte> read_payload;
+            put_u64(read_payload, block.block_id);
+            if (!node_connection.sendMessage(
+                    Message{MessageType::READ_BLOCK, next_request_id(), std::move(read_payload)})) {
+                continue;
+            }
+            auto read_response = node_connection.receiveMessage();
+            if (!read_response.has_value() || read_response->type != MessageType::ACK) {
+                continue;
+            }
+            if (read_response->payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
+                continue;
+            }
+            uint32_t data_size = get_u32(read_response->payload.data() + sizeof(uint64_t));
+            size_t data_offset = sizeof(uint64_t) + sizeof(uint32_t);
+            if (read_response->payload.size() != data_offset + data_size) {
+                continue;
+            }
 
-        uint32_t data_size = get_u32(read_response->payload.data() + sizeof(uint64_t));
-        size_t data_offset = sizeof(uint64_t) + sizeof(uint32_t);
-        if (read_response->payload.size() != data_offset + data_size) {
-            return Result<std::vector<uint8_t>>::err(ErrorCode::INTERNAL_ERROR);
+            const auto* block_bytes = read_response->payload.data() + data_offset;
+            result.insert(result.end(), reinterpret_cast<const uint8_t*>(block_bytes),
+                           reinterpret_cast<const uint8_t*>(block_bytes) + data_size);
+            block_read = true;
+            break;
         }
-
-        const auto* block_bytes = read_response->payload.data() + data_offset;
-        result.insert(result.end(), reinterpret_cast<const uint8_t*>(block_bytes),
-                       reinterpret_cast<const uint8_t*>(block_bytes) + data_size);
+        if (!block_read) {
+            return Result<std::vector<uint8_t>>::err(ErrorCode::BLOCK_NOT_FOUND);
+        }
     }
     return Result<std::vector<uint8_t>>::ok(std::move(result));
 }

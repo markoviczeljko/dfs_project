@@ -43,6 +43,12 @@ std::string bytes_to_string(const std::vector<std::byte>& payload) {
     return std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
 }
 
+uint16_t get_u16(const std::byte* src) {
+    uint16_t be;
+    std::memcpy(&be, src, sizeof(be));
+    return be16toh(be);
+}
+
 uint32_t get_u32(const std::byte* src) {
     uint32_t be;
     std::memcpy(&be, src, sizeof(be));
@@ -57,7 +63,8 @@ uint64_t get_u64(const std::byte* src) {
 
 }  // namespace
 
-Master::Master(Config config) : config_(std::move(config)) {}
+Master::Master(Config config)
+    : config_(std::move(config)), replication_manager_(storage_registry_) {}
 
 Result<std::unique_ptr<Master>> Master::create(Config config) {
     auto master = std::unique_ptr<Master>(new Master(std::move(config)));
@@ -106,7 +113,12 @@ Message Master::handle_message(const Message& request) {
             // enum, so this previously-unused type takes on that role
             // instead (see docs/design.md §11).
             return handle_read_file(request);
+        case MessageType::REGISTER_NODE:
+            return handle_register_node(request);
         default:
+            // HEARTBEAT stays unhandled in this phase — heartbeat
+            // sending/timeout detection is Faza 12's job (see
+            // docs/design.md §13).
             // Includes WRITE_FILE — never given a defined wire flow
             // anywhere in the design notes, out of scope for this phase
             // (see docs/design.md §10/§11).
@@ -173,11 +185,35 @@ Message Master::handle_allocate_block(const Message& request) {
     if (result.is_error()) {
         return make_error(request.request_id, result.error());
     }
+    BlockId block_id = result.value();
 
+    // Faza 9: pick DEFAULT_REPLICATION_FACTOR distinct alive nodes for this
+    // block. Fewer than that currently alive/registered is treated as
+    // NODE_NOT_FOUND rather than allocating a permanently under-replicated
+    // block this phase can never repair (see docs/design.md §13).
+    std::vector<StorageNodeId> replicas = replication_manager_.choose_replicas(block_id);
+    if (replicas.empty()) {
+        // block_id is already sitting in NamespaceManager's pending_blocks_
+        // set for this path at this point — same orphan-until-a-later-
+        // successful-commit-or-delete fate as an abandoned write attempt
+        // (see docs/design.md §12), not a new leak this phase introduces.
+        return make_error(request.request_id, ErrorCode::NODE_NOT_FOUND);
+    }
+    namespace_manager_.set_block_replicas(block_id, replicas);
+
+    // Wire format: [u64 block_id][u32 replica_count]
+    // {[u32 host_len][host][u16 port]} x replica_count.
     std::vector<std::byte> response_payload;
-    put_u64(response_payload, result.value());
-    put_string(response_payload, config_.storage_node_host);
-    put_u16(response_payload, config_.storage_node_port);
+    put_u64(response_payload, block_id);
+    put_u32(response_payload, static_cast<uint32_t>(replicas.size()));
+    for (StorageNodeId node_id : replicas) {
+        auto node = storage_registry_.get_node(node_id);
+        if (!node.has_value()) {
+            return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
+        }
+        put_string(response_payload, node->host);
+        put_u16(response_payload, node->port);
+    }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
 
@@ -228,6 +264,11 @@ Message Master::handle_read_file(const Message& request) {
         return make_error(request.request_id, result.error());
     }
 
+    // Faza 9 wire format: [u64 file_id][u64 size][u64 mtime][u32 block_count]
+    // { [u64 block_id][u32 replica_count]
+    //   {[u32 host_len][host][u16 port]} x replica_count } x block_count.
+    // Client tries replicas in this order, falling back to the next on
+    // failure (see docs/design.md §13).
     const FileMetadata& metadata = result.value();
     std::vector<std::byte> response_payload;
     put_u64(response_payload, metadata.id);
@@ -236,8 +277,48 @@ Message Master::handle_read_file(const Message& request) {
     put_u32(response_payload, static_cast<uint32_t>(metadata.blocks.size()));
     for (BlockId block_id : metadata.blocks) {
         put_u64(response_payload, block_id);
-        put_string(response_payload, config_.storage_node_host);
-        put_u16(response_payload, config_.storage_node_port);
+        auto block_result = namespace_manager_.block_metadata(block_id);
+        if (block_result.is_error()) {
+            return make_error(request.request_id, block_result.error());
+        }
+        const std::vector<StorageNodeId>& replicas = block_result.value().replicas;
+        put_u32(response_payload, static_cast<uint32_t>(replicas.size()));
+        for (StorageNodeId node_id : replicas) {
+            auto node = storage_registry_.get_node(node_id);
+            if (!node.has_value()) {
+                return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
+            }
+            put_string(response_payload, node->host);
+            put_u16(response_payload, node->port);
+        }
     }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
+}
+
+Message Master::handle_register_node(const Message& request) {
+    // Wire format: [u64 node_id][u32 host_len][host][u16 port]
+    // [u64 capacity_bytes]. Idempotent upsert — a node re-registering (e.g.
+    // a manual restart during development) simply overwrites its prior
+    // entry (see docs/design.md §13).
+    size_t offset = 0;
+    if (request.payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    StorageNodeId node_id = get_u64(request.payload.data() + offset);
+    offset += sizeof(uint64_t);
+    uint32_t host_length = get_u32(request.payload.data() + offset);
+    offset += sizeof(uint32_t);
+
+    if (request.payload.size() != offset + host_length + sizeof(uint16_t) + sizeof(uint64_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    std::string host(reinterpret_cast<const char*>(request.payload.data() + offset), host_length);
+    offset += host_length;
+    uint16_t port = get_u16(request.payload.data() + offset);
+    offset += sizeof(uint16_t);
+    uint64_t capacity_bytes = get_u64(request.payload.data() + offset);
+
+    storage_registry_.register_node(
+        StorageNodeInfo{node_id, std::move(host), port, /*alive=*/true, capacity_bytes, capacity_bytes});
+    return Message{MessageType::ACK, request.request_id, {}};
 }

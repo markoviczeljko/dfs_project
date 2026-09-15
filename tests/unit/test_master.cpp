@@ -36,6 +36,12 @@ uint64_t get_u64(const std::byte* src) {
     return be64toh(be);
 }
 
+void put_u16(std::vector<std::byte>& buf, uint16_t value) {
+    uint16_t be = htobe16(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
 void put_u32(std::vector<std::byte>& buf, uint32_t value) {
     uint32_t be = htobe32(value);
     const auto* bytes = reinterpret_cast<const std::byte*>(&be);
@@ -75,6 +81,21 @@ Message make_path_request(MessageType type, uint64_t request_id, const std::stri
     return Message{type, request_id, std::move(payload)};
 }
 
+// Faza 9 wire format: [u64 node_id][u32 host_len][host][u16 port]
+// [u64 capacity_bytes] (see docs/design.md §13).
+Message make_register_node_request(uint64_t request_id, StorageNodeId node_id,
+                                    const std::string& host, uint16_t port,
+                                    uint64_t capacity_bytes) {
+    std::vector<std::byte> payload;
+    put_u64(payload, node_id);
+    put_u32(payload, static_cast<uint32_t>(host.size()));
+    const auto* host_bytes = reinterpret_cast<const std::byte*>(host.data());
+    payload.insert(payload.end(), host_bytes, host_bytes + host.size());
+    put_u16(payload, port);
+    put_u64(payload, capacity_bytes);
+    return Message{MessageType::REGISTER_NODE, request_id, std::move(payload)};
+}
+
 ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
     return static_cast<ErrorCode>(get_u16(payload.data()));
 }
@@ -93,6 +114,22 @@ std::vector<std::string> parse_list_response(const std::vector<std::byte>& paylo
     return entries;
 }
 
+// Registers 3 nodes (ids 1-3, ports 19101-19103) over the given client
+// connection — the minimum RF=3 needs for ALLOCATE_BLOCK to succeed (see
+// docs/design.md §13). Uses request ids in the 900s to stay visually
+// distinct from a test's own low, sequential ids (harmless either way —
+// Master never deduplicates by request_id).
+void register_three_nodes(TCPConnection& client) {
+    for (uint64_t i = 1; i <= 3; ++i) {
+        uint16_t port = static_cast<uint16_t>(19100 + i);
+        ASSERT_TRUE(client.sendMessage(
+            make_register_node_request(900 + i, i, "127.0.0.1", port, /*capacity_bytes=*/1024)));
+        auto resp = client.receiveMessage();
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_EQ(resp->type, MessageType::ACK);
+    }
+}
+
 }  // namespace
 
 class MasterTest : public ::testing::Test {
@@ -101,9 +138,8 @@ protected:
         if (master_) master_->stop();
     }
 
-    void start_master(uint16_t port, const std::string& storage_host = "127.0.0.1",
-                       uint16_t storage_port = 9101) {
-        Master::Config config{port, storage_host, storage_port};
+    void start_master(uint16_t port) {
+        Master::Config config{port};
         auto result = Master::create(config);
         ASSERT_TRUE(result.is_ok());
         master_ = std::move(result.value());
@@ -237,6 +273,8 @@ TEST_F(MasterTest, ListRootReturnsTopLevelEntries) {
 }
 
 TEST_F(MasterTest, UnknownMessageTypeReturnsInvalidRequest) {
+    // HEARTBEAT stays unhandled in this phase — heartbeat sending/timeout
+    // detection is Faza 12's job (see docs/design.md §13).
     start_master(38008);
     TCPConnection client = connect_client(38008);
 
@@ -345,9 +383,73 @@ TEST_F(MasterTest, WriteFileRemainsOutOfScope) {
     EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
 }
 
-TEST_F(MasterTest, AllocateBlockReturnsIdAndConfiguredStorageNode) {
-    start_master(38015, "127.0.0.1", 9101);
+TEST_F(MasterTest, RegisterNodeReturnsAck) {
+    start_master(38029);
+    TCPConnection client = connect_client(38029);
+
+    ASSERT_TRUE(client.sendMessage(
+        make_register_node_request(1, /*node_id=*/1, "127.0.0.1", 9101, /*capacity_bytes=*/1024)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+}
+
+TEST_F(MasterTest, RegisterNodeTwiceWithSameIdSucceeds) {
+    // Idempotent upsert — a node re-registering (e.g. a manual restart
+    // during development) must not be rejected (see docs/design.md §13).
+    start_master(38030);
+    TCPConnection client = connect_client(38030);
+
+    ASSERT_TRUE(client.sendMessage(
+        make_register_node_request(1, /*node_id=*/1, "127.0.0.1", 9101, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(
+        make_register_node_request(2, /*node_id=*/1, "127.0.0.1", 9999, /*capacity_bytes=*/2048)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+}
+
+TEST_F(MasterTest, AllocateBlockWithFewerThanThreeRegisteredNodesReturnsNodeNotFound) {
+    start_master(38031);
+    TCPConnection client = connect_client(38031);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    // 0 registered nodes.
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto resp0 = client.receiveMessage();
+    ASSERT_TRUE(resp0.has_value());
+    EXPECT_EQ(resp0->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp0->payload), ErrorCode::NODE_NOT_FOUND);
+
+    // 1 registered node.
+    ASSERT_TRUE(client.sendMessage(
+        make_register_node_request(3, /*node_id=*/1, "127.0.0.1", 19101, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 4, "/a.txt")));
+    auto resp1 = client.receiveMessage();
+    ASSERT_TRUE(resp1.has_value());
+    EXPECT_EQ(resp1->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp1->payload), ErrorCode::NODE_NOT_FOUND);
+
+    // 2 registered nodes — still short of RF=3.
+    ASSERT_TRUE(client.sendMessage(
+        make_register_node_request(5, /*node_id=*/2, "127.0.0.1", 19102, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 6, "/a.txt")));
+    auto resp2 = client.receiveMessage();
+    ASSERT_TRUE(resp2.has_value());
+    EXPECT_EQ(resp2->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp2->payload), ErrorCode::NODE_NOT_FOUND);
+}
+
+TEST_F(MasterTest, AllocateBlockReturnsThreeDistinctReplicaLocations) {
+    start_master(38015);
     TCPConnection client = connect_client(38015);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -359,12 +461,24 @@ TEST_F(MasterTest, AllocateBlockReturnsIdAndConfiguredStorageNode) {
 
     ASSERT_GE(resp->payload.size(), sizeof(uint64_t) + sizeof(uint32_t));
     BlockId block_id = get_u64(resp->payload.data());
-    uint32_t host_length = get_u32(resp->payload.data() + 8);
-    std::string host = get_string(resp->payload.data() + 12, host_length);
-    uint16_t port = get_u16(resp->payload.data() + 12 + host_length);
     EXPECT_GT(block_id, 0u);
-    EXPECT_EQ(host, "127.0.0.1");
-    EXPECT_EQ(port, 9101);
+    uint32_t replica_count = get_u32(resp->payload.data() + sizeof(uint64_t));
+    ASSERT_EQ(replica_count, 3u);
+
+    size_t offset = sizeof(uint64_t) + sizeof(uint32_t);
+    std::set<uint16_t> ports;
+    for (uint32_t i = 0; i < replica_count; ++i) {
+        uint32_t host_length = get_u32(resp->payload.data() + offset);
+        offset += sizeof(uint32_t);
+        std::string host = get_string(resp->payload.data() + offset, host_length);
+        offset += host_length;
+        uint16_t port = get_u16(resp->payload.data() + offset);
+        offset += sizeof(uint16_t);
+        EXPECT_EQ(host, "127.0.0.1");
+        ports.insert(port);
+    }
+    EXPECT_EQ(ports.size(), 3u);
+    EXPECT_EQ(resp->payload.size(), offset);
 }
 
 TEST_F(MasterTest, AllocateBlockOnNonexistentFileFails) {
@@ -387,6 +501,7 @@ TEST_F(MasterTest, ConcurrentAllocateBlockProducesUniqueIds) {
     start_master(port);
 
     TCPConnection setup_client = connect_client(port);
+    register_three_nodes(setup_client);
     ASSERT_TRUE(setup_client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(setup_client.receiveMessage().has_value());
 
@@ -417,6 +532,7 @@ TEST_F(MasterTest, ConcurrentAllocateBlockProducesUniqueIds) {
 TEST_F(MasterTest, WriteCommitUpdatesMetadata) {
     start_master(38017);
     TCPConnection client = connect_client(38017);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -487,6 +603,7 @@ TEST_F(MasterTest, WriteCommitAcceptsAnyPreviouslyAllocatedIdForThisPath) {
     // deliberately dropped.
     start_master(38024);
     TCPConnection client = connect_client(38024);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -512,6 +629,7 @@ TEST_F(MasterTest, WriteCommitWithBlockIdFromDifferentPathFails) {
     // docs/design.md §12).
     start_master(38025);
     TCPConnection client = connect_client(38025);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -534,6 +652,7 @@ TEST_F(MasterTest, WriteCommitWithBlockIdFromDifferentPathFails) {
 TEST_F(MasterTest, WriteCommitWithMultipleBlocksSucceedsAndPreservesOrder) {
     start_master(38026);
     TCPConnection client = connect_client(38026);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -572,6 +691,7 @@ TEST_F(MasterTest, WriteCommitSubsetOfPendingBlocksSucceedsAndDiscardsUnusedIds)
     // permanently unwritable (see docs/design.md §12).
     start_master(38027);
     TCPConnection client = connect_client(38027);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -609,8 +729,12 @@ TEST_F(MasterTest, WriteCommitSubsetOfPendingBlocksSucceedsAndDiscardsUnusedIds)
 }
 
 TEST_F(MasterTest, WriteCommitWithUnallocatedIdAmongOtherwiseValidIdsFails) {
-    start_master(38028);
-    TCPConnection client = connect_client(38028);
+    // Port 38028 specifically fails to bind in this sandbox for unknown
+    // reasons (same category of environment quirk as port 36004 — see
+    // BILJESKE_FAZE.md); avoid it.
+    start_master(38032);
+    TCPConnection client = connect_client(38032);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -649,9 +773,10 @@ TEST_F(MasterTest, ReadFileOnEmptyFileReturnsZeroBlocks) {
     EXPECT_EQ(block_count, 0u);
 }
 
-TEST_F(MasterTest, ReadFileReturnsMetadataWithBlockLocation) {
-    start_master(38020, "127.0.0.1", 9101);
+TEST_F(MasterTest, ReadFileReturnsReplicaListPerBlock) {
+    start_master(38020);
     TCPConnection client = connect_client(38020);
+    register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
@@ -671,15 +796,34 @@ TEST_F(MasterTest, ReadFileReturnsMetadataWithBlockLocation) {
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ACK);
 
+    // Faza 9 wire format: [u64 id][u64 size][u64 mtime][u32 block_count]
+    // { [u64 block_id][u32 replica_count]
+    //   {[u32 host_len][host][u16 port]} x replica_count } x block_count
+    // (see docs/design.md §13).
     uint32_t block_count = get_u32(resp->payload.data() + 24);
     ASSERT_EQ(block_count, 1u);
-    BlockId returned_block_id = get_u64(resp->payload.data() + 28);
-    uint32_t host_length = get_u32(resp->payload.data() + 36);
-    std::string host = get_string(resp->payload.data() + 40, host_length);
-    uint16_t port = get_u16(resp->payload.data() + 40 + host_length);
+    size_t offset = 28;
+    BlockId returned_block_id = get_u64(resp->payload.data() + offset);
+    offset += sizeof(uint64_t);
     EXPECT_EQ(returned_block_id, block_id);
-    EXPECT_EQ(host, "127.0.0.1");
-    EXPECT_EQ(port, 9101);
+
+    uint32_t replica_count = get_u32(resp->payload.data() + offset);
+    offset += sizeof(uint32_t);
+    ASSERT_EQ(replica_count, 3u);
+
+    std::set<uint16_t> ports;
+    for (uint32_t i = 0; i < replica_count; ++i) {
+        uint32_t host_length = get_u32(resp->payload.data() + offset);
+        offset += sizeof(uint32_t);
+        std::string host = get_string(resp->payload.data() + offset, host_length);
+        offset += host_length;
+        uint16_t port = get_u16(resp->payload.data() + offset);
+        offset += sizeof(uint16_t);
+        EXPECT_EQ(host, "127.0.0.1");
+        ports.insert(port);
+    }
+    EXPECT_EQ(ports.size(), 3u);
+    EXPECT_EQ(resp->payload.size(), offset);
 }
 
 TEST_F(MasterTest, ReadFileOnNonexistentFileFails) {

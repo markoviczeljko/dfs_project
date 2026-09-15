@@ -29,6 +29,8 @@ target_link_libraries(storage PUBLIC common network Threads::Threads)
 
 add_library(master
     src/master/namespace.cpp
+    src/master/storage_registry.cpp
+    src/master/replication_manager.cpp
     src/master/master.cpp
 )
 target_include_directories(master PUBLIC include)

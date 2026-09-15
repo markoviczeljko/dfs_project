@@ -7,21 +7,21 @@
 
 #include "common/errors.h"
 #include "master/namespace.h"
+#include "master/replication_manager.h"
+#include "master/storage_registry.h"
 #include "network/network_server.h"
 #include "network/protocol.h"
 
-// The Master process: owns the namespace (NamespaceManager) and a
-// NetworkServer (accept-loop, reused verbatim from Faza 5), and wires
-// CREATE_FILE/DELETE_FILE/LIST_FILES/STAT_FILE/ALLOCATE_BLOCK/WRITE_COMMIT/
-// READ_FILE requests to it. `storage_node_host`/`storage_node_port` are a
-// temporary stand-in for the real StorageRegistry (Faza 9) — see
-// docs/design.md §11.
+// The Master process: owns the namespace (NamespaceManager), the Storage
+// Node inventory (StorageRegistry) and replica placement
+// (ReplicationManager), and a NetworkServer (accept-loop, reused verbatim
+// from Faza 5), and wires CREATE_FILE/DELETE_FILE/LIST_FILES/STAT_FILE/
+// ALLOCATE_BLOCK/WRITE_COMMIT/READ_FILE/REGISTER_NODE requests to them.
+// See docs/design.md §13.
 class Master {
 public:
     struct Config {
         uint16_t port;
-        std::string storage_node_host;
-        uint16_t storage_node_port;
     };
 
     static Result<std::unique_ptr<Master>> create(Config config);
@@ -43,10 +43,13 @@ private:
     Message handle_allocate_block(const Message& request);
     Message handle_write_commit(const Message& request);
     Message handle_read_file(const Message& request);
+    Message handle_register_node(const Message& request);
     static Message make_error(uint64_t request_id, ErrorCode error);
 
     Config config_;
     NamespaceManager namespace_manager_;
+    StorageRegistry storage_registry_;
+    ReplicationManager replication_manager_;
     std::unique_ptr<NetworkServer> network_server_;
 };
 

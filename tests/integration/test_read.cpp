@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -12,7 +13,8 @@
 #include "storage/storage_node.h"
 
 // Full CREATE -> WRITE -> READ round-trip through a real Client against an
-// in-process Master + StorageNode cluster (see docs/design.md §11).
+// in-process Master + 3 StorageNodes cluster (RF=3, see docs/design.md
+// §11/§13).
 class ReadIntegrationTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -24,39 +26,50 @@ protected:
 
     void TearDown() override {
         client_.reset();
+        for (auto& node : storage_nodes_) node->stop();
         if (master_) master_->stop();
-        if (storage_node_) storage_node_->stop();
         std::filesystem::remove_all(dir_);
     }
 
-    void start_cluster(uint16_t master_port, uint16_t storage_port,
-                        uint64_t block_size = BLOCK_SIZE) {
-        StorageNode::Config storage_config{1, storage_port, dir_, 1024ULL * 1024 * 1024};
-        auto storage_result = StorageNode::create(storage_config);
-        ASSERT_TRUE(storage_result.is_ok());
-        storage_node_ = std::move(storage_result.value());
-        ASSERT_EQ(storage_node_->start(), ErrorCode::OK);
-
-        Master::Config master_config{master_port, "127.0.0.1", storage_port};
+    // Master must start before any StorageNode — a StorageNode registers
+    // with Master synchronously at startup and fails if it isn't reachable
+    // (see docs/design.md §13).
+    void start_cluster(uint16_t master_port, uint16_t storage_port1, uint16_t storage_port2,
+                        uint16_t storage_port3, uint64_t block_size = BLOCK_SIZE) {
+        Master::Config master_config{master_port};
         auto master_result = Master::create(master_config);
         ASSERT_TRUE(master_result.is_ok());
         master_ = std::move(master_result.value());
         ASSERT_EQ(master_->start(), ErrorCode::OK);
 
-        auto client_result =
-            Client::create(Client::Config{"127.0.0.1", master_port, block_size});
+        std::array<uint16_t, 3> storage_ports = {storage_port1, storage_port2, storage_port3};
+        for (size_t i = 0; i < storage_ports.size(); ++i) {
+            StorageNode::Config storage_config{static_cast<StorageNodeId>(i + 1),
+                                                storage_ports[i],
+                                                dir_ / ("node" + std::to_string(i + 1)),
+                                                1024ULL * 1024 * 1024,
+                                                "127.0.0.1",
+                                                "127.0.0.1",
+                                                master_port};
+            auto storage_result = StorageNode::create(storage_config);
+            ASSERT_TRUE(storage_result.is_ok());
+            storage_nodes_.push_back(std::move(storage_result.value()));
+            ASSERT_EQ(storage_nodes_.back()->start(), ErrorCode::OK);
+        }
+
+        auto client_result = Client::create(Client::Config{"127.0.0.1", master_port, block_size});
         ASSERT_TRUE(client_result.is_ok());
         client_ = std::move(client_result.value());
     }
 
     std::filesystem::path dir_;
-    std::unique_ptr<StorageNode> storage_node_;
+    std::vector<std::unique_ptr<StorageNode>> storage_nodes_;
     std::unique_ptr<Master> master_;
     std::unique_ptr<Client> client_;
 };
 
 TEST_F(ReadIntegrationTest, WriteThenReadReturnsSameBytes) {
-    start_cluster(39009, 39010);
+    start_cluster(40200, 40201, 40202, 40203);
 
     ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
     std::vector<uint8_t> data = {10, 20, 30, 40, 50};
@@ -68,7 +81,7 @@ TEST_F(ReadIntegrationTest, WriteThenReadReturnsSameBytes) {
 }
 
 TEST_F(ReadIntegrationTest, ReadEmptyFileReturnsEmptyVector) {
-    start_cluster(39011, 39012);
+    start_cluster(40210, 40211, 40212, 40213);
 
     ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
 
@@ -78,7 +91,7 @@ TEST_F(ReadIntegrationTest, ReadEmptyFileReturnsEmptyVector) {
 }
 
 TEST_F(ReadIntegrationTest, ReadNonexistentFileFails) {
-    start_cluster(39013, 39014);
+    start_cluster(40220, 40221, 40222, 40223);
 
     auto read_result = client_->read("/nope.txt");
     ASSERT_TRUE(read_result.is_error());
@@ -86,7 +99,7 @@ TEST_F(ReadIntegrationTest, ReadNonexistentFileFails) {
 }
 
 TEST_F(ReadIntegrationTest, OverwriteReplacesContent) {
-    start_cluster(39015, 39016);
+    start_cluster(40230, 40231, 40232, 40233);
 
     ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
     ASSERT_EQ(client_->write("/a.txt", {1, 2, 3}), ErrorCode::OK);
@@ -99,7 +112,7 @@ TEST_F(ReadIntegrationTest, OverwriteReplacesContent) {
 
 TEST_F(ReadIntegrationTest, ReadMultiBlockFileReturnsSameBytesInOrder) {
     constexpr uint64_t kSmallBlockSize = 4096;
-    start_cluster(39025, 39026, kSmallBlockSize);
+    start_cluster(40240, 40241, 40242, 40243, kSmallBlockSize);
 
     ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
     std::vector<uint8_t> data(static_cast<size_t>(kSmallBlockSize) * 2 + 500);
@@ -113,7 +126,7 @@ TEST_F(ReadIntegrationTest, ReadMultiBlockFileReturnsSameBytesInOrder) {
 
 TEST_F(ReadIntegrationTest, ReadAfterOverwriteWithFewerBlocksReturnsNewContentOnly) {
     constexpr uint64_t kSmallBlockSize = 4096;
-    start_cluster(39027, 39028, kSmallBlockSize);
+    start_cluster(40250, 40251, 40252, 40253, kSmallBlockSize);
 
     ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
     std::vector<uint8_t> big_data(static_cast<size_t>(kSmallBlockSize) * 3, 5);
@@ -125,4 +138,23 @@ TEST_F(ReadIntegrationTest, ReadAfterOverwriteWithFewerBlocksReturnsNewContentOn
     auto read_result = client_->read("/a.txt");
     ASSERT_TRUE(read_result.is_ok());
     EXPECT_EQ(read_result.value(), small_data);
+}
+
+TEST_F(ReadIntegrationTest, ReadFallsBackToSurvivingReplicaAfterOneNodeStops) {
+    // Faza 9's own "definition of done" node-failure check: kill one of 3
+    // Storage Node processes (here, stop one in-process StorageNode
+    // object), confirm READ still succeeds via client-side replica
+    // fallback — Master never learns the node died (no heartbeat/failure
+    // detection until Faza 12, see docs/design.md §13).
+    start_cluster(40260, 40261, 40262, 40263);
+
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+    std::vector<uint8_t> data = {7, 7, 7, 7};
+    ASSERT_EQ(client_->write("/a.txt", data), ErrorCode::OK);
+
+    storage_nodes_[0]->stop();
+
+    auto read_result = client_->read("/a.txt");
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), data);
 }

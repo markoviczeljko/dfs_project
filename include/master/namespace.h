@@ -51,12 +51,25 @@ public:
     ErrorCode commit_write(const std::string& path, const std::vector<BlockId>& block_ids,
                            uint64_t size);
 
+    // Faza 9: records which Storage Nodes hold a block, once Master has
+    // chosen its replicas (see docs/design.md §13). Creates a new
+    // BlockMetadata entry in state ALLOCATED. commit_write() transitions a
+    // committed block's entry to COMMITTED. BlockState::WRITING and
+    // UNDER_REPLICATED are never set in this phase — Master is never in
+    // the data-plane write loop (Client writes directly to Storage Nodes),
+    // so there is no observable trigger for WRITING here, and
+    // UNDER_REPLICATED is defined as a consequence of heartbeat-driven
+    // failure detection, which doesn't exist until Faza 12.
+    ErrorCode set_block_replicas(BlockId block_id, std::vector<StorageNodeId> replicas);
+    Result<BlockMetadata> block_metadata(BlockId block_id) const;
+
 private:
     static Result<std::string> normalize_path(const std::string& path);
 
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, FileMetadata> files_;
     std::unordered_map<std::string, std::unordered_set<BlockId>> pending_blocks_;
+    std::unordered_map<BlockId, BlockMetadata> blocks_;
     FileId next_file_id_ = 1;
     BlockId next_block_id_ = 1;
 };

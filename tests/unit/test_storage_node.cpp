@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "master/master.h"
 #include "network/connection.h"
 #include "network/socket.h"
 #include "storage/storage_node.h"
@@ -76,11 +77,27 @@ protected:
 
     void TearDown() override {
         if (node_) node_->stop();
+        if (master_) master_->stop();
         std::filesystem::remove_all(dir_);
     }
 
+    // Faza 9: StorageNode::start() now registers with Master synchronously
+    // and fails if it's unreachable, so this fixture needs a real
+    // in-process Master too — even though these tests only exercise
+    // WRITE_BLOCK/READ_BLOCK/DELETE_BLOCK, which never touch Master (see
+    // docs/design.md §13). master_port is derived from the storage port
+    // (+100) to stay collision-free with the existing per-test port
+    // convention below without a separate port table.
     void start_node(uint16_t port, uint64_t capacity_bytes = 1024 * 1024) {
-        StorageNode::Config config{1, port, dir_, capacity_bytes};
+        uint16_t master_port = static_cast<uint16_t>(port + 100);
+        Master::Config master_config{master_port};
+        auto master_result = Master::create(master_config);
+        ASSERT_TRUE(master_result.is_ok());
+        master_ = std::move(master_result.value());
+        ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+        StorageNode::Config config{1, port, dir_, capacity_bytes, "127.0.0.1", "127.0.0.1",
+                                    master_port};
         auto result = StorageNode::create(config);
         ASSERT_TRUE(result.is_ok());
         node_ = std::move(result.value());
@@ -96,6 +113,7 @@ protected:
     }
 
     std::filesystem::path dir_;
+    std::unique_ptr<Master> master_;
     std::unique_ptr<StorageNode> node_;
 };
 

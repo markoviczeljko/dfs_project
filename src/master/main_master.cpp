@@ -36,8 +36,6 @@ Result<Master::Config> load_config(const std::filesystem::path& path) {
 
     Master::Config config{};
     bool has_port = false;
-    bool has_storage_host = false;
-    bool has_storage_port = false;
 
     auto parse_port = [](const std::string& value, uint16_t& out) {
         size_t consumed = 0;
@@ -66,19 +64,13 @@ Result<Master::Config> load_config(const std::filesystem::path& path) {
             if (key == "port") {
                 parse_port(value, config.port);
                 has_port = true;
-            } else if (key == "storage_node_host") {
-                config.storage_node_host = value;
-                has_storage_host = true;
-            } else if (key == "storage_node_port") {
-                parse_port(value, config.storage_node_port);
-                has_storage_port = true;
             }
         }
     } catch (const std::exception&) {
         return Result<Master::Config>::err(ErrorCode::INVALID_REQUEST);
     }
 
-    if (!has_port || !has_storage_host || !has_storage_port) {
+    if (!has_port) {
         return Result<Master::Config>::err(ErrorCode::INVALID_REQUEST);
     }
     return Result<Master::Config>::ok(config);
@@ -122,8 +114,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_shutdown_signal);
     std::signal(SIGTERM, handle_shutdown_signal);
 
-    std::cout << "dfs_master: listening on port " << config.port << ", storage_node="
-              << config.storage_node_host << ":" << config.storage_node_port << "\n";
+    std::cout << "dfs_master: listening on port " << config.port << "\n";
 
     while (!g_shutdown_requested.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

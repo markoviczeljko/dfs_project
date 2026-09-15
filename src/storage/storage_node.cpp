@@ -5,6 +5,9 @@
 #include <cstring>
 #include <utility>
 
+#include "network/connection.h"
+#include "network/socket.h"
+
 namespace {
 
 // Mirrors the private wire-level helpers in protocol.cpp — kept local since
@@ -27,6 +30,18 @@ void put_u64(std::vector<std::byte>& buf, uint64_t value) {
     uint64_t be = htobe64(value);
     const auto* bytes = reinterpret_cast<const std::byte*>(&be);
     buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+void put_string(std::vector<std::byte>& buf, const std::string& value) {
+    put_u32(buf, static_cast<uint32_t>(value.size()));
+    const auto* bytes = reinterpret_cast<const std::byte*>(value.data());
+    buf.insert(buf.end(), bytes, bytes + value.size());
+}
+
+uint16_t get_u16(const std::byte* src) {
+    uint16_t be;
+    std::memcpy(&be, src, sizeof(be));
+    return be16toh(be);
 }
 
 uint32_t get_u32(const std::byte* src) {
@@ -67,7 +82,48 @@ ErrorCode StorageNode::start() {
         return server_result.error();
     }
     network_server_ = std::move(server_result.value());
-    return network_server_->start();
+    if (ErrorCode err = network_server_->start(); err != ErrorCode::OK) {
+        return err;
+    }
+    // Register with Master only after this node is actually reachable, so
+    // it can never be picked as a replica target before it's ready to
+    // serve WRITE_BLOCK/READ_BLOCK requests (see docs/design.md §13).
+    return register_with_master();
+}
+
+ErrorCode StorageNode::register_with_master() {
+    auto socket_result = Socket::create();
+    if (socket_result.is_error()) {
+        return socket_result.error();
+    }
+    Socket socket = std::move(socket_result.value());
+    if (ErrorCode err = socket.connect(config_.master_host, config_.master_port); err != ErrorCode::OK) {
+        return err;
+    }
+    TCPConnection master_connection(std::move(socket));
+
+    // Wire format: [u64 node_id][u32 host_len][host][u16 port]
+    // [u64 capacity_bytes] (see docs/design.md §13).
+    std::vector<std::byte> payload;
+    put_u64(payload, config_.node_id);
+    put_string(payload, config_.advertise_host);
+    put_u16(payload, config_.port);
+    put_u64(payload, config_.capacity_bytes);
+
+    if (!master_connection.sendMessage(Message{MessageType::REGISTER_NODE, 1, std::move(payload)})) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    auto response = master_connection.receiveMessage();
+    if (!response.has_value()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (response->type != MessageType::ACK) {
+        if (response->payload.size() < sizeof(uint16_t)) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        return static_cast<ErrorCode>(get_u16(response->payload.data()));
+    }
+    return ErrorCode::OK;
 }
 
 void StorageNode::stop() {

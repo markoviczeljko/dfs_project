@@ -38,6 +38,9 @@ Result<StorageNode::Config> load_config(const std::filesystem::path& path) {
     bool has_port = false;
     bool has_data_dir = false;
     bool has_capacity = false;
+    bool has_host = false;
+    bool has_master_host = false;
+    bool has_master_port = false;
 
     std::string line;
     try {
@@ -66,13 +69,23 @@ Result<StorageNode::Config> load_config(const std::filesystem::path& path) {
             } else if (key == "capacity_bytes") {
                 config.capacity_bytes = std::stoull(value);
                 has_capacity = true;
+            } else if (key == "host") {
+                config.advertise_host = value;
+                has_host = true;
+            } else if (key == "master_host") {
+                config.master_host = value;
+                has_master_host = true;
+            } else if (key == "master_port") {
+                config.master_port = static_cast<uint16_t>(std::stoul(value));
+                has_master_port = true;
             }
         }
     } catch (const std::exception&) {
         return Result<StorageNode::Config>::err(ErrorCode::INVALID_REQUEST);
     }
 
-    if (!has_node_id || !has_port || !has_data_dir || !has_capacity) {
+    if (!has_node_id || !has_port || !has_data_dir || !has_capacity || !has_host ||
+        !has_master_host || !has_master_port) {
         return Result<StorageNode::Config>::err(ErrorCode::INVALID_REQUEST);
     }
     return Result<StorageNode::Config>::ok(config);

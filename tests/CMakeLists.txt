@@ -31,10 +31,16 @@ add_executable(test_network_server unit/test_network_server.cpp)
 target_link_libraries(test_network_server PRIVATE network gtest_main)
 
 add_executable(test_storage_node unit/test_storage_node.cpp)
-target_link_libraries(test_storage_node PRIVATE storage gtest_main)
+target_link_libraries(test_storage_node PRIVATE storage master gtest_main)
 
 add_executable(test_master unit/test_master.cpp)
 target_link_libraries(test_master PRIVATE master gtest_main)
+
+add_executable(test_storage_registry unit/test_storage_registry.cpp)
+target_link_libraries(test_storage_registry PRIVATE master gtest_main)
+
+add_executable(test_replication_manager unit/test_replication_manager.cpp)
+target_link_libraries(test_replication_manager PRIVATE master gtest_main)
 
 add_executable(test_create integration/test_create.cpp)
 target_link_libraries(test_create PRIVATE client master gtest_main)
@@ -55,6 +61,8 @@ gtest_discover_tests(test_namespace)
 gtest_discover_tests(test_network_server)
 gtest_discover_tests(test_storage_node)
 gtest_discover_tests(test_master)
+gtest_discover_tests(test_storage_registry)
+gtest_discover_tests(test_replication_manager)
 gtest_discover_tests(test_create)
 gtest_discover_tests(test_write)
 gtest_discover_tests(test_read)

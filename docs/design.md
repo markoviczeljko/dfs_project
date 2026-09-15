@@ -583,3 +583,107 @@ kodira `ErrorCode` na wire (sva ostala mjesta u `master.cpp`/`storage_node.cpp`/
 
 Nezavisan `cpp-reviewer` agent potvrdio je i popravku dizajna i ova dva
 mrežna bug-fixa kao ispravne, bez CRITICAL/HIGH nalaza.
+
+## 13. Faza 9 — Replikacija (RF=3)
+
+Uklanja single-node ograničenje: `Master::Config` je do sada imao samo
+`storage_node_host`/`storage_node_port` — jednu statičku adresu koju je
+svaki `ALLOCATE_BLOCK`/`READ_FILE` odgovor vraćao, eksplicitno označenu kao
+"privremeni stand-in za pravi StorageRegistry (Faza 9)". Storage Node-ovi se
+sada registruju kod Master-a (`REGISTER_NODE`) pri startu; Master bira 3
+replike po bloku (`ReplicationManager::choose_replicas`); `Client::write()`
+piše direktno na sve 3 (fan-out, Master nikad ne proxy-uje podatke); commit
+se dešava samo na 3/3 ACK (strogo, ne kvorum, po §7.7); `Client::read()`
+pokušava replike redom uz fallback na sljedeću. Faza je eksplicitno "happy
+path" — heartbeat/timeout detekcija otkaza čvora, reaktivna re-replikacija,
+puna JOIN state mašina, i WRITE_BLOCK/WRITE_COMMIT idempotencija su
+odložene do Faze 12.
+
+**Manje od RF=3 živih čvorova pri ALLOCATE_BLOCK → `NODE_NOT_FOUND`**
+(potvrđeno sa korisnikom). Alternativa (alociraj na dostupne + označi
+UNDER_REPLICATED) bi stvorila blok koji ova faza nikad ne može popraviti
+(repair je Faza 12) — nekonzistentno sa §7.7-ovom strogom 3/3 filozofijom.
+`BlockId` je u tom slučaju već upisan u `pending_blocks_` za tu putanju od
+`namespace_manager_.allocate_block()`-a prije nego što se replika bira —
+isti "orphan dok se path ponovo ne commit-uje/obriše" ishod kao napušten
+write pokušaj (§12), ne novo curenje koje ova faza uvodi.
+
+**Placement algoritam: deterministički round-robin kursor**
+(`ReplicationManager::cursor_`, pod sopstvenim mutex-om) preko
+`get_alive_nodes()` sortiranih po id-u — ne random. Nema `<random>`
+upotrebe nigdje u kodu do sada, i round-robin je tačno reproducibilan u
+unit testovima (`ChooseReplicasRoundRobinsAcrossSuccessiveCalls`), za
+razliku od hash/random politike. `StorageNodeInfo.free_space` je
+deklarisano (popunjeno sa `total_space` pri registraciji, potvrđeno sa
+korisnikom da se ne ažurira dok heartbeat ne postoji — Faza 12), ali se
+placement ne filtrira po njemu u ovoj fazi.
+
+**Nalaz: `BlockState::WRITING` i `UNDER_REPLICATED` nemaju trigger u ovoj
+fazi.** Master nikad nije u data-plane write petlji (Client piše
+`WRITE_BLOCK` direktno na Storage Node-ove; Master saznaje ishod tek
+retroaktivno preko `WRITE_COMMIT`-a), pa `WRITING` nema tačku gdje bi se
+ikad postavio — blok ide direktno `ALLOCATED → COMMITTED`
+(`NamespaceManager::set_block_replicas`/`commit_write`). `UNDER_REPLICATED`
+je po §7.8 definisan kao posljedica `HEALTHY → DEAD` heartbeat tranzicije
+čvora — pošto ova faza nema heartbeat/failure-detection uopšte, ta
+vrijednost je nedostižna. Nezavisan `cpp-reviewer` agent je potvrdio
+grep-om da se `.state` nigdje u kodu ne postavlja/čita osim na ta dva
+mjesta — obje enum vrijednosti su namjerno deklarisane-ali-nepostavljene,
+ne propust.
+
+**`StorageRegistry`/`ReplicationManager` API**: `StorageRegistry`
+implementira sve 4 metode iz §17.9 skice (`register_node` — idempotentan
+upsert, `mark_dead`, `mark_alive`, `get_alive_nodes`) plus jednu dodatu van
+skice, stvarno potrebnu odmah: `get_node(id)` (Master mora razriješiti
+izabrani `StorageNodeId` nazad u `host:port`). `ReplicationManager`
+deklariše samo `choose_replicas(BlockId)` — `replicate_block`/
+`handle_node_failure` iz §17.8 skice se ne deklarišu (nema pozivaoca u
+ovoj fazi, isti "no value-less stub" presedan kao Faze 5–8).
+
+**Wire formati** (svi novi, `protocol.h`/`.cpp` netaknut, isti "svaka faza
+izmišlja svoj payload lokalno" obrazac):
+```
+REGISTER_NODE zahtjev:   [u64 node_id][u32 host_len][host][u16 port][u64 capacity_bytes]
+ALLOCATE_BLOCK odgovor:  [u64 block_id][u32 replica_count]{[u32 host_len][host][u16 port]}×replica_count
+READ_FILE odgovor:       [u64 file_id][u64 size][u64 mtime][u32 block_count]
+                          { [u64 block_id][u32 replica_count]{[u32 host_len][host][u16 port]}×replica_count }×block_count
+```
+Duplikat `node_id` pri registraciji → idempotentan upsert (dev-otpornost na
+ručni restart čvora). Neuspjela registracija pri startu StorageNode-a →
+fail-fast, bez retry-ja (isti stil kao postojeći `start()`).
+
+**Redoslijed pokretanja se mijenja**: `StorageNode::start()` sad sinhrono
+poziva `register_with_master()` (prva upotreba outbound konekcije unutar
+`StorageNode`-a — do sada je imao samo inbound `NetworkServer`) i
+fail-fast-uje ako Master nije dostižan. `scripts/start_master.sh` mora
+sada raditi PRIJE bilo kog `scripts/start_storage.sh`-a — obrnuto od
+Faza 5–8-ine "bilo koji redoslijed radi" pretpostavke. `scripts/start_storage.sh`
+je parametrizovan indeksom čvora (`./scripts/start_storage.sh 2` →
+`configs/storage2.conf`) umjesto tri skoro-identične skripte.
+
+**Testna infrastruktura**: `tests/unit/test_storage_node.cpp`-ova fixture
+sad mora pokrenuti i pravi in-process `Master` (pošto `StorageNode::start()`
+bezuslovno zahtijeva uspješnu registraciju) — `master_port` se izvodi kao
+`storage_port + 100` da ostane bez kolizije sa postojećom po-testu-jedinstven-port
+konvencijom, bez posebne tabele portova. `tests/integration/test_write.cpp`/
+`test_read.cpp` fixture-i sada pokreću Master pa 3 `StorageNode` instance
+(RF fiksan na 3, bez tunability-ja za testove — za razliku od Faza 8-inog
+`block_size`, pokretanje 3 in-process objekata ne košta ništa uporedivo sa
+pomjeranjem 64MB podataka).
+
+**Ručna provjera** ("Definicija gotovog" iz `IMPLEMENTATION_PLAN.md`):
+Master + 3 prava `dfs_storage` procesa, multi-block write preko
+`dfs_client`, inspekcija data direktorijuma svakog node-a potvrđuje da
+blok postoji na sva 3; ugašen jedan Storage Node proces (`SIGINT`),
+potvrđeno da READ i dalje uspijeva preko client-side fallback-a (Master
+nikad ne saznaje da je čvor mrtav — nema heartbeat do Faze 12); `cmp`
+bajt-po-bajt identično prije i poslije.
+
+Nezavisan `cpp-reviewer` agent: bez CRITICAL/HIGH nalaza (potvrdio
+reference-member lifetime u `Master`-u, thread-safety `StorageRegistry`/
+`ReplicationManager`-a, round-robin aritmetiku uključujući wraparound kad
+broj živih čvorova nije umnožak RF-a, i bounds-checking u svim novim wire
+parserima). Dva MEDIUM/LOW nalaza primijenjena: komentar o
+orphan-pending-block-id ishodu na `NODE_NOT_FOUND`, i dodati konkurentni
+testovi za `StorageRegistry`/`ReplicationManager` (nedostajali su, iako je
+postojeća zaključavanja logika već bila ispravna).

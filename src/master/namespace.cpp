@@ -184,5 +184,28 @@ ErrorCode NamespaceManager::commit_write(const std::string& path,
     it->second.blocks = block_ids;
     it->second.size = size;
     it->second.modification_time = now;
+
+    for (BlockId id : block_ids) {
+        auto block_it = blocks_.find(id);
+        if (block_it != blocks_.end()) {
+            block_it->second.state = BlockState::COMMITTED;
+        }
+    }
     return ErrorCode::OK;
+}
+
+ErrorCode NamespaceManager::set_block_replicas(BlockId block_id,
+                                                std::vector<StorageNodeId> replicas) {
+    std::unique_lock lock(mutex_);
+    blocks_[block_id] = BlockMetadata{block_id, 0, 0, std::move(replicas), BlockState::ALLOCATED};
+    return ErrorCode::OK;
+}
+
+Result<BlockMetadata> NamespaceManager::block_metadata(BlockId block_id) const {
+    std::shared_lock lock(mutex_);
+    auto it = blocks_.find(block_id);
+    if (it == blocks_.end()) {
+        return Result<BlockMetadata>::err(ErrorCode::BLOCK_NOT_FOUND);
+    }
+    return Result<BlockMetadata>::ok(it->second);
 }

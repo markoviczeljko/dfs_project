@@ -16,7 +16,7 @@ protected:
     }
 
     void start_master(uint16_t port) {
-        Master::Config config{port, "127.0.0.1", 0};
+        Master::Config config{port};
         auto result = Master::create(config);
         ASSERT_TRUE(result.is_ok());
         master_ = std::move(result.value());
