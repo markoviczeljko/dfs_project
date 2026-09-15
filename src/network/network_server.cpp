@@ -50,6 +50,22 @@ void NetworkServer::stop() {
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+
+    // Every still-open connection's worker thread may be blocked inside
+    // recv(). Shut each one down first — otherwise join() below could hang
+    // forever on an idle-but-connected client — then join every worker so
+    // none is left running against a MessageHandler whose owner is about to
+    // be destroyed right after stop() returns.
+    std::lock_guard<std::mutex> lock(workers_mutex_);
+    for (auto& worker : workers_) {
+        ::shutdown(worker.fd, SHUT_RDWR);
+    }
+    for (auto& worker : workers_) {
+        if (worker.thread.joinable()) {
+            worker.thread.join();
+        }
+    }
+    workers_.clear();
 }
 
 void NetworkServer::accept_loop() {
@@ -60,20 +76,40 @@ void NetworkServer::accept_loop() {
             // down — either way, this thread's job is done.
             return;
         }
-        std::thread(&NetworkServer::handle_connection, this, std::move(accepted.value())).detach();
+
+        int fd = accepted.value().fd();
+        auto finished = std::make_shared<std::atomic<bool>>(false);
+        std::thread worker(&NetworkServer::handle_connection, this, std::move(accepted.value()), finished);
+
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        // Opportunistically reap workers whose connection already closed on
+        // its own, so a long-lived server doesn't accumulate joinable
+        // thread handles forever across many short-lived connections.
+        for (auto it = workers_.begin(); it != workers_.end();) {
+            if (it->finished->load()) {
+                if (it->thread.joinable()) {
+                    it->thread.join();
+                }
+                it = workers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        workers_.push_back(Worker{std::move(worker), fd, std::move(finished)});
     }
 }
 
-void NetworkServer::handle_connection(Socket client_socket) {
+void NetworkServer::handle_connection(Socket client_socket, std::shared_ptr<std::atomic<bool>> finished) {
     TCPConnection connection(std::move(client_socket));
     while (true) {
         auto request = connection.receiveMessage();
         if (!request.has_value()) {
-            return;  // client disconnected or sent something unframeable
+            break;  // client disconnected or sent something unframeable
         }
         Message response = handler_(*request);
         if (!connection.sendMessage(response)) {
-            return;
+            break;
         }
     }
+    finished->store(true);
 }

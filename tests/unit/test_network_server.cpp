@@ -92,3 +92,30 @@ TEST(NetworkServer, StopIsIdempotent) {
     server->stop();  // must not hang or double-join
     SUCCEED();
 }
+
+TEST(NetworkServer, StopClosesLiveConnectionWithoutHangingOrLeakingTheThread) {
+    // Regression test for a heap-use-after-free: stop() used to only join
+    // the accept thread, leaving any per-connection worker thread (detached,
+    // possibly still blocked in recv() on a client that never disconnects)
+    // running against a MessageHandler whose owner could be destroyed right
+    // after stop() returned. stop() must now shut every live connection down
+    // and join its worker before returning.
+    constexpr uint16_t port = 35005;
+    auto server = make_echo_server(port);
+    ASSERT_EQ(server->start(), ErrorCode::OK);
+
+    // Client connects but never sends anything — its worker thread is
+    // parked in receiveMessage()/recv() when stop() is called below.
+    TCPConnection client = connect_client(port);
+
+    // If stop() left the worker thread dangling, this either hangs (thread
+    // stuck forever) or races with a freed handler; if fixed, it returns
+    // promptly with every worker joined.
+    server->stop();
+
+    // The server-side socket must now be closed — sending on it fails
+    // instead of silently vanishing into a dead thread.
+    std::vector<std::byte> payload{std::byte{1}};
+    client.sendMessage(Message{MessageType::HEARTBEAT, 1, payload});
+    EXPECT_FALSE(client.receiveMessage().has_value());
+}

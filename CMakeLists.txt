@@ -29,12 +29,16 @@ target_link_libraries(storage PUBLIC common network Threads::Threads)
 
 add_library(master
     src/master/namespace.cpp
+    src/master/master.cpp
 )
 target_include_directories(master PUBLIC include)
-target_link_libraries(master PUBLIC common Threads::Threads)
+target_link_libraries(master PUBLIC common network Threads::Threads)
 
 add_executable(dfs_storage src/storage/main_storage.cpp)
 target_link_libraries(dfs_storage PRIVATE storage)
+
+add_executable(dfs_master src/master/main_master.cpp)
+target_link_libraries(dfs_master PRIVATE master)
 
 enable_testing()
 add_subdirectory(tests)

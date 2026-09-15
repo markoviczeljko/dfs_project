@@ -30,6 +30,7 @@ compile_commands.json
 # Local design/planning docs — kept local only, not pushed to GitHub
 /dfs_design_notes.md
 /IMPLEMENTATION_PLAN.md
+/BILJESKE_FAZE.md
 
 # Logs / runtime data
 *.log
