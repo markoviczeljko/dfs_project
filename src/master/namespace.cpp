@@ -82,6 +82,7 @@ ErrorCode NamespaceManager::delete_file(const std::string& path) {
         return ErrorCode::FILE_NOT_FOUND;
     }
     files_.erase(it);
+    pending_blocks_.erase(normalized_result.value());
     return ErrorCode::OK;
 }
 
@@ -123,4 +124,56 @@ Result<std::vector<std::string>> NamespaceManager::list_files(const std::string&
 
     return Result<std::vector<std::string>>::ok(
         std::vector<std::string>(children.begin(), children.end()));
+}
+
+Result<BlockId> NamespaceManager::allocate_block(const std::string& path) {
+    auto normalized_result = normalize_path(path);
+    if (normalized_result.is_error()) {
+        return Result<BlockId>::err(normalized_result.error());
+    }
+    const std::string& normalized = normalized_result.value();
+
+    std::unique_lock lock(mutex_);
+    if (files_.find(normalized) == files_.end()) {
+        return Result<BlockId>::err(ErrorCode::FILE_NOT_FOUND);
+    }
+    BlockId id = next_block_id_++;
+    pending_blocks_[normalized] = id;
+    return Result<BlockId>::ok(id);
+}
+
+ErrorCode NamespaceManager::commit_write(const std::string& path, BlockId block_id, uint64_t size) {
+    auto normalized_result = normalize_path(path);
+    if (normalized_result.is_error()) {
+        return normalized_result.error();
+    }
+    const std::string& normalized = normalized_result.value();
+
+    std::unique_lock lock(mutex_);
+    auto it = files_.find(normalized);
+    if (it == files_.end()) {
+        return ErrorCode::FILE_NOT_FOUND;
+    }
+
+    // Only accept a block_id this file was actually just given by
+    // allocate_block() — otherwise a client could commit an arbitrary,
+    // already-written block belonging to a different file (see
+    // docs/design.md §11).
+    auto pending_it = pending_blocks_.find(normalized);
+    if (pending_it == pending_blocks_.end() || pending_it->second != block_id) {
+        return ErrorCode::INVALID_REQUEST;
+    }
+    pending_blocks_.erase(pending_it);
+
+    uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+
+    // Faza 7 supports exactly one block per file — WRITE overwrites, so the
+    // blocks list is replaced rather than appended (see docs/design.md §11).
+    it->second.blocks = {block_id};
+    it->second.size = size;
+    it->second.modification_time = now;
+    return ErrorCode::OK;
 }

@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,6 +34,33 @@ uint64_t get_u64(const std::byte* src) {
     uint64_t be;
     std::memcpy(&be, src, sizeof(be));
     return be64toh(be);
+}
+
+void put_u32(std::vector<std::byte>& buf, uint32_t value) {
+    uint32_t be = htobe32(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+void put_u64(std::vector<std::byte>& buf, uint64_t value) {
+    uint64_t be = htobe64(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+std::string get_string(const std::byte* src, uint32_t length) {
+    return std::string(reinterpret_cast<const char*>(src), length);
+}
+
+Message make_write_commit_request(uint64_t request_id, const std::string& path, BlockId block_id,
+                                   uint64_t size) {
+    std::vector<std::byte> payload;
+    put_u32(payload, static_cast<uint32_t>(path.size()));
+    const auto* path_bytes = reinterpret_cast<const std::byte*>(path.data());
+    payload.insert(payload.end(), path_bytes, path_bytes + path.size());
+    put_u64(payload, block_id);
+    put_u64(payload, size);
+    return Message{MessageType::WRITE_COMMIT, request_id, std::move(payload)};
 }
 
 Message make_path_request(MessageType type, uint64_t request_id, const std::string& path) {
@@ -67,8 +96,9 @@ protected:
         if (master_) master_->stop();
     }
 
-    void start_master(uint16_t port) {
-        Master::Config config{port};
+    void start_master(uint16_t port, const std::string& storage_host = "127.0.0.1",
+                       uint16_t storage_port = 9101) {
+        Master::Config config{port, storage_host, storage_port};
         auto result = Master::create(config);
         ASSERT_TRUE(result.is_ok());
         master_ = std::move(result.value());
@@ -297,19 +327,230 @@ TEST_F(MasterTest, ConcurrentCreateOnSamePathYieldsExactlyOneSuccess) {
     EXPECT_EQ(already_exists_count.load(), kClients - 1);
 }
 
-TEST_F(MasterTest, ReadFileAndWriteFileAreOutOfScope) {
+TEST_F(MasterTest, WriteFileRemainsOutOfScope) {
+    // READ_FILE is repurposed in Faza 7 (see below) — WRITE_FILE still has
+    // no defined wire flow anywhere in the design notes and stays rejected.
     start_master(38009);
     TCPConnection client = connect_client(38009);
 
-    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::READ_FILE, 1, "/a.txt")));
-    auto read_resp = client.receiveMessage();
-    ASSERT_TRUE(read_resp.has_value());
-    EXPECT_EQ(read_resp->type, MessageType::ERROR);
-    EXPECT_EQ(error_from_payload(read_resp->payload), ErrorCode::INVALID_REQUEST);
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::WRITE_FILE, 1, "/a.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
+}
 
-    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::WRITE_FILE, 2, "/a.txt")));
-    auto write_resp = client.receiveMessage();
-    ASSERT_TRUE(write_resp.has_value());
-    EXPECT_EQ(write_resp->type, MessageType::ERROR);
-    EXPECT_EQ(error_from_payload(write_resp->payload), ErrorCode::INVALID_REQUEST);
+TEST_F(MasterTest, AllocateBlockReturnsIdAndConfiguredStorageNode) {
+    start_master(38015, "127.0.0.1", 9101);
+    TCPConnection client = connect_client(38015);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+
+    ASSERT_GE(resp->payload.size(), sizeof(uint64_t) + sizeof(uint32_t));
+    BlockId block_id = get_u64(resp->payload.data());
+    uint32_t host_length = get_u32(resp->payload.data() + 8);
+    std::string host = get_string(resp->payload.data() + 12, host_length);
+    uint16_t port = get_u16(resp->payload.data() + 12 + host_length);
+    EXPECT_GT(block_id, 0u);
+    EXPECT_EQ(host, "127.0.0.1");
+    EXPECT_EQ(port, 9101);
+}
+
+TEST_F(MasterTest, AllocateBlockOnNonexistentFileFails) {
+    start_master(38016);
+    TCPConnection client = connect_client(38016);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 1, "/nope.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::FILE_NOT_FOUND);
+}
+
+TEST_F(MasterTest, ConcurrentAllocateBlockProducesUniqueIds) {
+    // allocate_block()'s next_block_id_ counter is brand new in this phase
+    // and had no concurrency test anywhere — this exercises the same claim
+    // as ConcurrentCreateOnSamePathYieldsExactlyOneSuccess above, but for
+    // the new counter instead of the file map.
+    constexpr uint16_t port = 38022;
+    start_master(port);
+
+    TCPConnection setup_client = connect_client(port);
+    ASSERT_TRUE(setup_client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(setup_client.receiveMessage().has_value());
+
+    constexpr int kClients = 8;
+    std::vector<std::thread> threads;
+    std::mutex ids_mutex;
+    std::set<BlockId> block_ids;
+
+    for (int i = 0; i < kClients; ++i) {
+        threads.emplace_back([port, i, &ids_mutex, &block_ids]() {
+            TCPConnection client = connect_client(port);
+            ASSERT_TRUE(client.sendMessage(
+                make_path_request(MessageType::ALLOCATE_BLOCK, static_cast<uint64_t>(i), "/a.txt")));
+            auto resp = client.receiveMessage();
+            ASSERT_TRUE(resp.has_value());
+            ASSERT_EQ(resp->type, MessageType::ACK);
+            BlockId block_id = get_u64(resp->payload.data());
+
+            std::lock_guard<std::mutex> lock(ids_mutex);
+            block_ids.insert(block_id);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    EXPECT_EQ(block_ids.size(), static_cast<size_t>(kClients));
+}
+
+TEST_F(MasterTest, WriteCommitUpdatesMetadata) {
+    start_master(38017);
+    TCPConnection client = connect_client(38017);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    ASSERT_EQ(alloc_resp->type, MessageType::ACK);
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+
+    ASSERT_TRUE(client.sendMessage(make_write_commit_request(3, "/a.txt", block_id, /*size=*/1234)));
+    auto commit_resp = client.receiveMessage();
+    ASSERT_TRUE(commit_resp.has_value());
+    EXPECT_EQ(commit_resp->type, MessageType::ACK);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::STAT_FILE, 4, "/a.txt")));
+    auto stat_resp = client.receiveMessage();
+    ASSERT_TRUE(stat_resp.has_value());
+    EXPECT_EQ(stat_resp->type, MessageType::ACK);
+
+    uint64_t size = get_u64(stat_resp->payload.data() + 8);
+    uint32_t block_count = get_u32(stat_resp->payload.data() + 24);
+    BlockId committed_block_id = get_u64(stat_resp->payload.data() + 28);
+    EXPECT_EQ(size, 1234u);
+    EXPECT_EQ(block_count, 1u);
+    EXPECT_EQ(committed_block_id, block_id);
+}
+
+TEST_F(MasterTest, WriteCommitOnNonexistentFileFails) {
+    start_master(38018);
+    TCPConnection client = connect_client(38018);
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(1, "/nope.txt", /*block_id=*/1, /*size=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::FILE_NOT_FOUND);
+}
+
+TEST_F(MasterTest, WriteCommitWithoutPriorAllocationFails) {
+    // Regression test: commit_write() must reject a block_id that was never
+    // handed out by allocate_block() for this path — otherwise a client
+    // could point a file at an unrelated, already-written block belonging
+    // to someone else (see docs/design.md §11).
+    start_master(38023);
+    TCPConnection client = connect_client(38023);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(2, "/a.txt", /*block_id=*/999, /*size=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
+}
+
+TEST_F(MasterTest, WriteCommitWithStaleBlockIdFails) {
+    // A second ALLOCATE_BLOCK supersedes the first — committing the
+    // earlier, now-stale id must fail rather than silently succeed.
+    start_master(38024);
+    TCPConnection client = connect_client(38024);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto first_alloc = client.receiveMessage();
+    ASSERT_TRUE(first_alloc.has_value());
+    BlockId stale_block_id = get_u64(first_alloc->payload.data());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 3, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(4, "/a.txt", stale_block_id, /*size=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
+}
+
+TEST_F(MasterTest, ReadFileOnEmptyFileReturnsZeroBlocks) {
+    start_master(38019);
+    TCPConnection client = connect_client(38019);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::READ_FILE, 2, "/a.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+
+    uint32_t block_count = get_u32(resp->payload.data() + 24);
+    EXPECT_EQ(block_count, 0u);
+}
+
+TEST_F(MasterTest, ReadFileReturnsMetadataWithBlockLocation) {
+    start_master(38020, "127.0.0.1", 9101);
+    TCPConnection client = connect_client(38020);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    ASSERT_EQ(alloc_resp->type, MessageType::ACK);
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+
+    ASSERT_TRUE(client.sendMessage(make_write_commit_request(3, "/a.txt", block_id, /*size=*/9)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::READ_FILE, 4, "/a.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+
+    uint32_t block_count = get_u32(resp->payload.data() + 24);
+    ASSERT_EQ(block_count, 1u);
+    BlockId returned_block_id = get_u64(resp->payload.data() + 28);
+    uint32_t host_length = get_u32(resp->payload.data() + 36);
+    std::string host = get_string(resp->payload.data() + 40, host_length);
+    uint16_t port = get_u16(resp->payload.data() + 40 + host_length);
+    EXPECT_EQ(returned_block_id, block_id);
+    EXPECT_EQ(host, "127.0.0.1");
+    EXPECT_EQ(port, 9101);
+}
+
+TEST_F(MasterTest, ReadFileOnNonexistentFileFails) {
+    start_master(38021);
+    TCPConnection client = connect_client(38021);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::READ_FILE, 1, "/nope.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::FILE_NOT_FOUND);
 }

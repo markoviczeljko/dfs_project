@@ -43,6 +43,18 @@ std::string bytes_to_string(const std::vector<std::byte>& payload) {
     return std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
 }
 
+uint32_t get_u32(const std::byte* src) {
+    uint32_t be;
+    std::memcpy(&be, src, sizeof(be));
+    return be32toh(be);
+}
+
+uint64_t get_u64(const std::byte* src) {
+    uint64_t be;
+    std::memcpy(&be, src, sizeof(be));
+    return be64toh(be);
+}
+
 }  // namespace
 
 Master::Master(Config config) : config_(std::move(config)) {}
@@ -84,10 +96,20 @@ Message Master::handle_message(const Message& request) {
             return handle_list_files(request);
         case MessageType::STAT_FILE:
             return handle_stat_file(request);
+        case MessageType::ALLOCATE_BLOCK:
+            return handle_allocate_block(request);
+        case MessageType::WRITE_COMMIT:
+            return handle_write_commit(request);
+        case MessageType::READ_FILE:
+            // Repurposed in Faza 7 as "get file metadata for read" — the
+            // design notes' GET_FILE_METADATA was never added to the real
+            // enum, so this previously-unused type takes on that role
+            // instead (see docs/design.md §11).
+            return handle_read_file(request);
         default:
-            // Includes READ_FILE/WRITE_FILE — never given a defined wire
-            // flow anywhere in the design notes, out of scope for this
-            // phase (see docs/design.md §10).
+            // Includes WRITE_FILE — never given a defined wire flow
+            // anywhere in the design notes, out of scope for this phase
+            // (see docs/design.md §10/§11).
             return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 }
@@ -141,6 +163,64 @@ Message Master::handle_stat_file(const Message& request) {
     put_u32(response_payload, static_cast<uint32_t>(metadata.blocks.size()));
     for (BlockId block_id : metadata.blocks) {
         put_u64(response_payload, block_id);
+    }
+    return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
+}
+
+Message Master::handle_allocate_block(const Message& request) {
+    std::string path = bytes_to_string(request.payload);
+    auto result = namespace_manager_.allocate_block(path);
+    if (result.is_error()) {
+        return make_error(request.request_id, result.error());
+    }
+
+    std::vector<std::byte> response_payload;
+    put_u64(response_payload, result.value());
+    put_string(response_payload, config_.storage_node_host);
+    put_u16(response_payload, config_.storage_node_port);
+    return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
+}
+
+Message Master::handle_write_commit(const Message& request) {
+    if (request.payload.size() < sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    uint32_t path_length = get_u32(request.payload.data());
+    size_t expected_size = sizeof(uint32_t) + path_length + sizeof(uint64_t) + sizeof(uint64_t);
+    if (request.payload.size() != expected_size) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    std::string path(reinterpret_cast<const char*>(request.payload.data() + sizeof(uint32_t)),
+                      path_length);
+    BlockId block_id = get_u64(request.payload.data() + sizeof(uint32_t) + path_length);
+    uint64_t size =
+        get_u64(request.payload.data() + sizeof(uint32_t) + path_length + sizeof(uint64_t));
+
+    ErrorCode result = namespace_manager_.commit_write(path, block_id, size);
+    if (result != ErrorCode::OK) {
+        return make_error(request.request_id, result);
+    }
+    return Message{MessageType::ACK, request.request_id, {}};
+}
+
+Message Master::handle_read_file(const Message& request) {
+    std::string path = bytes_to_string(request.payload);
+    auto result = namespace_manager_.stat_file(path);
+    if (result.is_error()) {
+        return make_error(request.request_id, result.error());
+    }
+
+    const FileMetadata& metadata = result.value();
+    std::vector<std::byte> response_payload;
+    put_u64(response_payload, metadata.id);
+    put_u64(response_payload, metadata.size);
+    put_u64(response_payload, metadata.modification_time);
+    put_u32(response_payload, static_cast<uint32_t>(metadata.blocks.size()));
+    for (BlockId block_id : metadata.blocks) {
+        put_u64(response_payload, block_id);
+        put_string(response_payload, config_.storage_node_host);
+        put_u16(response_payload, config_.storage_node_port);
     }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }

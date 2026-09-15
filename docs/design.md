@@ -346,3 +346,120 @@ umjesto da ih tiho odsiječe/ignoriše (`std::stoul` sa provjerom
 `consumed == value.size()`). Isti propust postoji i u
 `main_storage.cpp` (Faza 5) — nije dirano u ovoj fazi, ostaje kao
 poznato, niskorizično zaduženje za kasnije.
+
+## 11. Faza 7 — Minimalan end-to-end CREATE/WRITE/READ
+
+Ovo je prva faza gdje Master, Storage Node i (nov) Client rade zajedno
+(§18.1 vertical-slice). Dizajn dokument ovdje ima najviše praznina do
+sada — nijedan mehanizam pomenut ispod nije bio konkretno specificiran,
+sve je izmišljeno u ovoj fazi.
+
+**Dvije precedentne odluke** (potvrđene sa korisnikom prije
+implementacije, pošto se ponavljaju u svakoj sljedećoj integration-test
+fazi):
+- **Integration testovi koriste in-process objekte**, ne odvojene OS
+  procese — `Master`/`StorageNode`/`Client` se prave kao pravi C++
+  objekti u istom test binary-ju, komunikacija i dalje ide preko pravih
+  TCP loopback konekcija. §16.3 opisuje pravi multi-proces harness, ali
+  to unosi infrastrukturu (process lifecycle, binary paths, cleanup)
+  nesrazmjernu koristi za diplomski — isti obrazac kao svi dosadašnji
+  testovi (`test_storage_node.cpp`, `test_master.cpp`), samo sad
+  kombinovan.
+- **`READ_FILE`** (postojeći, do sada nekorišten enum — Faza 6 je
+  eksplicitno testirala da vraća `INVALID_REQUEST`) **postaje prava
+  "daj mi metapodatke za čitanje" poruka**, umjesto uvođenja novog
+  `GET_FILE_METADATA` u `protocol.h`. Rješava gap iz Faze 6 (`READ_FILE`
+  je imao rezervisano mjesto u enumu bez ijedne definisane semantike) i
+  izbjegava diranje `protocol.h`-ovog enuma, koji nijedna faza do sada
+  nije mijenjala. Mijenja jedan Faza 6 test
+  (`ReadFileAndWriteFileAreOutOfScope` → `WriteFileRemainsOutOfScope`,
+  `READ_FILE` provjera zamijenjena pravim testovima).
+
+**`BlockId` generisanje — nema dizajna nigdje**, samo proza "Master
+generiše novi BlockID". Dodat `NamespaceManager::allocate_block(path)`,
+analogan postojećem `next_file_id_` obrascu: nov `next_block_id_`
+brojač, zaštićen istim `shared_mutex`-om (`unique_lock`, iako je čitanje
+`files_`-a read-only, mutacija brojača zahtijeva ekskluzivni pristup).
+Provjerava da fajl postoji (`FILE_NOT_FOUND` inače) ali **ne dira**
+`FileMetadata.blocks` — to se dešava tek na `commit_write`.
+
+**`NamespaceManager` nije imao NIJEDAN metod za ažuriranje
+`blocks`/`size`/`modification_time` poslije `create_file`-a** — dodat
+`commit_write(path, block_id, size)`. Pošto ova faza podržava tačno
+jedan blok po fajlu, `blocks` se **zamjenjuje** sa `{block_id}` (ne
+dodaje) — WRITE je overwrite semantika po §13.3, multi-block append
+dolazi tek u Fazi 8.
+
+**Master ne zna adresu Storage Node-a ni na koji način prije Faze 9**
+(`StorageRegistry`/`REGISTER_NODE` ne postoje do tada). Riješeno
+**privremenom statičkom konfiguracijom**: `Master::Config` dobija
+`storage_node_host`/`storage_node_port`, čita se iz `configs/master.conf`.
+Svaki `ALLOCATE_BLOCK`/`READ_FILE` odgovor vraća tu istu adresu — nema
+liste replika (RF=1 efektivno), dosljedno "svaka faza izmišlja svoj
+wire format nezavisno" konvenciji. Faza 9 će morati potpuno redizajnirati
+ovaj dio odgovora kad Storage Node-ovi postanu dinamički.
+
+**Tri nova Master handlera** (`ALLOCATE_BLOCK`, `WRITE_COMMIT`,
+`READ_FILE`), payload formati izmišljeni ovdje (lokalne funkcije u
+`master.cpp`, `protocol.h/cpp` netaknut):
+- `ALLOCATE_BLOCK` zahtjev = sirova putanja; odgovor = `block_id`(u64) +
+  `host`(length-prefiksovan) + `port`(u16).
+- `WRITE_COMMIT` zahtjev = `path_length`(u32)+`path`+`block_id`(u64)+
+  `size`(u64); odgovor = prazan `ACK` ili `ERROR`.
+- `READ_FILE` (repurposed) zahtjev = sirova putanja; odgovor =
+  `file_id`+`size`+`modification_time`+`block_count`+ po bloku
+  `block_id`+`host`+`port` (`block_count` je uvijek 0 ili 1 u ovoj fazi).
+
+**`Client` klasa (`include/client/client.h`) — nema posebnu
+`MasterConnection` wrapper klasu.** Dizajn dokument daje `MasterConnection`
+tačno jednu liniju (`MasterConnection master;`, bez ijednog metoda) —
+prazan omotač oko `TCPConnection`-a ne bi donio vrijednost (isti rezon
+kao izostanak `Statistics`/`StorageRegistry` stubova u Fazama 5/6).
+`Client` direktno drži `TCPConnection master_connection_` (persistentna,
+otvorena jednom u `create()`, po §5.24), a konekcija ka Storage Node-u
+je po-operaciji (otvori/piši-ili-čitaj/zatvori — nema pooling-a, nije
+potreban za jedan node). `write()` provjerava `data.size() <= BLOCK_SIZE`
+lokalno prije kontaktiranja Master-a (fail-fast na granici sistema).
+Nema thread-safety mehanizma — `Client` nije zamišljen za konkurentnu
+upotrebu (single-threaded CLI alat).
+
+**`tests/integration/` napravljen prvi put** — do sada su svi testovi
+bili u `tests/unit/` (deviation dokumentovana u Fazama 5/6). Ova faza
+stvarno testira više komponenti zajedno, tačno po
+`IMPLEMENTATION_PLAN.md`-ovoj fajl listi: `test_create.cpp` (samo
+Master+Client), `test_write.cpp`/`test_read.cpp` (Master+StorageNode+
+Client, pun CREATE→WRITE→READ round-trip).
+
+**Ručna provjera protiv pravih procesa**: `dfs_client create/write/read`
+CLI preko stvarno pokrenutih `dfs_master`+`dfs_storage`, `cmp` potvrđuje
+identične bajtove između izvornog i pročitanog fajla, čist `SIGINT`
+shutdown oba procesa.
+
+### Dopuna: `WRITE_COMMIT` nije provjeravao vlasništvo nad `block_id`-jem (nađeno pri code review-u ove faze)
+
+Nezavisan `cpp-reviewer` agent je prijavio da `commit_write(path, block_id,
+size)` prihvata **bilo koji** `block_id` bez provjere da je taj id
+stvarno prethodno izdat za taj fajl preko `ALLOCATE_BLOCK`-a. Dokaz:
+`WriteCommitUpdatesMetadata` test je (prije popravke) commit-ovao
+`block_id=42` za `/a.txt` bez ijednog prethodnog `ALLOCATE_BLOCK` poziva,
+i Master ga je bez pogovora prihvatio. Posljedica: klijent (bagovan ili
+zlonamjeran) mogao je "ukrasti" tuđ, već upisan blok tako što bi ga
+commit-ovao pod svojom putanjom — `READ_FILE`/`Client::read()` bi tada
+transparentno vratio tuđe podatke. Ovo je ozbiljnije od već prihvaćenog
+"nema GC-a starog bloka pri overwrite-u" ograničenja (koje samo troši
+prostor, ne otkriva tuđe podatke).
+
+**Popravka**: `NamespaceManager` dobija `pending_blocks_`
+(`unordered_map<string, BlockId>`, putanja → posljednji dodijeljen ali
+još ne commit-ovan blok). `allocate_block()` upisuje u ovu mapu;
+`commit_write()` odbija (`INVALID_REQUEST`) ako dati `block_id` ne
+odgovara zapisu u `pending_blocks_`-u za tu putanju, i briše zapis
+nakon uspješnog commit-a. Drugi `ALLOCATE_BLOCK` za isti fajl prirodno
+"pregazi" prvi — commit sa starim (stale) id-jem se odbija.
+`delete_file()` takođe čisti `pending_blocks_` zapis. Dodata dva nova
+regresiona testa (`WriteCommitWithoutPriorAllocationFails`,
+`WriteCommitWithStaleBlockIdFails`), i dva postojeća testa
+(`WriteCommitUpdatesMetadata`, `ReadFileReturnsMetadataWithBlockLocation`)
+su ispravljena da prvo stvarno alociraju blok prije commit-a. Pravi
+`Client::write()` tok nije bio pogođen — on je oduvijek commit-ovao
+tačno onaj `block_id` koji je upravo dobio od `ALLOCATE_BLOCK`-a.
