@@ -1,5 +1,7 @@
 #include "network/connection.h"
 
+#include <endian.h>
+
 #include <array>
 #include <cstring>
 
@@ -56,7 +58,7 @@ std::optional<Message> TCPConnection::receiveMessage() {
         // Reject based on the claimed length alone — never allocate a buffer
         // sized by an untrusted, oversized payload_length.
         std::vector<std::byte> error_payload(sizeof(uint16_t));
-        uint16_t code = static_cast<uint16_t>(ErrorCode::INVALID_MESSAGE);
+        uint16_t code = htobe16(static_cast<uint16_t>(ErrorCode::INVALID_MESSAGE));
         std::memcpy(error_payload.data(), &code, sizeof(code));
         return Message{MessageType::ERROR, header.request_id, std::move(error_payload)};
     }

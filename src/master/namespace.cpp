@@ -138,11 +138,12 @@ Result<BlockId> NamespaceManager::allocate_block(const std::string& path) {
         return Result<BlockId>::err(ErrorCode::FILE_NOT_FOUND);
     }
     BlockId id = next_block_id_++;
-    pending_blocks_[normalized] = id;
+    pending_blocks_[normalized].insert(id);
     return Result<BlockId>::ok(id);
 }
 
-ErrorCode NamespaceManager::commit_write(const std::string& path, BlockId block_id, uint64_t size) {
+ErrorCode NamespaceManager::commit_write(const std::string& path,
+                                          const std::vector<BlockId>& block_ids, uint64_t size) {
     auto normalized_result = normalize_path(path);
     if (normalized_result.is_error()) {
         return normalized_result.error();
@@ -155,24 +156,32 @@ ErrorCode NamespaceManager::commit_write(const std::string& path, BlockId block_
         return ErrorCode::FILE_NOT_FOUND;
     }
 
-    // Only accept a block_id this file was actually just given by
-    // allocate_block() — otherwise a client could commit an arbitrary,
-    // already-written block belonging to a different file (see
-    // docs/design.md §11).
+    // Every id being committed must have been allocated for this path at
+    // some point since its last successful commit/delete (subset check
+    // against the pending set) — otherwise a client could commit an
+    // arbitrary, already-written block belonging to a different path (see
+    // docs/design.md §12).
     auto pending_it = pending_blocks_.find(normalized);
-    if (pending_it == pending_blocks_.end() || pending_it->second != block_id) {
-        return ErrorCode::INVALID_REQUEST;
+    for (BlockId id : block_ids) {
+        if (pending_it == pending_blocks_.end() ||
+            pending_it->second.find(id) == pending_it->second.end()) {
+            return ErrorCode::INVALID_REQUEST;
+        }
     }
-    pending_blocks_.erase(pending_it);
+    // Clear the whole pending set, not just the committed ids — any
+    // leftover ids from an earlier abandoned write attempt on this path are
+    // discarded here rather than lingering forever (see docs/design.md §12).
+    pending_blocks_.erase(normalized);
 
     uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
 
-    // Faza 7 supports exactly one block per file — WRITE overwrites, so the
-    // blocks list is replaced rather than appended (see docs/design.md §11).
-    it->second.blocks = {block_id};
+    // WRITE overwrites — the blocks list is replaced wholesale, in the
+    // caller-given order, which is the file's byte order (see
+    // docs/design.md §12).
+    it->second.blocks = block_ids;
     it->second.size = size;
     it->second.modification_time = now;
     return ErrorCode::OK;

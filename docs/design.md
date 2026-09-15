@@ -463,3 +463,123 @@ regresiona testa (`WriteCommitWithoutPriorAllocationFails`,
 su ispravljena da prvo stvarno alociraju blok prije commit-a. Pravi
 `Client::write()` tok nije bio pogođen — on je oduvijek commit-ovao
 tačno onaj `block_id` koji je upravo dobio od `ALLOCATE_BLOCK`-a.
+
+## 12. Faza 8 — Multi-block WRITE/READ
+
+Uklanja Faza 7-ino ograničenje "fajl ima tačno jedan blok". `Client::write()`
+sada dijeli podatke veće od jednog bloka na više chunk-ova; `Client::read()`
+ih sastavlja nazad. `NamespaceManager`/`Master` prelaze sa "commit tačno
+jednog `block_id`-a" na "commit uređene liste `block_id`-jeva".
+`IMPLEMENTATION_PLAN.md` eksplicitno bira **jedan finalni `WRITE_COMMIT`
+nakon svih per-chunk `ALLOCATE_BLOCK`+`WRITE_BLOCK` poziva**, nasuprot
+`dfs_design_notes.md` §6.6-ovom dijagramu koji pokazuje commit po bloku —
+plan dokument je konačna korisnikova odluka i arhitekturno je čišći: neuspjeh
+usred petlje nikad ne mutira `FileMetadata.blocks` djelimično, jer
+`WRITE_COMMIT` se tada jednostavno nikad ne šalje. `StorageNode`/
+`NetworkServer` se ne diraju — svaki blok je već potpuno nezavisna jedinica
+adresirana samo preko `BlockId`-a; `handle_read_file`/`handle_stat_file` su
+već bili "N-block-ready" na wire nivou (već petljaju kroz `metadata.blocks`),
+samo `Client::read()` je čitao isključivo prvi element te liste.
+
+**`pending_blocks_` — subset-check + full-clear, umjesto Faza 7-inog
+exact-match.** Faza 7 je garantovala "samo najnovija alokacija za path je
+važeća" (svaki novi `allocate_block()` prepisivao je prethodni pending id).
+Faza 8 zahtijeva da više uzastopnih `allocate_block()` poziva za isti path
+ostanu **istovremeno validni** do jednog finalnog commit-a, pa je to
+ograničenje nužno napušteno. `pending_blocks_` postaje
+`unordered_map<string, unordered_set<BlockId>>`; `allocate_block()` sada
+**dodaje** u set umjesto da prepisuje. `commit_write(path, block_ids, size)`
+prima listu id-jeva i validira da je **svaki** id iz te liste prisutan u
+pending setu za taj path (subset-check, ne exact-match cijelog seta). Nakon
+uspješnog commit-a, `pending_blocks_.erase(path)` briše **cijeli** set —
+i iskorištene i eventualne zaostale id-jeve iz ranijeg napuštenog write
+pokušaja. Exact-match bi trajno blokirao path nakon bilo kog neuspjelog
+write pokušaja (zaostali pending id-jevi nikad ne bi mogli tačno da se
+poklope sa novom listom); subset-check + full-clear to rješava — neiskorišteni
+pending id-jevi se tiho odbacuju (postaju orphan blokovi, ista GC-odloženo
+filozofija kao kod overwrite-a). Cross-path krađa ostaje potpuno blokirana
+(id alociran za path A nikad ne uđe u `pending_blocks_[B]`).
+
+**Namjerno napuštena semantika, dokumentovano**: stari Faza 7 test
+`WriteCommitWithStaleBlockIdFails` (tvrdio je da drugi `ALLOCATE_BLOCK`
+poništava prvi za isti path) je povučen — to svojstvo je nespojivo sa
+multi-chunk write-om koji zahtijeva više istovremeno važećih pending
+alokacija. Zamijenjen sa `WriteCommitAcceptsAnyPreviouslyAllocatedIdForThisPath`
+(dokumentuje novo ponašanje), `WriteCommitWithBlockIdFromDifferentPathFails`
+(pravi cross-path anti-theft regresioni test, preuzima ulogu koju je stari
+test imao za tu zabrinutost), `WriteCommitWithMultipleBlocksSucceedsAndPreservesOrder`,
+`WriteCommitSubsetOfPendingBlocksSucceedsAndDiscardsUnusedIds` (dokazuje da
+abandoned write pokušaj ne blokira sljedeći legitiman write) i
+`WriteCommitWithUnallocatedIdAmongOtherwiseValidIdsFails`.
+
+**Poznato, prihvaćeno ograničenje (nije popravljeno)**: dva istovremena
+`Client::write()` poziva na **isti path** mogu dovesti do toga da jedan
+legitimno završi write, ali njegov `commit_write()` (koji radi full-clear)
+obriše pending blokove drugog, još-u-toku write-a — taj drugi dobije lažni
+`INVALID_REQUEST` iako ništa nije ukradeno/oštećeno. Ista kategorija race-a
+kao Faza 7-ino prihvaćeno allocate-time ograničenje, samo pomjerena na
+commit-time; real fix (per-writer izolacija/lease) van obima do neke buduće
+faze. Slično, `pending_blocks_` može rasti neograničeno za path koji se
+ponovljeno write-uje-pa-napusti bez ikad commit-ovanja — ograničeno samo
+memorijom procesa, ne diskom.
+
+**`WRITE_COMMIT` wire format promijenjen**: staro
+`[u32 path_len][path][u64 block_id][u64 size]` (tačno jedan blok) →
+novo `[u32 path_len][path][u64 size][u32 block_count]
+[block_count x u64 block_id]` (uređena lista, proizvoljne dužine).
+`ALLOCATE_BLOCK` i `READ_FILE`/`STAT_FILE` se ne mijenjaju — potonja dva su
+već bila N-block-ready na wire nivou.
+
+**Veličina bloka konfigurabilna samo na `Client` strani**
+(`Client::Config.block_size`, default = `BLOCK_SIZE` iz `common/config.h`).
+Master/`NamespaceManager` ne treba da zna veličinu chunk-a uopšte — samo
+prima gotovu uređenu listu blokova, pa ostaje potpuno agnostičan. Integration
+testovi override-uju `block_size` na par KB da multi-block scenarije testiraju
+brzo bez pomjeranja stvarnih 64 MB kroz loopback TCP u svakom test run-u.
+`Client::write()` odbija `block_size == 0` ili `block_size > BLOCK_SIZE`
+(`INVALID_REQUEST`) — potonje bi inače propalo tek duboko u `TCPConnection`
+sa zbunjujućim `INTERNAL_ERROR`-om jer bi premašilo `MAX_DATA_MESSAGE_SIZE`.
+
+**Empty-write promjena ponašanja**: `write(path, {})` sada proizvodi 0
+blokova (`chunk_count = data.empty() ? 0 : ceil(...)`), umjesto Faza 7-inog
+ponašanja gdje je prazan write i dalje alocirao 1 blok sa 0 bajtova. Manja
+namjerna pojednostavljenja `ceil()` formule, ne krši nijedan postojeći test.
+
+### Dopuna: `is_data_message()` je pogrešno klasifikovao ACK/ERROR odgovore, ograničavajući READ_BLOCK odgovore na 64 KB (nađeno pri ručnoj end-to-end provjeri ove faze)
+
+Bug nije bio uveden u ovoj fazi — postojao je od Faze 5, ali nikad nije
+okinut jer nijedan ručni test do sada nije stvarno pročitao/upisao preko
+64 KB podataka u jednom bloku. Otkriven tek kad je Faza 8 prvi put ručno
+testirana na realno velikom fajlu (130 MB, 3 bloka) protiv pravih pokrenutih
+`dfs_master`/`dfs_storage` procesa: `write` je uspio (podaci idu preko
+`WRITE_BLOCK` **zahtjeva**, ispravno klasifikovanog kao "data message"), ali
+`read` je propao sa nedešifrovanom greškom — čak i za obično 1 MB fajl.
+
+**Uzrok**: `is_data_message(MessageType)` u `src/network/protocol.cpp`
+klasifikuje poruku po njenom **tipu**, ali odgovor na `READ_BLOCK` zahtjev
+ima tip `ACK` (generički, ne `READ_BLOCK`), pa `TCPConnection::receiveMessage()`
+u `src/network/connection.cpp` nameće mali `MAX_CONTROL_MESSAGE_SIZE`
+(64 KB) limit na ACK odgovore koji legitimno nose do punog bloka (64 MB)
+podataka — svaki `payload_length` preko 64 KB odbacuje se kao
+`INVALID_MESSAGE` prije nego što se uopšte pokuša pročitati tijelo poruke.
+
+**Popravka**: `MessageType::ACK` i `MessageType::ERROR` dodati u
+`is_data_message()`-ovu listu tipova koji dobijaju veliki limit — primalac
+nema način da zna na koji zahtjev dati ACK/ERROR odgovara, pa oba tipa
+uvijek moraju dobiti velikodušan `MAX_DATA_MESSAGE_SIZE` limit. Ovo ne
+otvara novi sigurnosni gap: `WRITE_BLOCK`/`READ_BLOCK` i ostali data-tipovi
+su već prije ove izmjene mogli izazvati istu (već postojeću, van obima ove
+faze) slabost — bez per-connection read timeout-a, proizvoljan TCP klijent
+može poslati header koji tvrdi `payload_length` blizu 64 MB i zauvijek
+blokirati worker thread čekajući tijelo poruke koje nikad ne stiže; dodavanje
+ACK/ERROR-a u listu ne mijenja tu prijetnju na način koji već nije postojao.
+
+Usput popravljen i srodan, sitniji bug u istoj datoteci:
+`connection.cpp`-ov `INVALID_MESSAGE` error-payload je kopirao sirove bajte
+bez `htobe16()` poziva — nekonzistentno sa svakim drugim mjestom u kodu koje
+kodira `ErrorCode` na wire (sva ostala mjesta u `master.cpp`/`storage_node.cpp`/
+`client.cpp` prolaze kroz `htobe16` prije kopiranja). Popravljeno dodavanjem
+`htobe16()` poziva.
+
+Nezavisan `cpp-reviewer` agent potvrdio je i popravku dizajna i ova dva
+mrežna bug-fixa kao ispravne, bez CRITICAL/HIGH nalaza.

@@ -52,14 +52,19 @@ std::string get_string(const std::byte* src, uint32_t length) {
     return std::string(reinterpret_cast<const char*>(src), length);
 }
 
-Message make_write_commit_request(uint64_t request_id, const std::string& path, BlockId block_id,
-                                   uint64_t size) {
+Message make_write_commit_request(uint64_t request_id, const std::string& path,
+                                   const std::vector<BlockId>& block_ids, uint64_t size) {
+    // Faza 8 wire format: [u32 path_len][path][u64 size][u32 block_count]
+    // [block_count x u64 block_id] (see docs/design.md §12).
     std::vector<std::byte> payload;
     put_u32(payload, static_cast<uint32_t>(path.size()));
     const auto* path_bytes = reinterpret_cast<const std::byte*>(path.data());
     payload.insert(payload.end(), path_bytes, path_bytes + path.size());
-    put_u64(payload, block_id);
     put_u64(payload, size);
+    put_u32(payload, static_cast<uint32_t>(block_ids.size()));
+    for (BlockId block_id : block_ids) {
+        put_u64(payload, block_id);
+    }
     return Message{MessageType::WRITE_COMMIT, request_id, std::move(payload)};
 }
 
@@ -422,7 +427,8 @@ TEST_F(MasterTest, WriteCommitUpdatesMetadata) {
     ASSERT_EQ(alloc_resp->type, MessageType::ACK);
     BlockId block_id = get_u64(alloc_resp->payload.data());
 
-    ASSERT_TRUE(client.sendMessage(make_write_commit_request(3, "/a.txt", block_id, /*size=*/1234)));
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/1234)));
     auto commit_resp = client.receiveMessage();
     ASSERT_TRUE(commit_resp.has_value());
     EXPECT_EQ(commit_resp->type, MessageType::ACK);
@@ -445,7 +451,7 @@ TEST_F(MasterTest, WriteCommitOnNonexistentFileFails) {
     TCPConnection client = connect_client(38018);
 
     ASSERT_TRUE(
-        client.sendMessage(make_write_commit_request(1, "/nope.txt", /*block_id=*/1, /*size=*/1)));
+        client.sendMessage(make_write_commit_request(1, "/nope.txt", {/*block_id=*/1}, /*size=*/1)));
     auto resp = client.receiveMessage();
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
@@ -464,16 +470,21 @@ TEST_F(MasterTest, WriteCommitWithoutPriorAllocationFails) {
     ASSERT_TRUE(client.receiveMessage().has_value());
 
     ASSERT_TRUE(
-        client.sendMessage(make_write_commit_request(2, "/a.txt", /*block_id=*/999, /*size=*/1)));
+        client.sendMessage(make_write_commit_request(2, "/a.txt", {/*block_id=*/999}, /*size=*/1)));
     auto resp = client.receiveMessage();
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
     EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
 }
 
-TEST_F(MasterTest, WriteCommitWithStaleBlockIdFails) {
-    // A second ALLOCATE_BLOCK supersedes the first — committing the
-    // earlier, now-stale id must fail rather than silently succeed.
+TEST_F(MasterTest, WriteCommitAcceptsAnyPreviouslyAllocatedIdForThisPath) {
+    // Faza 8: a multi-chunk write needs several ALLOCATE_BLOCK calls to
+    // stay simultaneously valid until one final WRITE_COMMIT, so — unlike
+    // Faza 7 — an older allocation for a path is no longer invalidated the
+    // moment a newer one for the same path is issued (see docs/design.md
+    // §12). This replaces the old WriteCommitWithStaleBlockIdFails test,
+    // whose property (newer allocation supersedes older one) is
+    // deliberately dropped.
     start_master(38024);
     TCPConnection client = connect_client(38024);
 
@@ -483,13 +494,139 @@ TEST_F(MasterTest, WriteCommitWithStaleBlockIdFails) {
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
     auto first_alloc = client.receiveMessage();
     ASSERT_TRUE(first_alloc.has_value());
-    BlockId stale_block_id = get_u64(first_alloc->payload.data());
+    BlockId first_block_id = get_u64(first_alloc->payload.data());
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 3, "/a.txt")));
     ASSERT_TRUE(client.receiveMessage().has_value());
 
     ASSERT_TRUE(
-        client.sendMessage(make_write_commit_request(4, "/a.txt", stale_block_id, /*size=*/1)));
+        client.sendMessage(make_write_commit_request(4, "/a.txt", {first_block_id}, /*size=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+}
+
+TEST_F(MasterTest, WriteCommitWithBlockIdFromDifferentPathFails) {
+    // Cross-path anti-theft regression: a block_id allocated for one path
+    // must never be committable under a different path (see
+    // docs/design.md §12).
+    start_master(38025);
+    TCPConnection client = connect_client(38025);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 2, "/b.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 3, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(4, "/b.txt", {block_id}, /*size=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
+}
+
+TEST_F(MasterTest, WriteCommitWithMultipleBlocksSucceedsAndPreservesOrder) {
+    start_master(38026);
+    TCPConnection client = connect_client(38026);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    std::vector<BlockId> block_ids;
+    for (uint64_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(client.sendMessage(
+            make_path_request(MessageType::ALLOCATE_BLOCK, 2 + i, "/a.txt")));
+        auto resp = client.receiveMessage();
+        ASSERT_TRUE(resp.has_value());
+        block_ids.push_back(get_u64(resp->payload.data()));
+    }
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(5, "/a.txt", block_ids, /*size=*/150)));
+    auto commit_resp = client.receiveMessage();
+    ASSERT_TRUE(commit_resp.has_value());
+    EXPECT_EQ(commit_resp->type, MessageType::ACK);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::STAT_FILE, 6, "/a.txt")));
+    auto stat_resp = client.receiveMessage();
+    ASSERT_TRUE(stat_resp.has_value());
+    ASSERT_EQ(stat_resp->type, MessageType::ACK);
+
+    uint32_t block_count = get_u32(stat_resp->payload.data() + 24);
+    ASSERT_EQ(block_count, 3u);
+    for (size_t i = 0; i < block_ids.size(); ++i) {
+        BlockId returned = get_u64(stat_resp->payload.data() + 28 + i * sizeof(uint64_t));
+        EXPECT_EQ(returned, block_ids[i]);
+    }
+}
+
+TEST_F(MasterTest, WriteCommitSubsetOfPendingBlocksSucceedsAndDiscardsUnusedIds) {
+    // Documents the abandoned-write-attempt scenario: allocating more
+    // blocks than are ultimately committed must not leave the path
+    // permanently unwritable (see docs/design.md §12).
+    start_master(38027);
+    TCPConnection client = connect_client(38027);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    std::vector<BlockId> allocated;
+    for (uint64_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(client.sendMessage(
+            make_path_request(MessageType::ALLOCATE_BLOCK, 2 + i, "/a.txt")));
+        auto resp = client.receiveMessage();
+        ASSERT_TRUE(resp.has_value());
+        allocated.push_back(get_u64(resp->payload.data()));
+    }
+
+    // Commit only the first 2 of the 3 allocated blocks — the 3rd is
+    // silently discarded (orphaned), not an error.
+    std::vector<BlockId> committed(allocated.begin(), allocated.begin() + 2);
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(5, "/a.txt", committed, /*size=*/100)));
+    auto first_commit = client.receiveMessage();
+    ASSERT_TRUE(first_commit.has_value());
+    EXPECT_EQ(first_commit->type, MessageType::ACK);
+
+    // A second, fully independent legitimate write to the same path must
+    // still work cleanly afterward.
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 6, "/a.txt")));
+    auto second_alloc = client.receiveMessage();
+    ASSERT_TRUE(second_alloc.has_value());
+    BlockId second_block_id = get_u64(second_alloc->payload.data());
+
+    ASSERT_TRUE(client.sendMessage(
+        make_write_commit_request(7, "/a.txt", {second_block_id}, /*size=*/50)));
+    auto second_commit = client.receiveMessage();
+    ASSERT_TRUE(second_commit.has_value());
+    EXPECT_EQ(second_commit->type, MessageType::ACK);
+}
+
+TEST_F(MasterTest, WriteCommitWithUnallocatedIdAmongOtherwiseValidIdsFails) {
+    start_master(38028);
+    TCPConnection client = connect_client(38028);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    std::vector<BlockId> allocated;
+    for (uint64_t i = 0; i < 2; ++i) {
+        ASSERT_TRUE(client.sendMessage(
+            make_path_request(MessageType::ALLOCATE_BLOCK, 2 + i, "/a.txt")));
+        auto resp = client.receiveMessage();
+        ASSERT_TRUE(resp.has_value());
+        allocated.push_back(get_u64(resp->payload.data()));
+    }
+    allocated.push_back(99999);  // never allocated
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(4, "/a.txt", allocated, /*size=*/1)));
     auto resp = client.receiveMessage();
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
@@ -525,7 +662,8 @@ TEST_F(MasterTest, ReadFileReturnsMetadataWithBlockLocation) {
     ASSERT_EQ(alloc_resp->type, MessageType::ACK);
     BlockId block_id = get_u64(alloc_resp->payload.data());
 
-    ASSERT_TRUE(client.sendMessage(make_write_commit_request(3, "/a.txt", block_id, /*size=*/9)));
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/9)));
     ASSERT_TRUE(client.receiveMessage().has_value());
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::READ_FILE, 4, "/a.txt")));

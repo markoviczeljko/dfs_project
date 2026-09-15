@@ -182,22 +182,39 @@ Message Master::handle_allocate_block(const Message& request) {
 }
 
 Message Master::handle_write_commit(const Message& request) {
+    // Faza 8 wire format: [u32 path_len][path][u64 size][u32 block_count]
+    // [block_count x u64 block_id] — replaces Faza 7's single (block_id,
+    // size) pair with an ordered, variable-length block list (see
+    // docs/design.md §12).
     if (request.payload.size() < sizeof(uint32_t)) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
     uint32_t path_length = get_u32(request.payload.data());
-    size_t expected_size = sizeof(uint32_t) + path_length + sizeof(uint64_t) + sizeof(uint64_t);
+    size_t offset = sizeof(uint32_t);
+    if (request.payload.size() < offset + path_length + sizeof(uint64_t) + sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    std::string path(reinterpret_cast<const char*>(request.payload.data() + offset), path_length);
+    offset += path_length;
+    uint64_t size = get_u64(request.payload.data() + offset);
+    offset += sizeof(uint64_t);
+    uint32_t block_count = get_u32(request.payload.data() + offset);
+    offset += sizeof(uint32_t);
+
+    size_t expected_size = offset + static_cast<size_t>(block_count) * sizeof(uint64_t);
     if (request.payload.size() != expected_size) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 
-    std::string path(reinterpret_cast<const char*>(request.payload.data() + sizeof(uint32_t)),
-                      path_length);
-    BlockId block_id = get_u64(request.payload.data() + sizeof(uint32_t) + path_length);
-    uint64_t size =
-        get_u64(request.payload.data() + sizeof(uint32_t) + path_length + sizeof(uint64_t));
+    std::vector<BlockId> block_ids;
+    block_ids.reserve(block_count);
+    for (uint32_t i = 0; i < block_count; ++i) {
+        block_ids.push_back(get_u64(request.payload.data() + offset));
+        offset += sizeof(uint64_t);
+    }
 
-    ErrorCode result = namespace_manager_.commit_write(path, block_id, size);
+    ErrorCode result = namespace_manager_.commit_write(path, block_ids, size);
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }
