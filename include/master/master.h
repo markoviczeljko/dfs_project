@@ -16,8 +16,9 @@
 // Node inventory (StorageRegistry) and replica placement
 // (ReplicationManager), and a NetworkServer (accept-loop, reused verbatim
 // from Faza 5), and wires CREATE_FILE/DELETE_FILE/LIST_FILES/STAT_FILE/
-// ALLOCATE_BLOCK/WRITE_COMMIT/READ_FILE/REGISTER_NODE requests to them.
-// See docs/design.md §13.
+// ALLOCATE_BLOCK/WRITE_COMMIT/READ_FILE/REGISTER_NODE/APPEND_FILE/
+// APPEND_COMMIT requests to them.
+// See docs/design.md §13, §14.
 class Master {
 public:
     struct Config {
@@ -44,6 +45,8 @@ private:
     Message handle_write_commit(const Message& request);
     Message handle_read_file(const Message& request);
     Message handle_register_node(const Message& request);
+    Message handle_append_file(const Message& request);
+    Message handle_append_commit(const Message& request);
     static Message make_error(uint64_t request_id, ErrorCode error);
 
     Config config_;

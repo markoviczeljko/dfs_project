@@ -105,6 +105,25 @@ TEST_F(BlockManagerTest, WriteBlockWorksWithExternallyProvidedId) {
     EXPECT_EQ(read_result.value(), data);
 }
 
+TEST_F(BlockManagerTest, WriteBlockAtDelegatesToStorage) {
+    // Thin passthrough — full write_block_at() coverage lives in
+    // test_block_storage.cpp (see docs/design.md §14).
+    auto result = BlockManager::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto manager = std::move(result.value());
+
+    auto allocated = manager->allocate_block();
+    ASSERT_TRUE(allocated.is_ok());
+    BlockId id = allocated.value();
+
+    ASSERT_EQ(manager->write_block(id, std::vector<uint8_t>{1, 2, 3}), ErrorCode::OK);
+    EXPECT_EQ(manager->write_block_at(id, 1, std::vector<uint8_t>{9}), ErrorCode::OK);
+
+    auto read_result = manager->read_block(id);
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), (std::vector<uint8_t>{1, 9, 3}));
+}
+
 TEST_F(BlockManagerTest, ReleaseBlockRemovesDataAndIsIdempotent) {
     auto result = BlockManager::create(dir_, 1024 * 1024);
     ASSERT_TRUE(result.is_ok());

@@ -119,6 +119,119 @@ ErrorCode Client::create_file(const std::string& path) {
     return error_from_payload(response.payload);
 }
 
+Result<std::vector<Client::ReplicaLocation>> Client::parse_replica_list(
+    const std::vector<std::byte>& payload, size_t& offset, uint32_t count) {
+    std::vector<ReplicaLocation> replicas;
+    replicas.reserve(count);
+    for (uint32_t r = 0; r < count; ++r) {
+        if (payload.size() < offset + sizeof(uint32_t)) {
+            return Result<std::vector<ReplicaLocation>>::err(ErrorCode::INTERNAL_ERROR);
+        }
+        uint32_t host_length = get_u32(payload.data() + offset);
+        offset += sizeof(uint32_t);
+        if (payload.size() < offset + host_length + sizeof(uint16_t)) {
+            return Result<std::vector<ReplicaLocation>>::err(ErrorCode::INTERNAL_ERROR);
+        }
+        std::string host(reinterpret_cast<const char*>(payload.data() + offset), host_length);
+        offset += host_length;
+        uint16_t port = get_u16(payload.data() + offset);
+        offset += sizeof(uint16_t);
+        replicas.push_back(ReplicaLocation{std::move(host), port});
+    }
+    return Result<std::vector<ReplicaLocation>>::ok(std::move(replicas));
+}
+
+ErrorCode Client::write_chunk_to_replicas(BlockId block_id, uint64_t offset, const uint8_t* data,
+                                           size_t len, const std::vector<ReplicaLocation>& replicas) {
+    // Data plane — never routed through Master, one fresh connection per
+    // replica (no pooling, see docs/design.md §11). Commit requires ALL
+    // replicas to ACK (strict 3/3, see docs/design.md §13), so abort
+    // immediately on the first failure — no point trying the remaining
+    // replicas once commit is already impossible.
+    for (const ReplicaLocation& location : replicas) {
+        auto socket_result = Socket::create();
+        if (socket_result.is_error()) {
+            return socket_result.error();
+        }
+        Socket socket = std::move(socket_result.value());
+        if (ErrorCode err = socket.connect(location.host, location.port); err != ErrorCode::OK) {
+            return err;
+        }
+        TCPConnection node_connection(std::move(socket));
+
+        std::vector<std::byte> write_payload;
+        put_u64(write_payload, block_id);
+        put_u64(write_payload, offset);
+        put_u32(write_payload, static_cast<uint32_t>(len));
+        const auto* data_bytes = reinterpret_cast<const std::byte*>(data);
+        write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
+
+        if (!node_connection.sendMessage(
+                Message{MessageType::WRITE_BLOCK, next_request_id(), std::move(write_payload)})) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        auto write_response = node_connection.receiveMessage();
+        if (!write_response.has_value()) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (write_response->type != MessageType::ACK) {
+            // Abort without committing — the old file version stays intact
+            // (see docs/design.md §12); already-written replicas for this
+            // attempt become orphans (GC deferred).
+            return error_from_payload(write_response->payload);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, const uint8_t* data,
+                                                       size_t len) {
+    size_t chunk_count = len == 0 ? 0 : (len + config_.block_size - 1) / config_.block_size;
+    std::vector<BlockId> block_ids;
+    block_ids.reserve(chunk_count);
+
+    for (size_t i = 0; i < chunk_count; ++i) {
+        size_t chunk_offset = i * config_.block_size;
+        size_t chunk_len = std::min<size_t>(config_.block_size, len - chunk_offset);
+
+        // Step 1: ask Master for a BlockId + replica locations.
+        Message alloc_request{MessageType::ALLOCATE_BLOCK, next_request_id(), string_to_bytes(path)};
+        auto alloc_result = call_master(alloc_request);
+        if (alloc_result.is_error()) {
+            return Result<std::vector<BlockId>>::err(alloc_result.error());
+        }
+        const Message& alloc_response = alloc_result.value();
+        if (alloc_response.type != MessageType::ACK) {
+            return Result<std::vector<BlockId>>::err(error_from_payload(alloc_response.payload));
+        }
+        if (alloc_response.payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
+            return Result<std::vector<BlockId>>::err(ErrorCode::INTERNAL_ERROR);
+        }
+        BlockId block_id = get_u64(alloc_response.payload.data());
+        uint32_t replica_count = get_u32(alloc_response.payload.data() + sizeof(uint64_t));
+        size_t resp_offset = sizeof(uint64_t) + sizeof(uint32_t);
+
+        auto replicas_result = parse_replica_list(alloc_response.payload, resp_offset, replica_count);
+        if (replicas_result.is_error()) {
+            return Result<std::vector<BlockId>>::err(replicas_result.error());
+        }
+        if (alloc_response.payload.size() != resp_offset) {
+            return Result<std::vector<BlockId>>::err(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // Step 2: write this chunk (as a brand-new block, offset 0) to
+        // every replica.
+        ErrorCode write_err = write_chunk_to_replicas(block_id, /*offset=*/0, data + chunk_offset,
+                                                       chunk_len, replicas_result.value());
+        if (write_err != ErrorCode::OK) {
+            return Result<std::vector<BlockId>>::err(write_err);
+        }
+
+        block_ids.push_back(block_id);
+    }
+    return Result<std::vector<BlockId>>::ok(std::move(block_ids));
+}
+
 ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& data) {
     // block_size must be positive and never exceed the real BLOCK_SIZE — a
     // larger chunk would exceed MAX_DATA_MESSAGE_SIZE at the network layer
@@ -128,103 +241,148 @@ ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& dat
         return ErrorCode::INVALID_REQUEST;
     }
 
-    size_t total = data.size();
-    size_t chunk_count = total == 0 ? 0 : (total + config_.block_size - 1) / config_.block_size;
-    std::vector<BlockId> block_ids;
-    block_ids.reserve(chunk_count);
+    auto blocks_result = write_new_blocks(path, data.data(), data.size());
+    if (blocks_result.is_error()) {
+        return blocks_result.error();
+    }
+    const std::vector<BlockId>& block_ids = blocks_result.value();
 
-    for (size_t i = 0; i < chunk_count; ++i) {
-        size_t chunk_offset = i * config_.block_size;
-        size_t len = std::min<size_t>(config_.block_size, total - chunk_offset);
-
-        // Step 1: ask Master for a BlockId + replica locations.
-        Message alloc_request{MessageType::ALLOCATE_BLOCK, next_request_id(), string_to_bytes(path)};
-        auto alloc_result = call_master(alloc_request);
-        if (alloc_result.is_error()) {
-            return alloc_result.error();
-        }
-        const Message& alloc_response = alloc_result.value();
-        if (alloc_response.type != MessageType::ACK) {
-            return error_from_payload(alloc_response.payload);
-        }
-        if (alloc_response.payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        BlockId block_id = get_u64(alloc_response.payload.data());
-        uint32_t replica_count = get_u32(alloc_response.payload.data() + sizeof(uint64_t));
-        size_t resp_offset = sizeof(uint64_t) + sizeof(uint32_t);
-
-        // Step 2: write this chunk directly to every replica Storage Node
-        // (data plane — never routed through Master), one fresh connection
-        // per replica (no pooling, see docs/design.md §11). Commit
-        // requires ALL replicas to ACK (strict 3/3, see docs/design.md
-        // §13), so abort immediately on the first failure — no point
-        // trying the remaining replicas once commit is already impossible.
-        for (uint32_t r = 0; r < replica_count; ++r) {
-            if (alloc_response.payload.size() < resp_offset + sizeof(uint32_t)) {
-                return ErrorCode::INTERNAL_ERROR;
-            }
-            uint32_t host_length = get_u32(alloc_response.payload.data() + resp_offset);
-            resp_offset += sizeof(uint32_t);
-            if (alloc_response.payload.size() < resp_offset + host_length + sizeof(uint16_t)) {
-                return ErrorCode::INTERNAL_ERROR;
-            }
-            std::string host(
-                reinterpret_cast<const char*>(alloc_response.payload.data() + resp_offset),
-                host_length);
-            resp_offset += host_length;
-            uint16_t port = get_u16(alloc_response.payload.data() + resp_offset);
-            resp_offset += sizeof(uint16_t);
-
-            auto socket_result = Socket::create();
-            if (socket_result.is_error()) {
-                return socket_result.error();
-            }
-            Socket socket = std::move(socket_result.value());
-            if (ErrorCode err = socket.connect(host, port); err != ErrorCode::OK) {
-                return err;
-            }
-            TCPConnection node_connection(std::move(socket));
-
-            std::vector<std::byte> write_payload;
-            put_u64(write_payload, block_id);
-            put_u32(write_payload, static_cast<uint32_t>(len));
-            const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data() + chunk_offset);
-            write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
-
-            if (!node_connection.sendMessage(
-                    Message{MessageType::WRITE_BLOCK, next_request_id(), std::move(write_payload)})) {
-                return ErrorCode::INTERNAL_ERROR;
-            }
-            auto write_response = node_connection.receiveMessage();
-            if (!write_response.has_value()) {
-                return ErrorCode::INTERNAL_ERROR;
-            }
-            if (write_response->type != MessageType::ACK) {
-                // Abort without committing — the old file version stays
-                // intact (see docs/design.md §12); already-written
-                // replicas for this attempt become orphans (GC deferred).
-                return error_from_payload(write_response->payload);
-            }
-        }
-        if (alloc_response.payload.size() != resp_offset) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-
-        block_ids.push_back(block_id);
+    uint64_t total = data.size();
+    uint64_t last_block_size = 0;
+    if (!block_ids.empty()) {
+        last_block_size = total - static_cast<uint64_t>(block_ids.size() - 1) * config_.block_size;
     }
 
     // Step 3: tell Master the whole ordered block list is committed, so it
     // becomes visible via STAT_FILE/READ_FILE in one atomic step.
+    // last_block_size lets Master track how full the last block is, which
+    // append() needs to compute its offset (see docs/design.md §14).
     std::vector<std::byte> commit_payload;
     put_string(commit_payload, path);
-    put_u64(commit_payload, static_cast<uint64_t>(total));
+    put_u64(commit_payload, total);
     put_u32(commit_payload, static_cast<uint32_t>(block_ids.size()));
     for (BlockId block_id : block_ids) {
         put_u64(commit_payload, block_id);
     }
+    put_u64(commit_payload, last_block_size);
 
     Message commit_request{MessageType::WRITE_COMMIT, next_request_id(), std::move(commit_payload)};
+    auto commit_result = call_master(commit_request);
+    if (commit_result.is_error()) {
+        return commit_result.error();
+    }
+    if (commit_result.value().type != MessageType::ACK) {
+        return error_from_payload(commit_result.value().payload);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& data) {
+    if (config_.block_size == 0 || config_.block_size > BLOCK_SIZE) {
+        return ErrorCode::INVALID_REQUEST;
+    }
+    if (data.empty()) {
+        return ErrorCode::OK;
+    }
+
+    // Step 1: ask Master how much of this append fits into the file's
+    // current last block (see docs/design.md §14).
+    std::vector<std::byte> target_request_payload;
+    put_string(target_request_payload, path);
+    put_u64(target_request_payload, static_cast<uint64_t>(data.size()));
+    Message target_request{MessageType::APPEND_FILE, next_request_id(),
+                            std::move(target_request_payload)};
+    auto target_result = call_master(target_request);
+    if (target_result.is_error()) {
+        return target_result.error();
+    }
+    const Message& target_response = target_result.value();
+    if (target_response.type != MessageType::ACK) {
+        return error_from_payload(target_response.payload);
+    }
+    if (target_response.payload.empty()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    bool has_target = static_cast<uint8_t>(target_response.payload[0]) != 0;
+    size_t resp_offset = 1;
+    BlockId existing_block_id = 0;
+    uint64_t expected_prior_size = 0;
+    uint32_t fill_amount = 0;
+    if (has_target) {
+        if (target_response.payload.size() < resp_offset + 2 * sizeof(uint64_t) + 2 * sizeof(uint32_t)) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        existing_block_id = get_u64(target_response.payload.data() + resp_offset);
+        resp_offset += sizeof(uint64_t);
+        expected_prior_size = get_u64(target_response.payload.data() + resp_offset);
+        resp_offset += sizeof(uint64_t);
+        fill_amount = get_u32(target_response.payload.data() + resp_offset);
+        resp_offset += sizeof(uint32_t);
+        uint32_t replica_count = get_u32(target_response.payload.data() + resp_offset);
+        resp_offset += sizeof(uint32_t);
+
+        auto replicas_result = parse_replica_list(target_response.payload, resp_offset, replica_count);
+        if (replicas_result.is_error()) {
+            return replicas_result.error();
+        }
+        if (target_response.payload.size() != resp_offset) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+
+        if (fill_amount > 0) {
+            ErrorCode write_err = write_chunk_to_replicas(existing_block_id, expected_prior_size,
+                                                           data.data(), fill_amount,
+                                                           replicas_result.value());
+            if (write_err != ErrorCode::OK) {
+                return write_err;
+            }
+        }
+    } else if (target_response.payload.size() != resp_offset) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // Step 2: anything the existing block couldn't absorb (or the whole
+    // append, on an empty file / already-full last block, see docs/design.md
+    // §14 §6.11) goes through the same allocate-and-write chunk loop write()
+    // uses.
+    std::vector<BlockId> new_block_ids;
+    uint64_t remainder_len = data.size() - fill_amount;
+    if (remainder_len > 0) {
+        auto rest_result = write_new_blocks(path, data.data() + fill_amount, remainder_len);
+        if (rest_result.is_error()) {
+            return rest_result.error();
+        }
+        new_block_ids = std::move(rest_result.value());
+    }
+
+    // The last of the new blocks is the only one that can ever be an
+    // append target again, so it's the only one whose real size Master
+    // needs (see docs/design.md §14) — same reasoning as write()'s
+    // last_block_size.
+    uint64_t last_new_block_size = 0;
+    if (!new_block_ids.empty()) {
+        last_new_block_size =
+            remainder_len - static_cast<uint64_t>(new_block_ids.size() - 1) * config_.block_size;
+    }
+
+    // Step 3: one commit covering both the fill (if any) and the new blocks.
+    std::vector<std::byte> commit_payload;
+    put_string(commit_payload, path);
+    put_u64(commit_payload, static_cast<uint64_t>(data.size()));
+    commit_payload.push_back(static_cast<std::byte>(has_target ? 1 : 0));
+    if (has_target) {
+        put_u64(commit_payload, existing_block_id);
+        put_u64(commit_payload, expected_prior_size);
+        put_u32(commit_payload, fill_amount);
+    }
+    put_u32(commit_payload, static_cast<uint32_t>(new_block_ids.size()));
+    for (BlockId block_id : new_block_ids) {
+        put_u64(commit_payload, block_id);
+    }
+    put_u64(commit_payload, last_new_block_size);
+
+    Message commit_request{MessageType::APPEND_COMMIT, next_request_id(), std::move(commit_payload)};
     auto commit_result = call_master(commit_request);
     if (commit_result.is_error()) {
         return commit_result.error();

@@ -45,9 +45,11 @@ uint64_t get_u64(const std::byte* src) {
     return be64toh(be);
 }
 
-Message make_write_request(uint64_t request_id, BlockId block_id, const std::vector<uint8_t>& data) {
+Message make_write_request(uint64_t request_id, BlockId block_id, const std::vector<uint8_t>& data,
+                            uint64_t offset = 0) {
     std::vector<std::byte> payload;
     put_u64(payload, block_id);
+    put_u64(payload, offset);
     put_u32(payload, static_cast<uint32_t>(data.size()));
     const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data());
     payload.insert(payload.end(), data_bytes, data_bytes + data.size());
@@ -216,6 +218,7 @@ TEST_F(StorageNodeTest, WriteBlockWithMismatchedDataSizeReturnsInvalidRequest) {
 
     std::vector<std::byte> payload;
     put_u64(payload, 1);
+    put_u64(payload, 0);    // offset
     put_u32(payload, 100);  // claims 100 bytes but sends none
     ASSERT_TRUE(client.sendMessage(Message{MessageType::WRITE_BLOCK, 1, payload}));
 

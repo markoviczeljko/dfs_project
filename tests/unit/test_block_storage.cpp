@@ -5,6 +5,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/config.h"
 #include "storage/block_header.h"
 #include "storage/block_storage.h"
 
@@ -128,6 +129,70 @@ TEST_F(BlockStorageTest, StorageFullRejectsOversizedWrite) {
     EXPECT_FALSE(storage->block_exists(1));
     EXPECT_FALSE(std::filesystem::exists(dir_ / "blocks" / "1.block"));
     EXPECT_FALSE(std::filesystem::exists(dir_ / "blocks" / "1.block.tmp"));
+}
+
+// Faza 10: write_block_at() (see docs/design.md §14).
+
+TEST_F(BlockStorageTest, WriteBlockAtOverwritesWithinExistingContent) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, std::vector<uint8_t>{1, 2, 3, 4, 5}), ErrorCode::OK);
+    ASSERT_EQ(storage->write_block_at(1, 1, std::vector<uint8_t>{9, 9}), ErrorCode::OK);
+
+    auto read_result = storage->read_block(1);
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), (std::vector<uint8_t>{1, 9, 9, 4, 5}));
+}
+
+TEST_F(BlockStorageTest, WriteBlockAtExtendsWithoutGap) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, std::vector<uint8_t>{1, 2, 3}), ErrorCode::OK);
+    ASSERT_EQ(storage->write_block_at(1, 3, std::vector<uint8_t>{4, 5}), ErrorCode::OK);
+
+    auto read_result = storage->read_block(1);
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), (std::vector<uint8_t>{1, 2, 3, 4, 5}));
+}
+
+TEST_F(BlockStorageTest, WriteBlockAtExtendsWithGapZeroFills) {
+    // A later-offset append can legitimately land before an earlier one
+    // physically arrives (see docs/design.md §14) — write_block_at() must
+    // not require offset == current length.
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, std::vector<uint8_t>{1, 2}), ErrorCode::OK);
+    ASSERT_EQ(storage->write_block_at(1, 5, std::vector<uint8_t>{9, 9}), ErrorCode::OK);
+
+    auto read_result = storage->read_block(1);
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), (std::vector<uint8_t>{1, 2, 0, 0, 0, 9, 9}));
+}
+
+TEST_F(BlockStorageTest, WriteBlockAtOnMissingBlockFails) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    EXPECT_EQ(storage->write_block_at(404, 0, std::vector<uint8_t>{1}), ErrorCode::BLOCK_NOT_FOUND);
+}
+
+TEST_F(BlockStorageTest, WriteBlockAtRejectsWriteBeyondBlockSize) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, std::vector<uint8_t>{1}), ErrorCode::OK);
+    EXPECT_EQ(storage->write_block_at(1, BLOCK_SIZE - 1, std::vector<uint8_t>{1, 2}),
+              ErrorCode::INVALID_REQUEST);
+    EXPECT_EQ(storage->write_block_at(1, BLOCK_SIZE + 1, std::vector<uint8_t>{1}),
+              ErrorCode::INVALID_REQUEST);
 }
 
 TEST_F(BlockStorageTest, ConcurrentReadsAndWritesStayConsistent) {

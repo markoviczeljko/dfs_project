@@ -8,6 +8,7 @@
 
 #include "common/config.h"
 #include "common/errors.h"
+#include "common/types.h"
 #include "network/connection.h"
 #include "network/protocol.h"
 
@@ -39,11 +40,39 @@ public:
     ErrorCode write(const std::string& path, const std::vector<uint8_t>& data);
     Result<std::vector<uint8_t>> read(const std::string& path);
 
+    // Faza 10: appends data to the end of path. See docs/design.md §14.
+    ErrorCode append(const std::string& path, const std::vector<uint8_t>& data);
+
 private:
+    struct ReplicaLocation {
+        std::string host;
+        uint16_t port;
+    };
+
     Client(Config config, TCPConnection master_connection);
 
     Result<Message> call_master(const Message& request);
     uint64_t next_request_id();
+
+    // Parses the [u32 host_len][host][u16 port] x count replica list shared
+    // by ALLOCATE_BLOCK's and APPEND_FILE's responses, starting at *offset*
+    // (advanced past the list on success).
+    Result<std::vector<ReplicaLocation>> parse_replica_list(const std::vector<std::byte>& payload,
+                                                             size_t& offset, uint32_t count);
+
+    // Sends one chunk to every listed replica at the given block+offset,
+    // one fresh connection per replica; strict fail-fast on the first
+    // non-ACK (same 3/3 semantics as the original write() loop).
+    ErrorCode write_chunk_to_replicas(BlockId block_id, uint64_t offset, const uint8_t* data,
+                                       size_t len, const std::vector<ReplicaLocation>& replicas);
+
+    // Chunks [data, data+len) into config_.block_size pieces, each a
+    // brand-new block: ALLOCATE_BLOCK then write_chunk_to_replicas(offset=0)
+    // per chunk. Shared by write() (for the whole file) and append() (for
+    // whatever doesn't fit in the file's current last block). Returns the
+    // new block ids in order.
+    Result<std::vector<BlockId>> write_new_blocks(const std::string& path, const uint8_t* data,
+                                                   size_t len);
 
     Config config_;
     TCPConnection master_connection_;

@@ -115,6 +115,10 @@ Message Master::handle_message(const Message& request) {
             return handle_read_file(request);
         case MessageType::REGISTER_NODE:
             return handle_register_node(request);
+        case MessageType::APPEND_FILE:
+            return handle_append_file(request);
+        case MessageType::APPEND_COMMIT:
+            return handle_append_commit(request);
         default:
             // HEARTBEAT stays unhandled in this phase — heartbeat
             // sending/timeout detection is Faza 12's job (see
@@ -219,9 +223,11 @@ Message Master::handle_allocate_block(const Message& request) {
 
 Message Master::handle_write_commit(const Message& request) {
     // Faza 8 wire format: [u32 path_len][path][u64 size][u32 block_count]
-    // [block_count x u64 block_id] — replaces Faza 7's single (block_id,
-    // size) pair with an ordered, variable-length block list (see
-    // docs/design.md §12).
+    // [block_count x u64 block_id][u64 last_block_size] — replaces Faza 7's
+    // single (block_id, size) pair with an ordered, variable-length block
+    // list (see docs/design.md §12). Faza 10 appends last_block_size so
+    // Master can track how full the last block actually is, which append
+    // needs to compute an offset (see docs/design.md §14).
     if (request.payload.size() < sizeof(uint32_t)) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
@@ -238,7 +244,8 @@ Message Master::handle_write_commit(const Message& request) {
     uint32_t block_count = get_u32(request.payload.data() + offset);
     offset += sizeof(uint32_t);
 
-    size_t expected_size = offset + static_cast<size_t>(block_count) * sizeof(uint64_t);
+    size_t expected_size =
+        offset + static_cast<size_t>(block_count) * sizeof(uint64_t) + sizeof(uint64_t);
     if (request.payload.size() != expected_size) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
@@ -249,8 +256,9 @@ Message Master::handle_write_commit(const Message& request) {
         block_ids.push_back(get_u64(request.payload.data() + offset));
         offset += sizeof(uint64_t);
     }
+    uint64_t last_block_size = get_u64(request.payload.data() + offset);
 
-    ErrorCode result = namespace_manager_.commit_write(path, block_ids, size);
+    ErrorCode result = namespace_manager_.commit_write(path, block_ids, size, last_block_size);
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }
@@ -320,5 +328,117 @@ Message Master::handle_register_node(const Message& request) {
 
     storage_registry_.register_node(
         StorageNodeInfo{node_id, std::move(host), port, /*alive=*/true, capacity_bytes, capacity_bytes});
+    return Message{MessageType::ACK, request.request_id, {}};
+}
+
+Message Master::handle_append_file(const Message& request) {
+    // Wire format: [u32 path_len][path][u64 append_size]. Response:
+    // [u8 has_target], then if 1: [u64 block_id][u64 offset]
+    // [u32 fill_amount][u32 replica_count]
+    // {[u32 host_len][host][u16 port]} x replica_count — same replica list
+    // shape as ALLOCATE_BLOCK's response (see docs/design.md §14).
+    if (request.payload.size() < sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    uint32_t path_length = get_u32(request.payload.data());
+    size_t offset = sizeof(uint32_t);
+    if (request.payload.size() != offset + path_length + sizeof(uint64_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    std::string path(reinterpret_cast<const char*>(request.payload.data() + offset), path_length);
+    offset += path_length;
+    uint64_t append_size = get_u64(request.payload.data() + offset);
+
+    auto result = namespace_manager_.resolve_append_target(path, append_size);
+    if (result.is_error()) {
+        return make_error(request.request_id, result.error());
+    }
+    const AppendTarget& target = result.value();
+
+    std::vector<std::byte> response_payload;
+    response_payload.push_back(static_cast<std::byte>(target.has_target ? 1 : 0));
+    if (target.has_target) {
+        put_u64(response_payload, target.block_id);
+        put_u64(response_payload, target.offset);
+        put_u32(response_payload, target.fill_amount);
+        put_u32(response_payload, static_cast<uint32_t>(target.replicas.size()));
+        for (StorageNodeId node_id : target.replicas) {
+            auto node = storage_registry_.get_node(node_id);
+            if (!node.has_value()) {
+                return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
+            }
+            put_string(response_payload, node->host);
+            put_u16(response_payload, node->port);
+        }
+    }
+    return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
+}
+
+Message Master::handle_append_commit(const Message& request) {
+    // Wire format: [u32 path_len][path][u64 total_appended_bytes]
+    // [u8 has_existing_target], then if 1: [u64 existing_block_id]
+    // [u64 expected_prior_size][u32 filled_amount], then
+    // [u32 new_block_count]{u64 block_id} x new_block_count
+    // [u64 last_new_block_size] (meaningful only when new_block_count > 0 —
+    // see docs/design.md §14).
+    if (request.payload.size() < sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    uint32_t path_length = get_u32(request.payload.data());
+    size_t offset = sizeof(uint32_t);
+    if (request.payload.size() <
+        offset + path_length + sizeof(uint64_t) + sizeof(uint8_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    std::string path(reinterpret_cast<const char*>(request.payload.data() + offset), path_length);
+    offset += path_length;
+    uint64_t total_appended_bytes = get_u64(request.payload.data() + offset);
+    offset += sizeof(uint64_t);
+    bool has_existing_target = static_cast<uint8_t>(request.payload[offset]) != 0;
+    offset += sizeof(uint8_t);
+
+    BlockId existing_block_id = 0;
+    uint64_t expected_prior_size = 0;
+    uint32_t filled_amount = 0;
+    if (has_existing_target) {
+        if (request.payload.size() < offset + sizeof(uint64_t) * 2 + sizeof(uint32_t)) {
+            return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+        }
+        existing_block_id = get_u64(request.payload.data() + offset);
+        offset += sizeof(uint64_t);
+        expected_prior_size = get_u64(request.payload.data() + offset);
+        offset += sizeof(uint64_t);
+        filled_amount = get_u32(request.payload.data() + offset);
+        offset += sizeof(uint32_t);
+    }
+
+    if (request.payload.size() < offset + sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    uint32_t new_block_count = get_u32(request.payload.data() + offset);
+    offset += sizeof(uint32_t);
+
+    size_t expected_size =
+        offset + static_cast<size_t>(new_block_count) * sizeof(uint64_t) + sizeof(uint64_t);
+    if (request.payload.size() != expected_size) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    std::vector<BlockId> new_block_ids;
+    new_block_ids.reserve(new_block_count);
+    for (uint32_t i = 0; i < new_block_count; ++i) {
+        new_block_ids.push_back(get_u64(request.payload.data() + offset));
+        offset += sizeof(uint64_t);
+    }
+    uint64_t last_new_block_size = get_u64(request.payload.data() + offset);
+
+    AppendCommitRequest commit_request{has_existing_target,   existing_block_id,
+                                        expected_prior_size,   filled_amount,
+                                        std::move(new_block_ids), last_new_block_size,
+                                        total_appended_bytes};
+    ErrorCode result = namespace_manager_.commit_append(path, commit_request);
+    if (result != ErrorCode::OK) {
+        return make_error(request.request_id, result);
+    }
     return Message{MessageType::ACK, request.request_id, {}};
 }

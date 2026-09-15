@@ -36,3 +36,8 @@ ErrorCode BlockManager::write_block(BlockId id, const std::vector<uint8_t>& data
 Result<std::vector<uint8_t>> BlockManager::read_block(BlockId id) {
     return storage_->read_block(id);
 }
+
+ErrorCode BlockManager::write_block_at(BlockId id, uint64_t offset,
+                                        const std::vector<uint8_t>& data) {
+    return storage_->write_block_at(id, offset, data);
+}

@@ -4,11 +4,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <mutex>
 #include <system_error>
 
+#include "common/config.h"
 #include "storage/block_header.h"
 
 namespace {
@@ -197,7 +199,10 @@ ErrorCode BlockStorage::recover() {
 
 ErrorCode BlockStorage::write_block(BlockId id, const std::vector<uint8_t>& data) {
     std::unique_lock lock(mutex_);
+    return write_block_locked(id, data);
+}
 
+ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t>& data) {
     uint64_t existing_size = 0;
     if (auto it = local_blocks_.find(id); it != local_blocks_.end()) {
         existing_size = it->second.size;
@@ -253,7 +258,10 @@ ErrorCode BlockStorage::write_block(BlockId id, const std::vector<uint8_t>& data
 
 Result<std::vector<uint8_t>> BlockStorage::read_block(BlockId id) {
     std::shared_lock lock(mutex_);
+    return read_block_locked(id);
+}
 
+Result<std::vector<uint8_t>> BlockStorage::read_block_locked(BlockId id) const {
     if (local_blocks_.find(id) == local_blocks_.end()) {
         return Result<std::vector<uint8_t>>::err(ErrorCode::BLOCK_NOT_FOUND);
     }
@@ -286,6 +294,30 @@ Result<std::vector<uint8_t>> BlockStorage::read_block(BlockId id) {
     }
 
     return Result<std::vector<uint8_t>>::ok(std::move(data));
+}
+
+ErrorCode BlockStorage::write_block_at(BlockId id, uint64_t offset,
+                                        const std::vector<uint8_t>& data) {
+    std::unique_lock lock(mutex_);
+
+    if (local_blocks_.find(id) == local_blocks_.end()) {
+        return ErrorCode::BLOCK_NOT_FOUND;
+    }
+    if (offset > BLOCK_SIZE || data.size() > BLOCK_SIZE - offset) {
+        return ErrorCode::INVALID_REQUEST;
+    }
+
+    auto current = read_block_locked(id);
+    if (current.is_error()) {
+        return current.error();
+    }
+    std::vector<uint8_t> merged = std::move(current.value());
+    if (merged.size() < offset + data.size()) {
+        merged.resize(offset + data.size(), 0);  // Zero-fill any gap.
+    }
+    std::copy(data.begin(), data.end(), merged.begin() + static_cast<ptrdiff_t>(offset));
+
+    return write_block_locked(id, merged);
 }
 
 ErrorCode BlockStorage::delete_block(BlockId id) {

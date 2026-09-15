@@ -29,6 +29,7 @@ public:
     ErrorCode release_block(BlockId id);
     ErrorCode write_block(BlockId id, const std::vector<uint8_t>& data);
     Result<std::vector<uint8_t>> read_block(BlockId id);
+    ErrorCode write_block_at(BlockId id, uint64_t offset, const std::vector<uint8_t>& data);
 
 private:
     explicit BlockManager(std::unique_ptr<BlockStorage> storage);

@@ -3,6 +3,7 @@
 //   dfs_client --master-host <host> --master-port <port> create <path>
 //   dfs_client --master-host <host> --master-port <port> write <path> <local_source_file>
 //   dfs_client --master-host <host> --master-port <port> read <path> <local_dest_file>
+//   dfs_client --master-host <host> --master-port <port> append <path> <local_source_file>
 
 #include <exception>
 #include <fstream>
@@ -20,7 +21,9 @@ void print_usage(const char* argv0) {
               << "  " << argv0
               << " --master-host <host> --master-port <port> write <path> <local_source_file>\n"
               << "  " << argv0
-              << " --master-host <host> --master-port <port> read <path> <local_dest_file>\n";
+              << " --master-host <host> --master-port <port> read <path> <local_dest_file>\n"
+              << "  " << argv0
+              << " --master-host <host> --master-port <port> append <path> <local_source_file>\n";
 }
 
 Result<std::vector<uint8_t>> read_local_file(const std::string& path) {
@@ -119,6 +122,21 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "read " << data_result.value().size() << " bytes from " << positional[1] << "\n";
+        return 0;
+    }
+
+    if (command == "append" && positional.size() == 3) {
+        auto data_result = read_local_file(positional[2]);
+        if (data_result.is_error()) {
+            std::cerr << "Failed to read local file: " << positional[2] << "\n";
+            return 1;
+        }
+        ErrorCode result = client->append(positional[1], data_result.value());
+        if (result != ErrorCode::OK) {
+            std::cerr << "append failed: error_code=" << static_cast<int>(result) << "\n";
+            return 1;
+        }
+        std::cout << "appended " << data_result.value().size() << " bytes to " << positional[1] << "\n";
         return 0;
     }
 

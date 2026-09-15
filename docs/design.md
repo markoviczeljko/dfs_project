@@ -687,3 +687,155 @@ parserima). Dva MEDIUM/LOW nalaza primijenjena: komentar o
 orphan-pending-block-id ishodu na `NODE_NOT_FOUND`, i dodati konkurentni
 testovi za `StorageRegistry`/`ReplicationManager` (nedostajali su, iako je
 postojeća zaključavanja logika već bila ispravna).
+
+## 14. Faza 10 — APPEND
+
+Dodaje `Client::append(path, data)`. Ključni gap koji ni
+`IMPLEMENTATION_PLAN.md` ni `dfs_design_notes.md` ne pominju: `BlockMetadata.size`
+se do sada nigdje stvarno ne popunjava (hardkodovano na 0 u
+`set_block_replicas()`, nikad ažurirano) — a APPEND mora znati trenutnu
+popunjenost fajlovog posljednjeg bloka da bi odredio offset (§6.8). Odabrano
+rješenje: Master ostaje isključivo server (nikad ne inicira konekciju ka
+StorageNode-u, za razliku od alternative "upitaj `GET_BLOCK_INFO` uživo") —
+`WRITE_COMMIT` i novi `APPEND_COMMIT` sad eksplicitno nose stvarnu veličinu
+posljednjeg (dotičnog) bloka, koju Master upisuje u `BlockMetadata.size`.
+Samo POSLJEDNJI blok liste ikad treba tačnu veličinu — interior blokovi se
+nikad ne revizituju kao append-target, isti princip kao `commit_write()`.
+
+**`BlockMetadata` dobija `reserved_size`** (odvojeno od `size`): `size` je
+POTVRĐENA vrijednost (mijenja se samo pri uspješnom commit-u), `reserved_size`
+je monotono rastući kursor za dodjelu append-offset-a. Razdvajanje je nužno
+da bi konkurentni append-i mogli odmah vidjeti "sljedeći slobodan offset" bez
+čekanja na commit prethodnog — `resolve_append_target()` pod
+`unique_lock`-om odmah pomjeri `reserved_size` (optimistička rezervacija,
+bez I/O), isti obrazac kao postojeći `allocate_block()`+`pending_blocks_`.
+Overflow preko granice bloka (§6.10) se ne rješava u istom Master
+round-trip-u kao fill-cilj — `APPEND_FILE` odgovor opisuje isključivo
+eventualni fill u postojećem posljednjem bloku; ostatak ide kroz identičan,
+refaktorisan `ALLOCATE_BLOCK`-po-chunk-u loop koji `Client::write()` već
+koristi (`write_new_blocks()`/`write_chunk_to_replicas()`/
+`parse_replica_list()` dijeljeni helperi). Ovo pokriva i proizvoljno velike
+append-e i append-na-prazan-fajl (§6.11, automatski `has_target=false`) bez
+posebne grane koda.
+
+**`StorageNode`/`BlockStorage`**: `WRITE_BLOCK` wire format dobija `offset`
+polje — `offset==0` zadržava identično postojeće ponašanje (pun O_TRUNC
+overwrite), `offset>0` ide na novu `BlockStorage::write_block_at()`. Ova
+metoda NE radi sirov `pwrite` u postojeći fajl (što bi narušilo postojeću
+crash-safety garanciju) — radi read-modify-write pod JEDNIM
+`unique_lock`-om: učita trenutni sadržaj, zero-fill-uje gap ako je `offset`
+ispred trenutne fizičke dužine (vidi dolje), spoji novi podatak, pa upiše
+kroz identičan tmp+fsync+rename put kao `write_block()`.
+
+**Konkurentnosne rupe otkrivene i popravljene tokom razvoja i review-a**
+(bez njih bi "definicija gotovog" — 2 konkurentna klijenta, 100× append —
+bila flaky ili tiho pogrešna):
+
+1. **Fizički redoslijed pristiglih `WRITE_BLOCK` poziva na storage node-u ne
+   prati redoslijed dodjele offset-a** (odvojeni network round-trip-ovi,
+   thread-per-connection) — moguće je da klijent sa KASNIJIM offset-om
+   fizički stigne na storage node PRIJE klijenta sa RANIJIM. Striktan
+   `offset == trenutna dužina` zahtjev bi ovo tretirao kao grešku iako nije
+   korupcija. Popravka: `write_block_at()` dozvoljava write na bilo koji
+   offset unutar `BLOCK_SIZE` i zero-fill-uje gap ako je offset ispred
+   trenutne dužine — redoslijed fizičkih upisa postaje irelevantan za
+   uspjeh.
+2. **Redoslijed `APPEND_COMMIT` poziva na Masteru takođe nije garantovan.**
+   Naivan bezuslovan `size = ...` bi mogao vratiti `size` unazad ako kasniji
+   (po redoslijedu commit-a) append zapravo ima RANIJI offset. Popravka:
+   `commit_append()` radi CAS-stil commit — `expected_prior_size` mora
+   tačno odgovarati trenutnoj POTVRĐENOJ `size`, inače se čeka
+   (`condition_variable_any`, timeout `APPEND_COMMIT_WAIT_TIMEOUT_MS`=3s)
+   dok predak-append ne commit-uje i pozove `notify_all()`.
+3. **(Nađeno tek pri prvom ručnom testu, prije review-a) Novoalociran blok
+   nikad ne dobija stvaran `reserved_size`.** `commit_append()`-ov
+   new-blocks loop je originalno radio `block.size = block.reserved_size`
+   — ali `reserved_size` novog bloka ostaje 0 (nikad ga niko ne pomjera
+   osim `resolve_append_target()`, koja se primjenjuje samo na POSTOJEĆI
+   posljednji blok, ne na novoalocirane). Rezultat: drugi uzastopni append
+   je računao offset 0 za blok koji zapravo već ima podatke, i
+   `WRITE_BLOCK(offset=0, ...)` (pun overwrite) je tiho UNIŠTIO sadržaj
+   prvog append-a. Popravka: `APPEND_COMMIT` sad nosi i
+   `last_new_block_size` (analogno `WRITE_COMMIT`-ovom `last_block_size`),
+   koji `commit_append()` upisuje u i `size` i `reserved_size` POSLJEDNJEG
+   novog bloka.
+4. **(Nađeno pri concurrent testu, prije review-a) `commit_append()`-ovo
+   brisanje CIJELOG `pending_blocks_` seta pri svakom komitu** (kopirano od
+   `commit_write()`-a) je pogrešno za append: dva konkurentna append-a na
+   ISTI prazan/pun-posljednji-blok fajl mogu istovremeno imati validan
+   pending novi blok — prvi commit bi obrisao CIJELI set, odbacujući drugi
+   sa lažnim `INVALID_REQUEST`. Popravka: `commit_append()` briše samo
+   id-jeve koji se STVARNO komituju u tom pozivu, ne cijeli set (za razliku
+   od `commit_write()`-a, kojem ovaj scenario nikad ne prijeti jer
+   pretpostavlja jednog sekvencijalnog pisca).
+
+**Nezavisan `cpp-reviewer` agent — 2 CRITICAL + 1 HIGH nalaz, oba CRITICAL
+popravljena:**
+
+- **CRITICAL: dangling iterator kroz CV wait.** Originalna implementacija je
+  držala `files_`-iterator (`file_it`) preko `wait_for()` poziva, koji
+  interno otključava `mutex_`. Konkurentan `delete_file(path)` u tom
+  prozoru invalidira iterator — UB pri narednoj dereferenci. Popravljeno:
+  ništa se ne drži preko wait-a; CAS predikat radi svoj `blocks_.find()`
+  svaki put kad se pozove, a sve (`files_`, `pending_blocks_`, `blocks_`)
+  se ponovo traži OD NULE odmah nakon wait-a, prije bilo koje mutacije.
+  Regresioni test: `CommitAppendSurvivesConcurrentDeleteFileDuringWait`
+  (ASan potvrđuje odsustvo use-after-free).
+- **CRITICAL: nedostaje provjera vlasništva nad `existing_block_id`-jem.**
+  `blocks_` je jedna ravna mapa dijeljena preko svih fajlova — bez provjere,
+  bilo koji `APPEND_COMMIT` je mogao imenovati blok koji pripada SASVIM
+  DRUGOM fajlu, i ako bi se `expected_prior_size` slučajno poklopio
+  (trivijalno tačno za bilo koji još-ne-append-ovan blok, koji kreće od 0),
+  tiho bi mutirao tuđi blok. Popravljeno: `file_owns_block()` provjerava da
+  `existing_block_id` postoji NEGDJE u `path`-ovoj `blocks` listi (ne mora
+  biti tačno posljednji — dva konkurentna append-a mogu legitimno biti u
+  toku istovremeno, jedan još komituje fill u blok koji je u međuvremenu
+  već prestao biti posljednji zbog tuđeg rollover-a na nov blok), provjereno
+  i prije i poslije CV wait-a. Regresioni test:
+  `CommitAppendRejectsBlockIdBelongingToAnotherFile`.
+- **HIGH (prihvaćeno, nije popravljeno ove faze): napuštena rezervacija
+  trajno "zaglavi" TAJ JEDAN blok dok se ne popuni.** Ako klijent
+  crash-uje/otkaže poslije `resolve_append_target()`-ove rezervacije a
+  prije `APPEND_COMMIT`-a, `reserved_size` ostaje trajno ispred `size`-a za
+  taj blok — svaki naredni append tom bloku računa offset koji CAS nikad
+  neće moći potvrditi, pa svaki takav poziv čeka puni
+  `APPEND_COMMIT_WAIT_TIMEOUT_MS` (3s) pa vraća `TIMEOUT`, sve dok
+  `reserved_size` ne dostigne `BLOCK_SIZE` i append prirodno ne pređe na
+  nov blok. Pravi fix (lease sa isteka/rollback) zahtijeva razlikovanje
+  "spor pisac" od "mrtav pisac" — što zahtijeva failure detection koja ne
+  postoji do Faze 12, ista kategorija namjerno odloženog ograničenja kao
+  "manje od RF=3 živih čvorova" (§13) i orphan pending blokovi (§12).
+  Ograničeno na JEDAN blok (fajl nikad trajno ne postaje neupisiv u
+  cjelini), ali vrijedi ga imati na umu kao poznat gap.
+
+**Wire formati** (svi novi/prošireni, `protocol.h`/`.cpp` netaknut osim
+enum vrijednosti koje su već postojale rezervisane od ranije):
+```
+WRITE_COMMIT zahtjev (prošireno):  [u32 path_len][path][u64 size][u32 block_count]
+                                    {u64 block_id}×block_count[u64 last_block_size]
+WRITE_BLOCK zahtjev (prošireno):   [u64 block_id][u64 offset][u32 data_size][data]
+APPEND_FILE zahtjev/odgovor:       req: [path][u64 append_size]
+                                    resp: [u8 has_target], ako 1:
+                                    [u64 block_id][u64 offset][u32 fill_amount]
+                                    [u32 replica_count]{[u32 host_len][host][u16 port]}×replica_count
+APPEND_COMMIT zahtjev:             [path][u64 total_appended_bytes][u8 has_existing_target], ako 1:
+                                    [u64 existing_block_id][u64 expected_prior_size][u32 filled_amount]
+                                    [u32 new_block_count]{u64 block_id}×new_block_count[u64 last_new_block_size]
+```
+
+**Ručna provjera**: Master + 3 prava `dfs_storage` procesa. (a) Sekvencijalni
+append-i malog fajla (`create`+`write` 1000B, dva `append`-a od 50B i 200B)
+— `cmp` bajt-po-bajt identično očekivanom spoju. (b) Pravi
+block-boundary-crossing na punoj `BLOCK_SIZE` skali: `write` fajla od
+`BLOCK_SIZE - 500` bajtova (jedan pun blok minus 500), pa `append` od 2000
+bajtova (500 popunjava prvi blok, 1500 ide u nov drugi blok) — `read` vraća
+tačno `BLOCK_SIZE + 1500` bajtova, `cmp` identično; inspekcija sva 3 node-a
+potvrđuje identične veličine `.block` fajlova (uključujući header) na svakom.
+
+131/131 testova prolazi (107 stari + 24 nova: 5 u `test_block_storage.cpp`,
+1 u `test_block_manager.cpp`, 13 u `test_namespace.cpp` — uključujući
+`CommitAppendRejectsBlockIdBelongingToAnotherFile` i
+`CommitAppendSurvivesConcurrentDeleteFileDuringWait`, regresione testove za
+cpp-reviewer-ove dva CRITICAL nalaza — i 5 u
+`tests/integration/test_append.cpp`), čisto pod ASan/UBSan, stabilno kroz
+ponovljena pokretanja.

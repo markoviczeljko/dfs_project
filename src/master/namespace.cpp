@@ -1,9 +1,12 @@
 #include "master/namespace.h"
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <set>
 #include <utility>
+
+#include "common/config.h"
 
 Result<std::string> NamespaceManager::normalize_path(const std::string& path) {
     if (path.empty() || path.front() != '/') {
@@ -143,7 +146,8 @@ Result<BlockId> NamespaceManager::allocate_block(const std::string& path) {
 }
 
 ErrorCode NamespaceManager::commit_write(const std::string& path,
-                                          const std::vector<BlockId>& block_ids, uint64_t size) {
+                                          const std::vector<BlockId>& block_ids, uint64_t size,
+                                          uint64_t last_block_size) {
     auto normalized_result = normalize_path(path);
     if (normalized_result.is_error()) {
         return normalized_result.error();
@@ -191,13 +195,202 @@ ErrorCode NamespaceManager::commit_write(const std::string& path,
             block_it->second.state = BlockState::COMMITTED;
         }
     }
+    // Only the last block is ever an append target, so only its size needs
+    // to be accurate — interior blocks are never revisited (see
+    // docs/design.md §14).
+    if (!block_ids.empty()) {
+        auto last_it = blocks_.find(block_ids.back());
+        if (last_it != blocks_.end()) {
+            last_it->second.size = last_block_size;
+            last_it->second.reserved_size = last_block_size;
+        }
+    }
     return ErrorCode::OK;
 }
 
 ErrorCode NamespaceManager::set_block_replicas(BlockId block_id,
                                                 std::vector<StorageNodeId> replicas) {
     std::unique_lock lock(mutex_);
-    blocks_[block_id] = BlockMetadata{block_id, 0, 0, std::move(replicas), BlockState::ALLOCATED};
+    blocks_[block_id] = BlockMetadata{block_id, /*size=*/0, /*reserved_size=*/0, /*version=*/0,
+                                       std::move(replicas), BlockState::ALLOCATED};
+    return ErrorCode::OK;
+}
+
+Result<AppendTarget> NamespaceManager::resolve_append_target(const std::string& path,
+                                                               uint64_t append_size) {
+    auto normalized_result = normalize_path(path);
+    if (normalized_result.is_error()) {
+        return Result<AppendTarget>::err(normalized_result.error());
+    }
+
+    std::unique_lock lock(mutex_);
+    auto file_it = files_.find(normalized_result.value());
+    if (file_it == files_.end()) {
+        return Result<AppendTarget>::err(ErrorCode::FILE_NOT_FOUND);
+    }
+
+    if (file_it->second.blocks.empty() || append_size == 0) {
+        return Result<AppendTarget>::ok(AppendTarget{false, 0, 0, 0, {}});
+    }
+
+    BlockId last_id = file_it->second.blocks.back();
+    auto block_it = blocks_.find(last_id);
+    if (block_it == blocks_.end()) {
+        return Result<AppendTarget>::err(ErrorCode::INTERNAL_ERROR);
+    }
+
+    if (block_it->second.reserved_size >= BLOCK_SIZE) {
+        return Result<AppendTarget>::ok(AppendTarget{false, 0, 0, 0, {}});
+    }
+
+    uint64_t free_space = BLOCK_SIZE - block_it->second.reserved_size;
+    uint32_t fill = static_cast<uint32_t>(std::min<uint64_t>(append_size, free_space));
+    uint64_t offset = block_it->second.reserved_size;
+    block_it->second.reserved_size += fill;  // Optimistic reservation, no I/O yet.
+
+    return Result<AppendTarget>::ok(
+        AppendTarget{true, last_id, offset, fill, block_it->second.replicas});
+}
+
+namespace {
+// True iff existing_block_id genuinely belongs to path (appears anywhere in
+// its block list) — checked instead of "is exactly the current last block"
+// because two concurrent appends can legitimately be in flight at once:
+// one still committing a fill into a block that, by the time it commits,
+// has already been superseded as the last block by another append's
+// rollover to a brand-new block (see docs/design.md §14). This still fully
+// rejects a block belonging to a DIFFERENT file, which is the actual
+// cross-file-corruption case this check exists to prevent. Must be
+// re-checked with a FRESH files_ lookup both before and after any wait on
+// block_commit_cv_ — condition_variable_any::wait_for() unlocks mutex_
+// while waiting, during which a concurrent delete_file() can invalidate an
+// iterator taken beforehand.
+bool file_owns_block(const FileMetadata& file, bool has_existing_target, BlockId existing_block_id) {
+    if (!has_existing_target) return true;
+    return std::find(file.blocks.begin(), file.blocks.end(), existing_block_id) != file.blocks.end();
+}
+}  // namespace
+
+ErrorCode NamespaceManager::commit_append(const std::string& path,
+                                          const AppendCommitRequest& request) {
+    auto normalized_result = normalize_path(path);
+    if (normalized_result.is_error()) {
+        return normalized_result.error();
+    }
+    const std::string& normalized = normalized_result.value();
+
+    std::unique_lock lock(mutex_);
+
+    // Fail fast on an ownership mismatch before waiting on anything —
+    // existing_block_id must genuinely be this path's last block, not some
+    // unrelated (or stale, or adversarial) block id: without this check a
+    // malformed APPEND_COMMIT could mutate a completely different file's
+    // block metadata as long as its expected_prior_size happened to match
+    // (trivially true for any never-yet-appended block, which starts at
+    // size 0) — see docs/design.md §14.
+    {
+        auto file_it = files_.find(normalized);
+        if (file_it == files_.end()) {
+            return ErrorCode::FILE_NOT_FOUND;
+        }
+        if (!file_owns_block(file_it->second, request.has_existing_target,
+                                    request.existing_block_id)) {
+            return ErrorCode::INVALID_REQUEST;
+        }
+    }
+
+    if (request.has_existing_target) {
+        // Compare-and-swap against the CONFIRMED size: an earlier append to
+        // this same block may still be in flight (its reservation already
+        // landed, but its commit hasn't arrived yet). Waiting here — rather
+        // than rejecting immediately — absorbs ordinary network/scheduling
+        // reordering between two concurrent appends without making either
+        // one a hard failure (see docs/design.md §14). The predicate does
+        // its own fresh blocks_.find() on every check — it's invoked
+        // repeatedly under the lock, so no iterator is held across the
+        // unlock/relock wait_for() does internally.
+        bool ready = block_commit_cv_.wait_for(
+            lock, std::chrono::milliseconds(APPEND_COMMIT_WAIT_TIMEOUT_MS), [&] {
+                auto it = blocks_.find(request.existing_block_id);
+                return it != blocks_.end() && it->second.size == request.expected_prior_size;
+            });
+        if (!ready) {
+            return ErrorCode::TIMEOUT;
+        }
+    }
+
+    // Re-validate everything from scratch: the wait above (if it happened)
+    // released mutex_, so files_/pending_blocks_/blocks_ may have changed
+    // underneath this call. No iterator from before the wait is reused
+    // below.
+    auto file_it = files_.find(normalized);
+    if (file_it == files_.end()) {
+        return ErrorCode::FILE_NOT_FOUND;
+    }
+    if (!file_owns_block(file_it->second, request.has_existing_target,
+                                request.existing_block_id)) {
+        return ErrorCode::INVALID_REQUEST;
+    }
+
+    // New blocks go through the same pending-set subset check as
+    // commit_write() (see docs/design.md §12), but — unlike commit_write()
+    // — only the ids actually being committed are removed, not the whole
+    // set: two concurrent appends to the same empty/full-last-block file
+    // can each have a simultaneously-valid pending new block at once, and
+    // clearing the entire set on the first commit would wrongly reject the
+    // second (see docs/design.md §14). Validated before any mutation below,
+    // so a bad new_block_ids list can't leave a partially-applied commit
+    // (fill applied, new blocks rejected) behind.
+    auto pending_it = pending_blocks_.find(normalized);
+    for (BlockId id : request.new_block_ids) {
+        if (pending_it == pending_blocks_.end() ||
+            pending_it->second.find(id) == pending_it->second.end()) {
+            return ErrorCode::INVALID_REQUEST;
+        }
+    }
+
+    // All validation passed — mutate. existing_block_id is looked up fresh
+    // one more time rather than reusing any iterator from above.
+    if (request.has_existing_target) {
+        auto block_it = blocks_.find(request.existing_block_id);
+        if (block_it == blocks_.end()) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        block_it->second.size = request.expected_prior_size + request.filled_amount;
+        block_it->second.state = BlockState::COMMITTED;
+    }
+
+    if (pending_it != pending_blocks_.end()) {
+        for (BlockId id : request.new_block_ids) {
+            pending_it->second.erase(id);
+        }
+        if (pending_it->second.empty()) {
+            pending_blocks_.erase(pending_it);
+        }
+    }
+
+    for (size_t i = 0; i < request.new_block_ids.size(); ++i) {
+        BlockId id = request.new_block_ids[i];
+        file_it->second.blocks.push_back(id);
+        auto block_it = blocks_.find(id);
+        if (block_it != blocks_.end()) {
+            block_it->second.state = BlockState::COMMITTED;
+            if (i + 1 == request.new_block_ids.size()) {
+                block_it->second.size = request.last_new_block_size;
+                block_it->second.reserved_size = request.last_new_block_size;
+            }
+        }
+    }
+
+    uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    file_it->second.size += request.total_appended_bytes;
+    file_it->second.modification_time = now;
+
+    lock.unlock();
+    block_commit_cv_.notify_all();
     return ErrorCode::OK;
 }
 

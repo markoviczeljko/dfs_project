@@ -57,6 +57,7 @@ uint64_t get_u64(const std::byte* src) {
 }
 
 constexpr size_t kBlockIdSize = sizeof(uint64_t);
+constexpr size_t kOffsetSize = sizeof(uint64_t);
 constexpr size_t kDataSizeFieldSize = sizeof(uint32_t);
 
 }  // namespace
@@ -152,23 +153,39 @@ Message StorageNode::handle_message(const Message& request) {
 }
 
 Message StorageNode::handle_write_block(const Message& request) {
-    if (request.payload.size() < kBlockIdSize + kDataSizeFieldSize) {
+    // Faza 10 wire format: [u64 block_id][u64 offset][u32 data_size][data]
+    // (see docs/design.md §14). offset == 0 keeps write_block()'s existing
+    // full-overwrite behavior unchanged; offset > 0 is the new
+    // append-at-offset path.
+    if (request.payload.size() < kBlockIdSize + kOffsetSize + kDataSizeFieldSize) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 
     BlockId block_id = get_u64(request.payload.data());
-    uint32_t data_size = get_u32(request.payload.data() + kBlockIdSize);
-    size_t expected_size = kBlockIdSize + kDataSizeFieldSize + data_size;
+    uint64_t offset = get_u64(request.payload.data() + kBlockIdSize);
+    uint32_t data_size = get_u32(request.payload.data() + kBlockIdSize + kOffsetSize);
+    size_t expected_size = kBlockIdSize + kOffsetSize + kDataSizeFieldSize + data_size;
     if (request.payload.size() != expected_size) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 
     std::vector<uint8_t> data(data_size);
     if (data_size > 0) {
-        std::memcpy(data.data(), request.payload.data() + kBlockIdSize + kDataSizeFieldSize, data_size);
+        std::memcpy(data.data(), request.payload.data() + kBlockIdSize + kOffsetSize + kDataSizeFieldSize,
+                    data_size);
     }
 
-    ErrorCode result = block_manager_->write_block(block_id, data);
+    // offset == 0 always means "this is the block's complete, definitive
+    // content" (full overwrite/truncate), never "append at offset 0 into an
+    // already-nonempty block": Master never hands out offset 0 as an append
+    // target for an existing block, since a block only becomes an append
+    // target once resolve_append_target() has been called against it at
+    // least once, and any block's very first append is by construction the
+    // first thing to ever write to it beyond allocate_block() (see
+    // docs/design.md §14). If that invariant ever changes, this branch
+    // needs a real is_new_block flag instead of overloading offset==0.
+    ErrorCode result = (offset == 0) ? block_manager_->write_block(block_id, data)
+                                      : block_manager_->write_block_at(block_id, offset, data);
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }

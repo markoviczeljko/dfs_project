@@ -59,9 +59,13 @@ std::string get_string(const std::byte* src, uint32_t length) {
 }
 
 Message make_write_commit_request(uint64_t request_id, const std::string& path,
-                                   const std::vector<BlockId>& block_ids, uint64_t size) {
+                                   const std::vector<BlockId>& block_ids, uint64_t size,
+                                   uint64_t last_block_size = 0) {
     // Faza 8 wire format: [u32 path_len][path][u64 size][u32 block_count]
-    // [block_count x u64 block_id] (see docs/design.md §12).
+    // [block_count x u64 block_id] (see docs/design.md §12), extended in
+    // Faza 10 with a trailing [u64 last_block_size] (see docs/design.md
+    // §14). None of these tests assert on BlockMetadata.size, so a default
+    // of 0 keeps every existing call site unchanged.
     std::vector<std::byte> payload;
     put_u32(payload, static_cast<uint32_t>(path.size()));
     const auto* path_bytes = reinterpret_cast<const std::byte*>(path.data());
@@ -71,6 +75,7 @@ Message make_write_commit_request(uint64_t request_id, const std::string& path,
     for (BlockId block_id : block_ids) {
         put_u64(payload, block_id);
     }
+    put_u64(payload, last_block_size);
     return Message{MessageType::WRITE_COMMIT, request_id, std::move(payload)};
 }
 
