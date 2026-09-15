@@ -160,3 +160,68 @@ dosad.
 **`FileId` brojač je trajan izvor istine**, za razliku od `BlockId`-a
 u Fazi 3 — `NamespaceManager` jeste sâm Master-ov namespace sloj, nema
 spoljne komponente koja bi kasnije preuzela generisanje `FileId`-a.
+
+## 9. Faza 5 — StorageNode proces
+
+**`NetworkServer` je nova klasa u `network/` sloju, van originalnog
+rasporeda faza.** §17.10 skicira `NetworkServer` kao `start()/stop()`
+komponentu deljenu između Master-a i Storage Node-a, ali nijedna faza
+u `IMPLEMENTATION_PLAN.md`-u je nikad nije zakazala za implementaciju —
+ni Faza 1 (koja je izgradila samo `Socket`/`Protocol`/`TCPConnection`).
+Pošto će Faza 6 (Master) trebati identičan accept-loop, `NetworkServer`
+je izgrađen sada kao generička, ponovo iskoristiva klasa koja ne zna
+ništa o `BlockManager`-u ili storage-u — prima `MessageHandler`
+callback i vrti accept-thread + jedan detached worker-thread po
+konekciji (thread-per-connection, §11.3). `stop()` radi
+`shutdown(SHUT_RDWR)` na listening file descriptor-u da otključa
+blokirajući `accept()`, pa `join()`-uje accept-thread; worker-thread-ovi
+se ne join-uju eksplicitno — završavaju sami kad se konekcija zatvori
+(dosledno "diplomski scope" pojednostavljenju iz §11.3).
+
+**Wire-format za `WRITE_BLOCK`/`READ_BLOCK`/`DELETE_BLOCK` payload je
+izmišljen u ovoj fazi.** `network/protocol.h` nosi samo generički
+`vector<byte>` payload — strukture po operaciji su eksplicitno van
+dometa Faze 1 (§5, dokumentovano u sekciji 5 iznad). Usvojen je layout
+(sve big-endian, dosledno header-u):
+- `WRITE_BLOCK` zahtev: `block_id`(u64) + `data_size`(u32) + `data`;
+  odgovor `ACK(block_id)` ili `ERROR(error_code)`.
+- `READ_BLOCK` zahtev: `block_id`(u64); odgovor
+  `ACK(block_id + data_size + data)` ili `ERROR(error_code)`.
+- `DELETE_BLOCK` zahtev: `block_id`(u64); odgovor uvek `ACK(block_id)`
+  (idempotentno, §4.13 zahteva "retry-friendly" ponašanje).
+
+Enkodiranje/dekodiranje živi kao slobodne funkcije u `storage_node.cpp`,
+ne dira `protocol.h`/`protocol.cpp`.
+
+**`DELETE_BLOCK` handler zove `BlockManager::release_block(id)`** —
+jedini metod na tom sloju koji i briše fizički blok i oslobađa id;
+`BlockManager` nema poseban "samo storage-level delete" poziv.
+
+**Nema `Statistics` stub klase u ovoj fazi.** §17.6 i
+`IMPLEMENTATION_PLAN.md` pominju `Statistics` kao član `StorageNode`-a,
+ali prava implementacija dolazi tek u Fazi 14. Prazna klasa bez ijedne
+funkcije ne bi donela vrednost sada — izostavljena je u potpunosti.
+
+**Konfiguracija (`configs/storage1.conf`) je prost `key=value` tekstualni
+format**, izmišljen u ovoj fazi — dokument nigde ne definiše šemu za
+ovaj fajl, samo pominje njegovo ime u §14 stablu direktorijuma. Polja:
+`node_id`, `port`, `data_dir`, `capacity_bytes`. `node_id` se čita i
+čuva radi buduće kompatibilnosti (Faza 12 registracija kod Master-a),
+ali se ne koristi mrežno u ovoj fazi — nema Master-a još.
+
+**`main_storage.cpp`**: ručni argv parser za `--config <path>` (bez
+eksterne biblioteke, dosledno projektu koji do sada nema nijednu
+eksternu zavisnost osim GoogleTest-a). Graceful shutdown preko
+`SIGINT`/`SIGTERM` postavlja `std::atomic<bool>` flag koji glavna
+petlja proverava; nijedan main()/signal-handling sketch ne postoji u
+dizajn dokumentu — ovo je u potpunosti nova odluka ove faze.
+
+**Testovi ostaju u `tests/unit/`** (nema novog `tests/integration/`
+direktorijuma, dosledno postojećoj konvenciji): `test_network_server.cpp`
+(generički accept-loop/echo-handler test) i `test_storage_node.cpp`
+(end-to-end WRITE→READ round-trip, DELETE idempotencija,
+`STORAGE_FULL`/`BLOCK_NOT_FOUND` error putanje) preko pravog TCP
+loopback-a, istim obrascem kao `TCPConnectionLoopback` testovi iz
+Faze 1. Ovim je "ad hoc smoke test" iz `IMPLEMENTATION_PLAN.md`-a
+pretvoren u ponovljiv regresioni test umesto jednokratnog ručnog
+skripta.

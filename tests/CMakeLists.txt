@@ -27,6 +27,12 @@ target_link_libraries(test_block_manager PRIVATE storage gtest_main)
 add_executable(test_namespace unit/test_namespace.cpp)
 target_link_libraries(test_namespace PRIVATE master gtest_main)
 
+add_executable(test_network_server unit/test_network_server.cpp)
+target_link_libraries(test_network_server PRIVATE network gtest_main)
+
+add_executable(test_storage_node unit/test_storage_node.cpp)
+target_link_libraries(test_storage_node PRIVATE storage gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
 gtest_discover_tests(test_protocol)
@@ -34,3 +40,5 @@ gtest_discover_tests(test_serialization)
 gtest_discover_tests(test_block_storage)
 gtest_discover_tests(test_block_manager)
 gtest_discover_tests(test_namespace)
+gtest_discover_tests(test_network_server)
+gtest_discover_tests(test_storage_node)
