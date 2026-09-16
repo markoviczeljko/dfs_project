@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <utility>
 
 #include "common/config.h"
@@ -68,6 +69,53 @@ constexpr size_t kBlockVersionSize = sizeof(uint64_t);
 constexpr size_t kChecksumSize = sizeof(uint32_t);
 constexpr size_t kNodeIdSize = sizeof(uint64_t);
 constexpr size_t kPortSize = sizeof(uint16_t);
+
+// Faza 14: only the message types with a natural file/block-level
+// "operation" meaning get one — COPY_BLOCK/COPY_BLOCK_DATA/REGISTER_NODE/
+// HEARTBEAT/GET_STATS are cluster-membership/recovery/diagnostic traffic,
+// not user-facing operations, so they're left unmapped (their responses
+// still count toward record_error() on failure — see docs/design.md §18).
+std::optional<OperationType> to_operation_type(MessageType type) {
+    switch (type) {
+        case MessageType::READ_BLOCK:
+            return OperationType::READ;
+        case MessageType::WRITE_BLOCK:
+            return OperationType::WRITE;
+        case MessageType::DELETE_BLOCK:
+            return OperationType::DELETE;
+        default:
+            return std::nullopt;
+    }
+}
+
+ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
+    return static_cast<ErrorCode>(get_u16(payload.data()));
+}
+
+// Faza 14: bytes actually transferred, derived from the request/response
+// wire formats already owned by this file (see docs/design.md §18) — 0 on
+// any outcome other than the specific success response each type expects,
+// so a failed/NOT_MODIFIED exchange never counts phantom bytes.
+uint64_t compute_bytes(const Message& request, const Message& response) {
+    switch (request.type) {
+        case MessageType::READ_BLOCK:
+            if (response.type == MessageType::READ_OK &&
+                response.payload.size() >= kBlockVersionSize + kDataSizeFieldSize) {
+                return response.payload.size() - kBlockVersionSize - kDataSizeFieldSize;
+            }
+            return 0;
+        case MessageType::WRITE_BLOCK: {
+            constexpr size_t kFixedHeader =
+                kOperationIdSize + kBlockIdSize + kOffsetSize + kBlockVersionSize + kDataSizeFieldSize;
+            if (response.type == MessageType::ACK && request.payload.size() >= kFixedHeader) {
+                return request.payload.size() - kFixedHeader;
+            }
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
 
 }  // namespace
 
@@ -208,6 +256,7 @@ void StorageNode::heartbeat_loop() {
         lock.unlock();
 
         auto socket_result = Socket::create();
+        bool heartbeat_acked = false;
         if (socket_result.is_ok()) {
             Socket socket = std::move(socket_result.value());
             if (socket.set_timeout(HEARTBEAT_SEND_TIMEOUT_MS) == ErrorCode::OK &&
@@ -217,14 +266,14 @@ void StorageNode::heartbeat_loop() {
                 put_u64(payload, config_.node_id);
                 master_connection.sendMessage(Message{MessageType::HEARTBEAT, 1, std::move(payload)});
                 auto response = master_connection.receiveMessage();
+                heartbeat_acked = response.has_value() && response->type == MessageType::ACK;
                 // Faza 12.3: needs_inventory==1 means Master lost track of
                 // this node's contents (e.g. after a Faza 12.4 restart) and
                 // needs a fresh report — best-effort, like everything else
                 // in this loop; a failure here just means the next tick's
                 // heartbeat sees needs_inventory again (see docs/design.md
                 // §16).
-                if (response.has_value() && response->type == MessageType::ACK &&
-                    !response->payload.empty() &&
+                if (heartbeat_acked && !response->payload.empty() &&
                     static_cast<uint8_t>(response->payload[0]) == 1) {
                     send_inventory();
                 }
@@ -233,6 +282,7 @@ void StorageNode::heartbeat_loop() {
             // silently ignored — the next tick simply tries again. See
             // docs/design.md §16.
         }
+        statistics_.record_heartbeat_sent(heartbeat_acked);
 
         lock.lock();
     }
@@ -245,6 +295,22 @@ Message StorageNode::make_error(uint64_t request_id, ErrorCode error) {
 }
 
 Message StorageNode::handle_message(const Message& request) {
+    auto start = std::chrono::steady_clock::now();
+    Message response = route_message(request);
+    auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    bool success = response.type != MessageType::ERROR;
+    if (!success) {
+        statistics_.record_error(error_from_payload(response.payload));
+    }
+    if (auto op = to_operation_type(request.type); op.has_value()) {
+        statistics_.record_operation(*op, compute_bytes(request, response), latency, success);
+    }
+    return response;
+}
+
+Message StorageNode::route_message(const Message& request) {
     switch (request.type) {
         case MessageType::WRITE_BLOCK:
             return handle_write_block(request);
@@ -256,6 +322,8 @@ Message StorageNode::handle_message(const Message& request) {
             return handle_copy_block(request);
         case MessageType::COPY_BLOCK_DATA:
             return handle_copy_block_data(request);
+        case MessageType::GET_STATS:
+            return handle_get_stats(request);
         default:
             return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
@@ -540,3 +608,17 @@ Message StorageNode::handle_copy_block_data(const Message& request) {
     }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
+
+Message StorageNode::handle_get_stats(const Message& request) {
+    uint64_t used = block_manager_->used_space();
+    uint64_t free = block_manager_->free_space();
+    statistics_.record_storage_capacity(used + free, used, block_manager_->enumerate_blocks().size());
+
+    std::string text = statistics_.format_snapshot();
+    std::vector<std::byte> response_payload(reinterpret_cast<const std::byte*>(text.data()),
+                                             reinterpret_cast<const std::byte*>(text.data()) +
+                                                 text.size());
+    return Message{MessageType::STATS_RESPONSE, request.request_id, std::move(response_payload)};
+}
+
+StatisticsSnapshot StorageNode::statistics_snapshot() const { return statistics_.snapshot(); }

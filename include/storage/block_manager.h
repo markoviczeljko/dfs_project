@@ -41,6 +41,10 @@ public:
     // Faza 13: see BlockStorage::read_block_if_changed.
     Result<BlockStorage::ConditionalReadResult> read_block_if_changed(BlockId id, uint64_t known_version);
 
+    // Faza 14: capacity stats passthroughs (see docs/design.md §18).
+    uint64_t used_space() const;
+    uint64_t free_space() const;
+
 private:
     explicit BlockManager(std::unique_ptr<BlockStorage> storage);
 

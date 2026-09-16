@@ -304,6 +304,34 @@ TEST_F(StorageNodeTest, WriteBeyondCapacityReturnsStorageFull) {
     EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::STORAGE_FULL);
 }
 
+// Faza 14: GET_STATS (see docs/design.md §18).
+TEST_F(StorageNodeTest, GetStatsReturnsTextSnapshotReflectingPriorOperations) {
+    start_node(37010);
+    TCPConnection client = connect_client(37010);
+
+    std::vector<uint8_t> data = {1, 2, 3};
+    ASSERT_TRUE(client.sendMessage(make_write_request(1, /*block_id=*/1, data)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_read_block_request(2, /*block_id=*/1, /*known_version=*/0)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(Message{MessageType::GET_STATS, 3, {}}));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::STATS_RESPONSE);
+
+    std::string text(reinterpret_cast<const char*>(resp->payload.data()), resp->payload.size());
+    EXPECT_NE(text.find("DFS Statistics"), std::string::npos);
+    EXPECT_NE(text.find("WRITE: total=1"), std::string::npos);
+    EXPECT_NE(text.find("READ: total=1"), std::string::npos);
+
+    // Confirmed via the in-process accessor too, not just the wire text.
+    StatisticsSnapshot snap = node_->statistics_snapshot();
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].successful, 1u);
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::READ)].successful, 1u);
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].bytes, data.size());
+}
+
 TEST_F(StorageNodeTest, UnknownMessageTypeReturnsInvalidRequest) {
     start_node(37006);
     TCPConnection client = connect_client(37006);

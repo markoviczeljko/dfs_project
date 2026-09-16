@@ -55,3 +55,7 @@ Result<BlockStorage::ConditionalReadResult> BlockManager::read_block_if_changed(
                                                                                   uint64_t known_version) {
     return storage_->read_block_if_changed(id, known_version);
 }
+
+uint64_t BlockManager::used_space() const { return storage_->used_space(); }
+
+uint64_t BlockManager::free_space() const { return storage_->free_space(); }

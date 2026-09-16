@@ -68,6 +68,16 @@ enum class MessageType : uint16_t {
     // needs_inventory bit is 1 — see docs/design.md §16.
     NODE_INVENTORY,
 
+    // Faza 14: statistics query, served by Master and StorageNode alike
+    // (both own a StatisticsManager and a GET_STATS handler with the same
+    // shape — see docs/design.md §18). Request payload is empty; response
+    // payload is a plain UTF-8 "DFS Statistics" text table
+    // (StatisticsManager::format_snapshot()), not a structured binary
+    // snapshot — dfs_statsctl just prints the bytes back, no client-side
+    // parsing needed for this diagnostic tool.
+    GET_STATS,
+    STATS_RESPONSE,
+
     // Generic
     ACK,
     ERROR

@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "network/network_server.h"
 #include "network/protocol.h"
+#include "statistics/statistics.h"
 #include "storage/block_manager.h"
 #include "storage/operation_log.h"
 
@@ -44,10 +45,20 @@ public:
     ErrorCode start();
     void stop();
 
+    // Faza 14: exposed for tests/tools; the same StatisticsManager backs
+    // GET_STATS's wire response (see docs/design.md §18).
+    StatisticsSnapshot statistics_snapshot() const;
+
 private:
     StorageNode(Config config, std::unique_ptr<BlockManager> block_manager);
 
+    // Faza 14: thin wrapper around route_message() — measures latency,
+    // maps MessageType to OperationType where one applies, and records
+    // operation/error stats in one place rather than touching every
+    // individual handler (see docs/design.md §18). Same
+    // wrap-the-core-method pattern as Client's *_impl split.
     Message handle_message(const Message& request);
+    Message route_message(const Message& request);
     Message handle_write_block(const Message& request);
     Message handle_read_block(const Message& request);
     Message handle_delete_block(const Message& request);
@@ -58,6 +69,8 @@ private:
     // handle_copy_block() on another node, verifies its checksum before
     // ever writing to disk.
     Message handle_copy_block_data(const Message& request);
+    // Faza 14: see docs/design.md §18.
+    Message handle_get_stats(const Message& request);
     ErrorCode register_with_master();
     // Faza 12.3: sends this node's full on-disk block inventory to Master
     // on a fresh connection — called once after a successful
@@ -81,6 +94,8 @@ private:
     // operation_log.h for why one shared log is safe (see docs/design.md
     // §16).
     OperationLog operation_log_;
+    // Faza 14: see docs/design.md §18.
+    StatisticsManager statistics_;
 
     std::thread heartbeat_thread_;
     std::mutex heartbeat_cv_mutex_;

@@ -34,7 +34,7 @@ add_library(storage
     src/storage/storage_node.cpp
 )
 target_include_directories(storage PUBLIC include)
-target_link_libraries(storage PUBLIC common network Threads::Threads)
+target_link_libraries(storage PUBLIC common network statistics Threads::Threads)
 
 add_library(master
     src/master/namespace.cpp

@@ -1659,3 +1659,45 @@ fixtures, tačno po planu).
 
 231/231 testova prolazi (bez novih test IZVRŠNIH fajlova — samo dopune
 postojećih), čisto pod ASan/UBSan.
+
+### 18.3 — StorageNode retrofit + GET_STATS wire
+
+`MessageType::GET_STATS`/`STATS_RESPONSE` dodati na kraj enuma (prvi put
+korišćeni ovdje, isti presedan kao `NODE_INVENTORY`). `BlockManager` dobija
+`used_space()`/`free_space()` passthrough (jednolinijski, isti obrazac kao
+`get_block_info()`); `capacity_bytes = used_space() + free_space()` —
+nije trebao novi `capacity()` getter na `BlockStorage`-u.
+
+`StorageNode::handle_message()` (centralni dispatcher) preimenovan u
+`route_message()`; novi tanak `handle_message()` wrapper mjeri
+`steady_clock`, mapira `READ_BLOCK→READ`/`WRITE_BLOCK→WRITE`/
+`DELETE_BLOCK→DELETE` (`to_operation_type()` helper — `COPY_BLOCK`/
+`COPY_BLOCK_DATA`/`REGISTER_NODE`/`HEARTBEAT`/`GET_STATS` namjerno
+nemapirani, to je cluster-membership/recovery/dijagnostički saobraćaj, ne
+korisnička operacija), i zove `record_operation()`/`record_error()`.
+Bajtovi se računaju direktno iz request/response wire formata (`compute_bytes()`
+helper, koristi već postojeće `kBlockVersionSize`/`kDataSizeFieldSize`
+konstante iz istog fajla) — bez potrebe za dodatnom `StatisticsManager`
+metodom, i bez curenja handler-specifičnog wire-format znanja u wrapper
+(sve živi u istoj translation unit, isti fajl koji i handleri koriste).
+
+`heartbeat_loop()` zove `record_heartbeat_sent(success)` po pokušaju
+(uspjeh = ACK primljen). Novi `handle_get_stats()`: ažurira storage
+capacity gauge preko `block_manager_->used_space()`/`free_space()`/
+`enumerate_blocks().size()`, pa vraća `STATS_RESPONSE` sa
+`statistics_.format_snapshot()` kao UTF-8 payload.
+
+**Testovi**: novi `StorageNodeTest.GetStatsReturnsTextSnapshotReflectingPriorOperations`
+u `tests/unit/test_storage_node.cpp` — potvrđuje i wire tekst ODGOVOR i
+in-process `statistics_snapshot()` accessor posle stvarnog WRITE_BLOCK/
+READ_BLOCK para.
+
+**Poznat, nepovezan environment flake ponovo zabilježen**: `ReadIntegrationTest.WriteThenReadReturnsSameBytes`
+je pukao (segfault) zbog istog sandbox efemernog-porta fenomena kao ranije
+(port 40202 zauzet od strane Firefox-a u trenutku testiranja) — potvrđeno
+`fuser`-om, nepovezano sa ovim diff-om (nijedna izmjena ove pod-faze ne
+dira taj test/port). Svih preostalih testova prolazi čisto i pod običnim
+build-om i pod ASan/UBSan-om kad se ovaj isključi.
+
+231/231 (232 sa novim testom, 1 isključen zbog environment flake-a)
+testova prolazi, čisto pod ASan/UBSan.
