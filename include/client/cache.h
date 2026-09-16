@@ -43,6 +43,13 @@ public:
     // documented use (Client is single-threaded, see client.h); revisit
     // with e.g. a shared_ptr<const vector<uint8_t>> payload if ClientCache
     // is ever shared across threads.
+    //
+    // Faza 15 audit (design notes §9.20/§11.29 — "unlock before network
+    // I/O"): confirmed every call site in client.cpp (get/put/invalidate,
+    // ~5 sites) is a single, self-contained call — none hold onto
+    // anything returned from mutex_ across a network round-trip, since
+    // get()/put() never return a reference into entries_ in the first
+    // place. Structurally guaranteed by this API, not just by convention.
     std::optional<CacheEntry> get(BlockId id);
 
     // Inserts/replaces the entry for id, evicting least-recently-used

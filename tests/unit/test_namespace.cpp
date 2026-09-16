@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -532,4 +534,65 @@ TEST(NamespaceManagerTest, ConcurrentStatAndListDontRace) {
         });
     }
     for (auto& thread : threads) thread.join();
+}
+
+// Faza 15 audit (§11.24/§12.8): ConcurrentStatAndListDontRace above only
+// exercises shared_lock-vs-shared_lock (STAT/LIST racing each other).
+// This exercises the mixed case the audit specifically called out —
+// unique_lock CREATE/DELETE racing shared_lock LIST/STAT on the SAME
+// NamespaceManager — to confirm the single shared_mutex genuinely
+// serializes writers against readers under real contention, not just in
+// the single-lock-mode test above. A reader observing a file mid-
+// create/delete is expected (create_file()/delete_file() are atomic, so a
+// reader sees it fully present or fully absent, never partial) — the
+// property under test is the absence of a crash, deadlock, or data-race
+// under TSan, not a specific interleaving.
+TEST(NamespaceManagerTest, ConcurrentCreateDeleteAndListStatDontRace) {
+    NamespaceManager ns;
+    constexpr int kWriterThreads = 4;
+    constexpr int kIterationsPerWriter = 50;
+
+    std::vector<std::thread> writers;
+    writers.reserve(kWriterThreads);
+    for (int w = 0; w < kWriterThreads; ++w) {
+        writers.emplace_back([&ns, w]() {
+            std::string path = "/data/file" + std::to_string(w) + ".txt";
+            for (int i = 0; i < kIterationsPerWriter; ++i) {
+                ns.create_file(path);
+                ns.delete_file(path);
+            }
+        });
+    }
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    constexpr int kReaderThreads = 4;
+    readers.reserve(kReaderThreads);
+    for (int r = 0; r < kReaderThreads; ++r) {
+        readers.emplace_back([&ns, &stop]() {
+            while (!stop.load()) {
+                auto list_result = ns.list_files("/data");
+                if (!list_result.is_ok()) continue;
+                for (const std::string& path : list_result.value()) {
+                    // A concurrent delete can legitimately land between
+                    // list_files() and stat_file() for the same path —
+                    // that race is expected and not asserted against, only
+                    // that stat_file() itself never crashes or corrupts
+                    // state.
+                    ns.stat_file(path);
+                }
+            }
+        });
+    }
+
+    for (auto& t : writers) t.join();
+    stop = true;
+    for (auto& t : readers) t.join();
+
+    // Every writer's last action is delete_file() on its own path, so the
+    // namespace must end up empty — a silent map corruption (e.g. a lost
+    // erase or a resurrected entry) would leave a stray file behind.
+    auto final_list = ns.list_files("/data");
+    ASSERT_TRUE(final_list.is_ok());
+    EXPECT_TRUE(final_list.value().empty());
 }

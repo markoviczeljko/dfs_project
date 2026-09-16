@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -161,4 +162,60 @@ TEST(StorageRegistryTest, ConcurrentRegisterNodeWithDistinctIdsAllPersist) {
     for (int i = 0; i < kNodes; ++i) {
         EXPECT_TRUE(registry.get_node(static_cast<StorageNodeId>(i + 1)).has_value());
     }
+}
+
+// Faza 15 audit (§11.32): the test above only exercises concurrent
+// mutators against each other (distinct-id registrations). This exercises
+// the specific concern §11.32 raises — a heartbeat-writer thread
+// (record_heartbeat/mark_dead/mark_alive) racing request-handling reader
+// threads (get_alive_nodes/get_node) on the SAME nodes — to confirm the
+// registry's shared_mutex genuinely synchronizes that interaction under
+// real contention, not just on paper. No specific interleaving is
+// asserted (heartbeat timing vs. a concurrent read is inherently racy by
+// design); the property under test is the absence of a crash, deadlock,
+// or data race under TSan.
+TEST(StorageRegistryTest, ConcurrentHeartbeatWritesAndReaderQueriesDontRace) {
+    StorageRegistry registry;
+    constexpr int kNodes = 8;
+    for (int i = 0; i < kNodes; ++i) {
+        registry.register_node(make_node(static_cast<StorageNodeId>(i + 1), static_cast<uint16_t>(9100 + i)));
+    }
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> writers;
+    writers.reserve(kNodes);
+    for (int i = 0; i < kNodes; ++i) {
+        writers.emplace_back([&registry, i, &stop]() {
+            auto id = static_cast<StorageNodeId>(i + 1);
+            while (!stop.load()) {
+                registry.record_heartbeat(id);
+                registry.mark_dead(id);
+                registry.mark_alive(id);
+            }
+        });
+    }
+
+    constexpr int kReaderThreads = 4;
+    std::vector<std::thread> readers;
+    readers.reserve(kReaderThreads);
+    for (int r = 0; r < kReaderThreads; ++r) {
+        readers.emplace_back([&registry, &stop]() {
+            while (!stop.load()) {
+                for (const StorageNodeInfo& node : registry.get_all_nodes()) {
+                    registry.get_node(node.id);
+                }
+            }
+        });
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop = true;
+    for (auto& t : writers) t.join();
+    for (auto& t : readers) t.join();
+
+    // None of record_heartbeat/mark_dead/mark_alive ever remove a node
+    // from the registry — regardless of which operation each writer last
+    // completed before stop, all kNodes entries must still be present. A
+    // missing id here would indicate map corruption under contention.
+    EXPECT_EQ(registry.get_all_nodes().size(), static_cast<size_t>(kNodes));
 }
