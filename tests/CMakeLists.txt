@@ -54,6 +54,9 @@ target_link_libraries(test_metadata_store PRIVATE master gtest_main)
 add_executable(test_cache unit/test_cache.cpp)
 target_link_libraries(test_cache PRIVATE client gtest_main)
 
+add_executable(test_statistics unit/test_statistics.cpp)
+target_link_libraries(test_statistics PRIVATE statistics gtest_main)
+
 add_executable(test_create integration/test_create.cpp)
 target_link_libraries(test_create PRIVATE client master gtest_main)
 
@@ -91,6 +94,7 @@ gtest_discover_tests(test_replication_manager)
 gtest_discover_tests(test_failure_detector)
 gtest_discover_tests(test_metadata_store)
 gtest_discover_tests(test_cache)
+gtest_discover_tests(test_statistics)
 gtest_discover_tests(test_create)
 gtest_discover_tests(test_write)
 gtest_discover_tests(test_read)

@@ -1532,3 +1532,99 @@ nalaza, sva 4 popravljena**:
 
 216/216 testova prolazi (5 novih regresionih: 5 u `test_block_storage.cpp`),
 čisto pod ASan/UBSan (ponovljena puna provjera nakon ovih popravki).
+
+## 18. Faza 14 — Statistics & Monitoring (§10 dizajn dokumenta)
+
+Podijeljena na 4 pod-koraka (14.1-14.4), isti obrazac kao Faza 12, jer dira
+gotovo svaki fajl u projektu iako je pretežno mehanički retrofit (dodavanje
+brojača/mernih tačaka), ne nova rizična logika.
+
+**Poprečne odluke** (važe za cijelu Fazu 14 — spec (§10, 46 podsekcija)
+ostavlja nekoliko stvari nedefinisanim koje sam morao sam da riješim):
+
+- **`dfsctl stats` mehanizam (§10.33)**: dokument kaže samo "CLI komanda
+  ili lokalni endpoint", bez ijedne konkretne žice, i nema `GET_STATS` u
+  kanonskom `MessageType` enumu. Dodat `MessageType::GET_STATS`/
+  `STATS_RESPONSE` (Faza 14.3, kad StorageNode prvi implementira handler —
+  isti presedan kao Faza 12.3-ov `NODE_INVENTORY`). Response payload je
+  **običan UTF-8 tekstualni blob** (formatirana tabela, §10.33-ov "DFS
+  Statistics" primer), ne strukturisan binaran snapshot — `dfs_statsctl`
+  samo ispiše string nazad, bez potrebe za dizajniranjem/verzionisanjem
+  posebne binarne šeme za čisto dijagnostički alat.
+- **Percentil algoritam (§10.9/§10.38/§10.39)**: nema bucket granica ni
+  algoritma u spec-u, samo zahtjev da bude jeftino i periodično.
+  `Histogram` koristi fiksne bucket-e na stepen dvojke u mikrosekundama
+  (`std::bit_width(value)`, 65 bucket-a, pokriva ceo `uint64_t` opseg),
+  `std::atomic<uint64_t>` brojač po bucket-u (O(1) lock-free `record()`),
+  percentil se računa TEK u `snapshot()` preko kumulativnog prolaza
+  (nearest-rank definicija: `target = max(1, ceil(fraction*total))`) —
+  vraća bucket-ovu gornju granicu kao aproksimaciju, ne tačnu vrijednost.
+- **Konflikt imena klase (§10.28-30 `StatisticsManager`/camelCase vs
+  §17.13 `Statistics`/snake_case)**: `StatisticsManager`, potpuno
+  snake_case — projekat nigdje ne koristi camelCase (isti presedan kao
+  Faza 0-ova `Result<T,E>` odluka umjesto doslovnog `std::expected`
+  sketch-a).
+- **Eksplicitno van scope-a, dokumentovano a ne tiho preskočeno**: §10.14
+  per-`MessageType` network bajt/poruka brojači (zahtijevao bi kuku u
+  svakom mjestu koje pravi `TCPConnection`, a plan-ov sopstveni committed
+  metod-spisak ga ne imenuje) i §10.25-26 request/operation-ID korelacija
+  (alat za debagovanje/tracing, ne brojiva metrika).
+- **§10.20-22 failure-detection-time vs recovery-time**: pravi `t0`
+  (trenutak stvarne smrti node-a) je fundamentalno nemerljiv sa Master
+  strane. Umjesto lažne "detection latency" ograničene nepoznatim `t0`,
+  pratim stvaran, mjerljiv par: `detected_failures` (brojač, stvaran
+  `FailureDetector::on_node_dead_` okidač) + `recovery_duration` (stvarno
+  izmjerena latencija, `RecoveryManager`-ov `record_recovery` poziv) — plus
+  već postojeći `SUSPECTED_TIMEOUT_SECONDS`/`DEAD_TIMEOUT_SECONDS` daju
+  fiksnu gornju granicu na detection latency.
+- **`record_replication` naspram `record_recovery`**: `ReplicationManager`
+  samo BIRA node-ove (nikad ne pomjera bajtove), `RecoveryManager` STVARNO
+  pomjera bajtove preko `COPY_BLOCK`. `record_replication(bytes)` = Master
+  -ova inicijalna placement odluka (poziva se u `handle_write_commit`/
+  `handle_append_commit`, kad je stvarna veličina bloka već poznata).
+  `record_recovery(bytes, success)` = `RecoveryManager`-ov `COPY_BLOCK`
+  re-replikacije. Nema duplog brojanja iste operacije pod dva imena.
+- **Cache brojači (§10.11) naspram Faza 13-ovog `ClientCache::stats()`**:
+  `ClientCache` VEĆ prati hits/misses/evictions/invalidations/bytes_served.
+  `StatisticsManager` NEMA `record_cache_hit()`/`record_cache_miss()`
+  metode uopšte — `Client`-ov poseban `cache_stats()` accessor prosto vraća
+  postojeći `CacheStats`, bez duplirane logike. `StatisticsSnapshot` (u
+  `statistics/` biblioteci) namjerno NE zna za `CacheStats` (koji živi u
+  `client/`) — sprečava upward zavisnost od generičke statistike ka
+  Client-specifičnom tipu; spajanje se dešava na `Client` nivou, ne unutar
+  `StatisticsManager`-a.
+
+### 18.1 — Statistics/Histogram jezgro + Logger
+
+Novi `statistics` lib (`include/statistics/statistics.h`,
+`include/statistics/histogram.h`, odgovarajući `.cpp`), samostalan i
+testiran bez mreže/Master/StorageNode/Client zavisnosti. `OperationType`
+enum (`READ, WRITE, APPEND, CREATE, DELETE, LIST, STAT`) — `StatisticsManager`
+drži po jedan `OperationCounters` (total/successful/failed/bytes + sopstveni
+`Histogram`) za svaki tip, plus `errors_by_code_` (`std::array<atomic, 11>`
+indeksiran `ErrorCode`-om), replication/recovery/heartbeat/node-dead
+brojače, i storage capacity gauge (zaštićen `std::mutex`-om jer su
+capacity/used/block_count smisleni samo zajedno kao konzistentna trojka,
+ne kao tri nezavisna atomika koja mogu da se razmimoiđu).
+
+`Logger` (`include/common/logger.h`) je **header-only** (C++17 `inline`
+promenljive/funkcije) — namjerno, da se izbjegne pretvaranje `common`
+INTERFACE biblioteke u pravu static-lib samo zbog jednog malog fajla.
+`DEBUG/INFO/WARNING/ERROR` nivoi tačno po §10.32, globalni atomic prag,
+`std::mutex` oko `std::cerr` ispisa (sam `std::cerr` nije bezbjedan pod
+konkurentnim `<<` lancima).
+
+**Bag nađen tokom pisanja sopstvenog testa (ne u proizvodnom kodu)**:
+`const OperationStats& read = stats.snapshot().operations[idx];` je
+dangling-reference — `std::array::operator[]` je poziv funkcije koji
+prekida C++-ov lanac produženja životnog vijeka privremenog objekta (radi
+SAMO za direktan `.`-pristup članu, ne kroz poziv funkcije koja vraća
+referencu), pa je `StatisticsSnapshot` privremeni objekat uništen na kraju
+te linije dok je `read` i dalje trebalo da se koristi na sljedećoj.
+Uhvaćeno od strane ASan-a (`stack-use-after-scope`) tek u ASan/UBSan
+prolazu — običan build ovo nikad ne bi otkrio. Popravljeno čuvanjem
+`StatisticsSnapshot`-a u imenovanu lokalnu promjenljivu prije uzimanja
+reference na njegov član. Dobra ilustracija zašto ASan/UBSan prolaz posle
+SVAKE pod-faze nije opciono, čak i za "samo testni kod".
+
+15 novih testova (`test_statistics.cpp`), čisto pod ASan/UBSan.

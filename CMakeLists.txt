@@ -19,6 +19,13 @@ add_library(network
 target_include_directories(network PUBLIC include)
 target_link_libraries(network PUBLIC common Threads::Threads)
 
+add_library(statistics
+    src/statistics/histogram.cpp
+    src/statistics/statistics.cpp
+)
+target_include_directories(statistics PUBLIC include)
+target_link_libraries(statistics PUBLIC common Threads::Threads)
+
 add_library(storage
     src/storage/block_storage.cpp
     src/storage/block_manager.cpp
