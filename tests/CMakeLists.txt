@@ -89,6 +89,35 @@ target_link_libraries(test_concurrent_writes PRIVATE storage gtest_main)
 add_executable(test_concurrent_append concurrency/test_concurrent_append.cpp)
 target_link_libraries(test_concurrent_append PRIVATE storage gtest_main)
 
+# Faza 16: real-OS-process failure/recovery/restart tests (design notes
+# §16.3-16.5) — spawn the actual dfs_master/dfs_storage/dfs_client/
+# dfs_statsctl binaries rather than in-process C++ objects. binary_paths.h
+# is generated at CMake generate-time (needs $<TARGET_FILE:...> generator
+# expressions, which plain configure_file() cannot resolve) so the harness
+# can find its sibling binaries regardless of the test binary's CWD.
+set(dfs_test_binary_paths_header "${CMAKE_CURRENT_BINARY_DIR}/binary_paths.h")
+file(GENERATE OUTPUT "${dfs_test_binary_paths_header}" CONTENT
+"#pragma once
+inline constexpr const char* kDfsMasterPath = \"$<TARGET_FILE:dfs_master>\";
+inline constexpr const char* kDfsStoragePath = \"$<TARGET_FILE:dfs_storage>\";
+inline constexpr const char* kDfsClientPath = \"$<TARGET_FILE:dfs_client>\";
+inline constexpr const char* kDfsStatsctlPath = \"$<TARGET_FILE:dfs_statsctl>\";
+")
+
+add_library(failure_test_support failure/process_cluster.cpp)
+target_link_libraries(failure_test_support PUBLIC network)
+target_include_directories(failure_test_support PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+add_dependencies(failure_test_support dfs_master dfs_storage dfs_client dfs_statsctl)
+
+add_executable(test_restart failure/test_restart.cpp)
+target_link_libraries(test_restart PRIVATE failure_test_support gtest_main)
+
+add_executable(test_storage_failure failure/test_storage_failure.cpp)
+target_link_libraries(test_storage_failure PRIVATE failure_test_support gtest_main)
+
+add_executable(test_failure_recovery failure/test_recovery.cpp)
+target_link_libraries(test_failure_recovery PRIVATE failure_test_support gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
 gtest_discover_tests(test_protocol)
@@ -116,3 +145,6 @@ gtest_discover_tests(test_recovery)
 gtest_discover_tests(test_concurrent_reads)
 gtest_discover_tests(test_concurrent_writes)
 gtest_discover_tests(test_concurrent_append)
+gtest_discover_tests(test_restart)
+gtest_discover_tests(test_storage_failure)
+gtest_discover_tests(test_failure_recovery)

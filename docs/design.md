@@ -1951,3 +1951,113 @@ ništa iz ovog diff-a).
 
 242/241 testova prolazi (241 stvarnih + 1 isključen environment flake),
 čisto pod ASan/UBSan, čisto pod ThreadSanitizer-om (nula upozorenja).
+
+---
+
+## 20. Faza 16 — Multi-process integration testovi & failure-injection hardening (§16.3-16.5)
+
+Sve dosadašnje integration/failure provjere koriste in-process C++ objekte
+(Master/StorageNode konstruisani direktno u test procesu) — brzo za CI, ali
+strukturno ne mogu testirati pravi TCP preko granica procesa, pravi
+`SIGKILL`, ili pravi restart-sa-diska. Ova faza formalizuje pravi
+multi-process deployment model kao test, i proizvodi operativne skripte za
+odbranu diplomskog rada. Jedan commit (potvrđena odluka korisnika — faza je
+logički jedna cjelina).
+
+**`tests/failure/` je konačno napravljen** — tri fajla obećana još od Faze
+12 (`test_storage_failure.cpp`, `test_recovery.cpp`, `test_restart.cpp`)
+nikad nisu bila napravljena (Faza 12-ovo recovery testiranje je završilo
+in-process unutar `tests/integration/test_recovery.cpp` umjesto).
+
+**Novi process-harness** (`tests/failure/process_cluster.h`/`.cpp`, novi
+CMake target `failure_test_support`): `ProcessHandle` (RAII omotač oko
+`posix_spawn`-ovanog procesa — destruktor šalje `SIGKILL`+`waitpid` kao
+sigurnosna mreža ako test padne na ASSERT prije sopstvenog cleanup-a),
+`wait_for_port_ready()` (poll `connect()`, jedini nacin da se sazna da je
+proces spreman — ni `dfs_master` ni `dfs_storage` nemaju pidfile/health
+endpoint), `write_master_config()`/`write_storage_config()` (generišu
+`key=value` config fajlove tačno u formatu koji `main_master.cpp`/
+`main_storage.cpp` već parsiraju), `run_client()`/`run_statsctl()`
+(pokreću `dfs_client`/`dfs_statsctl` kao jednokratne procese), i
+`spawn_cluster()`/`SpawnedCluster` (jedna funkcija koja podiže Master + N
+Storage Node-a i čeka da svi budu spremni — koristi je sva tri nova test
+fajla). Pravi binary putanje pronalazi preko CMake `file(GENERATE ...
+CONTENT "...$<TARGET_FILE:dfs_master>...")` — generator-expression-safe,
+za razliku od `configure_file()`-a koji ne resolvuje `$<TARGET_FILE:...>`
+— generisan `binary_paths.h` je implementacioni detalj sakriven unutar
+`process_cluster.cpp`, test fajlovi ga nikad ne dodiruju direktno.
+
+**Analitički potvrđena korekcija plana prije implementacije**: originalni
+plan je predložio `test_storage_failure.cpp` sa tačno 3 Storage Node-a
+(bez rezervnog), doslovno po §16.4 tekstu. Čitanjem
+`src/master/replication_manager.cpp` prije pisanja koda otkriveno:
+`choose_recovery_destination()` vraća `nullopt` kad su svi zdravi node-ovi
+već u `exclude` skupu. Sa tačno 3 node-a i RF=3, svaki blok već postoji na
+SVA 3 node-a od početka — kad se jedan ubije, oba preostala zdrava node-a
+već imaju kopiju, `exclude` ih oba pokriva, `choose_recovery_destination()`
+vraća `nullopt` bezuslovno. Recovery matematički nikad ne može stvoriti
+novu repliku sa samo 3 ukupna node-a. Primijenjen dokumentovani fallback iz
+samog plana: `test_storage_failure.cpp` i `test_recovery.cpp` koriste 4
+node-a (3 + 1 rezervni), isti obrazac kao `tests/integration/
+test_recovery.cpp`. `test_restart.cpp` (§16.5, nema failure/recovery)
+ostaje na 3 node-a — nije pogođen ovim problemom.
+
+**`tests/failure/test_restart.cpp` (§16.5)**: real WRITE → real `SIGTERM`
+(graceful, ne `SIGKILL`) na jedan Storage subprocess → restart ISTOG
+procesa (isti config fajl, isti `node_id`/`port`/`data_dir`) → real READ
+vraća originalne bajtove. Ne zavisi od `FailureDetector` tajminga —
+najjeftiniji test, ~0.9s.
+
+**`tests/failure/test_storage_failure.cpp` (§16.4)**: real WRITE → pravi
+**`SIGKILL`** (prvi put u ovom projektu, nigdje ranije korišćen) na
+Storage Node koji fizički drži blok → `dfs_client read` mora uspijevati
+CIJELO vrijeme dok se čeka na real `FailureDetector` (real
+`SUSPECTED_TIMEOUT_SECONDS=6`+`DEAD_TIMEOUT_SECONDS=12` iz
+`include/common/config.h` — nije ubrzano, isti trade-off kao već prihvaćen
+u in-process `test_recovery.cpp`) → blok se fizički pojavljuje na
+rezervnom node-u. Potvrđeno manuelnim pokretanjem: `[Master] Storage Node
+1 declared DEAD` u pravom Master-ovom stdout-u, ~13s ukupno.
+
+**`tests/failure/test_recovery.cpp`** (CMake target `test_failure_recovery`
+— ime fajla se poklapa sa postojećim `tests/integration/test_recovery.cpp`,
+ali CMake target imena su globalno jedinstvena, pa je novo ime nužno):
+isti trigger, ali druga asercija — operator-vidljiv dokaz recovery-ja
+umjesto klijent-vidljivog. `dfs_statsctl` (pravi subprocess, pravi
+`GET_STATS` preko žice protiv pravog Master-a — ono što in-process test
+strukturno ne može) mora prijaviti `detected_failures`≥1 i
+`successful_recoveries`≥1. Prvi pokušaj parsiranja stats teksta je pukao:
+naivan `text.find("operations=")` je pogodio `"Replication: operations=0
+..."` liniju umjesto `"Recovery: operations=..."` linije (obje sadrže istu
+podnisku), a `"successful="` se javlja i u svakoj po-operaciji liniji
+(`"CREATE: total=1 successful=1..."`). Popravljeno: parsiranje ograničeno
+na specifičnu liniju (`"Recovery:"`/`"Failures:"` prefiks), ne globalna
+pretraga cijelog teksta.
+
+**`scripts/test_cluster.sh`** (nova, RUČNA demo skripta — potvrđena odluka:
+NE u CTest-u, fiksni portovi 9000/9101-9103 nisu bezbjedni za automatske
+run-ove): podiže pravi 4-proces klaster preko postojećih `configs/`,
+`trap cleanup EXIT ERR INT TERM` garantuje gašenje svih background procesa
+bez obzira kako skripta završi (SIGTERM, pa SIGKILL fallback nakon 10s).
+Bag uhvaćen i popravljen prije prve manuelne provjere: drugi `trap ... EXIT`
+(za brisanje temp fajlova) je NEPRIMJETNO PREPISAO prvi `trap cleanup ...`
+— bash trap ne dodaje handlere, zamjenjuje ih. Popravljeno spajanjem oba
+cleanup-a u jednu `cleanup()` funkciju, jedan `trap` pozив. Manuelno
+potvrđeno: puna smoke sekvenca (CREATE/WRITE/READ/APPEND/STAT/LIST/DELETE)
+uspijeva, `logs/`+cleanup ispravni.
+
+**`scripts/start_master.sh`/`start_storage.sh` finalizovane** (potvrđena
+odluka: pidfile+log redirection direktno u skriptama, ne samo u
+`test_cluster.sh`): `data/master.pid`/`data/storage<N>.pid` +
+`logs/master.log`/`logs/storage<N>.log`. Idempotencija manuelno potvrđena:
+drugi pokušaj starta dok je prvi još živ ispravno odbija (`exit 1`,
+provjera `ps -p <pid> -o comm=` protiv binary imena); stale pidfile (proces
+već završio) se tiho prepisuje, ne blokira novi start.
+
+**TSan van scope-a za ovu fazu** (odluka, ne propust) — instrumentuje
+thread-race unutar jednog procesa, ne cross-process orkestraciju/signale;
+ništa novo da testira za ovu fazu.
+
+244/244 testova prolazi (isključujući isti poznati port-collision flake iz
+Faze 15), čisto pod ASan/UBSan (uklj. pravi subprocess-i pod istim
+sanitizer flagovima, pošto se `CMAKE_CXX_FLAGS` primjenjuje na cijeli
+projekat).
