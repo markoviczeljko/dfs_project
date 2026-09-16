@@ -1763,6 +1763,64 @@ prošao čisto na ponovnom pokretanju, nepovezano sa ovim diff-om.
 
 ---
 
-**Faza 14 u cjelini**: 4 pod-faze, sve gore. Nezavisan `cpp-reviewer` pass
-na cijeloj Fazi 14 (sve 4 pod-faze kao jedna cjelina) slijedi prije
-push-a — isti obrazac kao Faze 12/13.
+**Nezavisan `cpp-reviewer` na cijeloj Fazi 14 — 3 MEDIUM + 2 LOW nalaza,
+svih 5 popravljeno**:
+
+- **MEDIUM: Master-ov `handle_message()` wrapper je hardkodovao
+  `bytes=0`** za SVAKI operation type, uključujući WRITE/APPEND, iako je
+  stvarna veličina već dostupna u `WRITE_COMMIT`/`APPEND_COMMIT` wire
+  payload-u (`handle_write_commit`/`handle_append_commit` je već
+  parsiraju za `record_replication()` par linija niže). Rezultat: `dfs_statsctl`
+  protiv Master-a bi uvijek pokazao `WRITE: ... bytes=0` pored ispravnog
+  `Replication: bytes=...` — interno nekonzistentna tabela. Novi
+  `WriteCommitRecordsReplicationStats` test (dodat u istoj Fazi 14.4) je
+  ovo propustio jer nikad nije asertovao `.bytes` polje. Popravljeno:
+  novi `compute_bytes()` helper u `master.cpp` (isti obrazac kao
+  StorageNode-ov, iz istog wire formata koji `handle_write_commit`/
+  `handle_append_commit` već parsiraju), samo za `WRITE_COMMIT`/
+  `APPEND_COMMIT` i samo na `ACK` odgovoru. Regresija: `.bytes` asercija
+  dodata postojećem testu + nova asercija u `test_append.cpp`-ovom
+  `AppendToEmptyFileIsEquivalentToWrite` (Master-side, ne samo
+  Client-side).
+- **MEDIUM: idempotentan WRITE_BLOCK retry (izgubljen ACK, isti
+  `operation_id`) je duplo brojan u statistici** — `handle_message()`
+  wrapper bezuslovno zove `record_operation()` oko `route_message()`-a,
+  bez obzira da li je `route_message` stvarno izvršio pisanje ili samo
+  vratio keširan odgovor iz `OperationLog`-a (Faza 12.2 idempotency).
+  Popravljeno: novi `OperationLog::contains(id)` metod (read-only peek,
+  za razliku od `begin_or_get()`, koji mutira stanje) pozvan PRIJE
+  `route_message()`-a da uhvati "da li je ovo poznat operation_id" stanje
+  na početku poziva — provjera POSLIJE `route_message()`-a bi uvijek
+  vratila true čak i za svjež zahtjev (jer `begin_or_get()` upravo ubaci
+  novi unos kao svoju sporednu posljedicu). Regresija:
+  `IdempotentWriteBlockRetryDoesNotDoubleCountStats` — isti
+  `operation_id`, dva različita `request_id`-a, potvrđuje `total == 1` ne
+  `2`.
+- **MEDIUM: `OperationCounters`-ova 4 atomika + `Histogram` se ažuriraju
+  nezavisno, bez zajedničkog lock-a** — konkurentan `snapshot()` može
+  vidjeti ih "poderane" jedne u odnosu na druge (npr. `total` već
+  inkrementiran a `bytes`/latencija još nisu). Namjerno prihvaćeno (isti
+  §10.39 princip kao capacity gauge-ov mutex, ali ovdje je dijagnostički
+  značaj dovoljno nizak da opravda jeftinije atomike bez zajedničkog
+  lock-a) — popravljeno DOKUMENTOVANJEM ove odluke eksplicitno pored
+  `OperationCounters` strukture, da budući čitalac ne pomisli da je
+  `successful + failed != total` u live snapshot-u bag.
+- **LOW: `get_u16()` na error payload-u bez provjere granica** u oba
+  wrapper-a (`Master::handle_message`/`StorageNode::handle_message`) —
+  danas bezopasno (svaki `MessageType::ERROR` u oba fajla trenutno uvijek
+  puni bar 2-bajtni payload), ali wrapper je generički dispatcher kod koji
+  radi nad SVAKIM handler-ovim rezultatom, sadašnjim i budućim. Popravljeno
+  dodavanjem `payload.size() >= sizeof(uint16_t)` provjere direktno u oba
+  wrapper poziva (defense-in-depth, nezavisno od `make_error()`-ove
+  sopstvene ispravnosti).
+- **LOW: `GET_STATS`/`STATS_RESPONSE` ubačeni usred `MessageType` enuma**,
+  pomjerajući numeričke vrijednosti `ACK`/`ERROR`-a u odnosu na
+  pre-Faza-14 build. Bezopasno za OVAJ projekat (single-binary build,
+  nema perzistovanih sirovih `MessageType` vrijednosti, nema mixed-version
+  deployment-a), ali loša higijena za over-the-wire enum uopšteno.
+  Popravljeno premještanjem oba na sam kraj enuma (poslije `ERROR`).
+
+233/233 testova prolazi (3 nova regresiona: `WriteCommitRecordsReplicationStats`-ovo
+prošireno, `AppendToEmptyFileIsEquivalentToWrite`-ovo prošireno,
+`IdempotentWriteBlockRetryDoesNotDoubleCountStats` nov), čisto pod
+ASan/UBSan.

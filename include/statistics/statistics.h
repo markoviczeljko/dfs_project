@@ -100,6 +100,20 @@ public:
     std::string format_snapshot() const;
 
 private:
+    // cpp-reviewer note: total/successful/failed/bytes/latency are each
+    // updated via independent atomic ops in record_operation() (see
+    // statistics.cpp), not under one shared lock — a concurrent snapshot()
+    // can observe them torn relative to each other (e.g. total already
+    // incremented but bytes/latency not yet, or transiently
+    // successful+failed < total). Deliberate: this is a monitoring/
+    // diagnostic surface, not correctness-affecting state (unlike the
+    // storage-capacity gauge below, which IS mutex-protected because
+    // capacity/used/block_count are only ever meaningful read together as
+    // one consistent triple) — a torn read here just means one snapshot
+    // occasionally under-counts by the handful of in-flight operations
+    // racing it, self-correcting on the next snapshot. Accepted per
+    // design notes §10.39 ("monitoring should never hold critical DFS
+    // locks unnecessarily").
     struct OperationCounters {
         std::atomic<uint64_t> total{0};
         std::atomic<uint64_t> successful{0};

@@ -332,6 +332,38 @@ TEST_F(StorageNodeTest, GetStatsReturnsTextSnapshotReflectingPriorOperations) {
     EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].bytes, data.size());
 }
 
+// cpp-reviewer regression: a WRITE_BLOCK retry (same operation_id, lost
+// original ACK) replays the cached response without re-executing the
+// write — it must not be double-counted in StatisticsManager either (see
+// docs/design.md §18).
+TEST_F(StorageNodeTest, IdempotentWriteBlockRetryDoesNotDoubleCountStats) {
+    start_node(37011);
+    TCPConnection client = connect_client(37011);
+
+    std::vector<uint8_t> data = {9, 9, 9};
+    constexpr OperationId kOperationId = 555;
+    ASSERT_TRUE(client.sendMessage(
+        make_write_request(1, /*block_id=*/1, data, /*offset=*/0, /*block_version=*/0,
+                            /*operation_id=*/kOperationId)));
+    auto first = client.receiveMessage();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->type, MessageType::ACK);
+
+    // Same operation_id, different request_id — simulates the client
+    // retrying after never seeing the first ACK.
+    ASSERT_TRUE(client.sendMessage(
+        make_write_request(2, /*block_id=*/1, data, /*offset=*/0, /*block_version=*/0,
+                            /*operation_id=*/kOperationId)));
+    auto second = client.receiveMessage();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->type, MessageType::ACK);
+
+    StatisticsSnapshot snap = node_->statistics_snapshot();
+    const OperationStats& write_stats = snap.operations[static_cast<size_t>(OperationType::WRITE)];
+    EXPECT_EQ(write_stats.total, 1u) << "the replay must not be counted as a second operation";
+    EXPECT_EQ(write_stats.bytes, data.size());
+}
+
 TEST_F(StorageNodeTest, UnknownMessageTypeReturnsInvalidRequest) {
     start_node(37006);
     TCPConnection client = connect_client(37006);

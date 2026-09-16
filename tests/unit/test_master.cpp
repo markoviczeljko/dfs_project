@@ -1426,4 +1426,7 @@ TEST_F(MasterTest, WriteCommitRecordsReplicationStats) {
     EXPECT_EQ(snap.replication_operations, 1u);
     EXPECT_EQ(snap.bytes_replicated, kSize);
     EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].successful, 1u);
+    // cpp-reviewer regression: this used to be hardcoded to 0 regardless
+    // of the real committed size (see docs/design.md §18).
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].bytes, kSize);
 }

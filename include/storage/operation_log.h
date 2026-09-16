@@ -50,8 +50,14 @@ public:
     std::optional<OperationRecord> begin_or_get(OperationId id);
     void complete(OperationId id, ErrorCode result, std::vector<std::byte> response_payload);
 
+    // Faza 14: read-only peek, never mutates state (unlike begin_or_get()) —
+    // used by StorageNode's stats wrapper to detect an idempotent replay
+    // BEFORE the handler runs, so a retried operation doesn't get double-
+    // counted in StatisticsManager (see docs/design.md §18).
+    bool contains(OperationId id) const;
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<OperationId, OperationRecord> records_;
     std::deque<OperationId> insertion_order_;
     size_t capacity_;

@@ -295,16 +295,28 @@ Message StorageNode::make_error(uint64_t request_id, ErrorCode error) {
 }
 
 Message StorageNode::handle_message(const Message& request) {
+    // cpp-reviewer fix: captured BEFORE route_message() runs — WRITE_BLOCK's
+    // handler calls operation_log_.begin_or_get(), which INSERTS a fresh
+    // IN_PROGRESS entry as a side effect when the id is genuinely new, so
+    // checking "is this a known id" after route_message() would always see
+    // it as known and never detect a first attempt. A true replay (id
+    // already present right now) skips record_operation() below — the
+    // original attempt already counted it, and no new work actually
+    // happened this time (see docs/design.md §18).
+    bool is_replay = request.type == MessageType::WRITE_BLOCK &&
+                      request.payload.size() >= kOperationIdSize &&
+                      operation_log_.contains(get_u64(request.payload.data()));
+
     auto start = std::chrono::steady_clock::now();
     Message response = route_message(request);
     auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start);
 
     bool success = response.type != MessageType::ERROR;
-    if (!success) {
+    if (!success && response.payload.size() >= sizeof(uint16_t)) {
         statistics_.record_error(error_from_payload(response.payload));
     }
-    if (auto op = to_operation_type(request.type); op.has_value()) {
+    if (auto op = to_operation_type(request.type); op.has_value() && !is_replay) {
         statistics_.record_operation(*op, compute_bytes(request, response), latency, success);
     }
     return response;

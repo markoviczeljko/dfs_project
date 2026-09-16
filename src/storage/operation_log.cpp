@@ -32,3 +32,8 @@ void OperationLog::complete(OperationId id, ErrorCode result, std::vector<std::b
     it->second.result = result;
     it->second.response_payload = std::move(response_payload);
 }
+
+bool OperationLog::contains(OperationId id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return records_.find(id) != records_.end();
+}

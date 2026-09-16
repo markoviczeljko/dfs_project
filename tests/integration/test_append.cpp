@@ -96,6 +96,14 @@ TEST_F(AppendIntegrationTest, AppendToEmptyFileIsEquivalentToWrite) {
     EXPECT_EQ(append_stats.total, 1u);
     EXPECT_EQ(append_stats.successful, 1u);
     EXPECT_EQ(append_stats.bytes, data.size());
+
+    // cpp-reviewer regression: Master::handle_message()'s generic wrapper
+    // used to hardcode bytes=0 for every operation type, including
+    // APPEND_COMMIT, even though the real total is in the wire payload
+    // (see docs/design.md §18).
+    StatisticsSnapshot master_snap = master_->statistics_snapshot();
+    EXPECT_EQ(master_snap.operations[static_cast<size_t>(OperationType::APPEND)].bytes,
+              data.size());
 }
 
 TEST_F(AppendIntegrationTest, AppendFillsExistingBlockWithoutCrossingBoundary) {

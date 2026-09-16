@@ -68,6 +68,10 @@ enum class MessageType : uint16_t {
     // needs_inventory bit is 1 — see docs/design.md §16.
     NODE_INVENTORY,
 
+    // Generic
+    ACK,
+    ERROR,
+
     // Faza 14: statistics query, served by Master and StorageNode alike
     // (both own a StatisticsManager and a GET_STATS handler with the same
     // shape — see docs/design.md §18). Request payload is empty; response
@@ -75,12 +79,17 @@ enum class MessageType : uint16_t {
     // (StatisticsManager::format_snapshot()), not a structured binary
     // snapshot — dfs_statsctl just prints the bytes back, no client-side
     // parsing needed for this diagnostic tool.
+    //
+    // cpp-reviewer note: appended at the very end (not grouped near
+    // REGISTER_NODE/HEARTBEAT/NODE_INVENTORY like earlier phases did),
+    // specifically so the numeric wire values of every pre-existing
+    // MessageType — ACK/ERROR included — stay stable. Mid-sequence
+    // insertion doesn't corrupt anything in THIS project (single-binary
+    // build, no persisted raw MessageType values, no mixed-version
+    // deployment) but appending is strictly safer general practice for an
+    // over-the-wire enum, and costs nothing here.
     GET_STATS,
-    STATS_RESPONSE,
-
-    // Generic
-    ACK,
-    ERROR
+    STATS_RESPONSE
 };
 
 // True for message types that carry block-sized payloads (§5.18 data plane).

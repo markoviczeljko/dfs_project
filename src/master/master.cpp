@@ -185,6 +185,24 @@ std::optional<OperationType> to_operation_type(MessageType type) {
     }
 }
 
+// cpp-reviewer fix: WRITE_COMMIT/APPEND_COMMIT both start with
+// [u32 path_len][path][u64 <total bytes>] on the wire (see
+// handle_write_commit/handle_append_commit) — extracted here so the
+// generic wrapper can report real bytes instead of a hardcoded 0 (which
+// left StatisticsSnapshot.operations[WRITE/APPEND].bytes always zero even
+// though Replication: bytes=... on the same snapshot was correct).
+uint64_t compute_bytes(const Message& request, const Message& response) {
+    if (response.type != MessageType::ACK) return 0;
+    if (request.type != MessageType::WRITE_COMMIT && request.type != MessageType::APPEND_COMMIT) {
+        return 0;
+    }
+    if (request.payload.size() < sizeof(uint32_t)) return 0;
+    uint32_t path_length = get_u32(request.payload.data());
+    size_t offset = sizeof(uint32_t) + path_length;
+    if (request.payload.size() < offset + sizeof(uint64_t)) return 0;
+    return get_u64(request.payload.data() + offset);
+}
+
 }  // namespace
 
 Message Master::handle_message(const Message& request) {
@@ -194,11 +212,11 @@ Message Master::handle_message(const Message& request) {
         std::chrono::steady_clock::now() - start);
 
     bool success = response.type != MessageType::ERROR;
-    if (!success) {
+    if (!success && response.payload.size() >= sizeof(uint16_t)) {
         statistics_.record_error(static_cast<ErrorCode>(get_u16(response.payload.data())));
     }
     if (auto op = to_operation_type(request.type); op.has_value()) {
-        statistics_.record_operation(*op, 0, latency, success);
+        statistics_.record_operation(*op, compute_bytes(request, response), latency, success);
     }
     return response;
 }
