@@ -20,8 +20,8 @@
 // (ReplicationManager), node liveness (FailureDetector, Faza 12.1), and a
 // NetworkServer (accept-loop, reused verbatim from Faza 5), and wires
 // CREATE_FILE/DELETE_FILE/LIST_FILES/STAT_FILE/ALLOCATE_BLOCK/WRITE_COMMIT/
-// READ_FILE/REGISTER_NODE/APPEND_FILE/APPEND_COMMIT/HEARTBEAT requests to
-// them.
+// READ_FILE/REGISTER_NODE/APPEND_FILE/APPEND_COMMIT/HEARTBEAT/NODE_INVENTORY
+// requests to them.
 // See docs/design.md §13, §14, §16.
 class Master {
 public:
@@ -52,6 +52,7 @@ private:
     Message handle_append_file(const Message& request);
     Message handle_append_commit(const Message& request);
     Message handle_heartbeat(const Message& request);
+    Message handle_node_inventory(const Message& request);
     static Message make_error(uint64_t request_id, ErrorCode error);
 
     // Faza 11: best-effort physical cleanup of blocks DELETE_FILE/WRITE

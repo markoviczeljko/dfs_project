@@ -59,6 +59,12 @@ private:
     // ever writing to disk.
     Message handle_copy_block_data(const Message& request);
     ErrorCode register_with_master();
+    // Faza 12.3: sends this node's full on-disk block inventory to Master
+    // on a fresh connection — called once after a successful
+    // register_with_master() in start(), and again reactively from
+    // heartbeat_loop() whenever a HEARTBEAT ACK's needs_inventory bit is 1
+    // (see docs/design.md §16).
+    ErrorCode send_inventory();
     static Message make_error(uint64_t request_id, ErrorCode error);
 
     // Faza 12.1: sends HEARTBEAT{node_id} to Master every

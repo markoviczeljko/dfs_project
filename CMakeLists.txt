@@ -23,6 +23,7 @@ add_library(storage
     src/storage/block_storage.cpp
     src/storage/block_manager.cpp
     src/storage/operation_log.cpp
+    src/storage/recovery.cpp
     src/storage/storage_node.cpp
 )
 target_include_directories(storage PUBLIC include)

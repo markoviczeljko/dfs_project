@@ -165,6 +165,32 @@ bool RecoveryManager::send_copy_block(StorageNodeId source, BlockId block_id,
     return response.has_value() && response->type == MessageType::ACK;
 }
 
+void RecoveryManager::handle_stale_replica(StorageNodeId stale_node, BlockId block_id,
+                                            uint64_t expected_version) {
+    auto metadata = namespace_manager_.block_metadata(block_id);
+    if (metadata.is_error()) {
+        return;  // block gone (DELETE/overwrite raced ahead of us) — nothing to resync
+    }
+
+    StorageNodeId source = 0;
+    bool found_source = false;
+    for (StorageNodeId candidate : metadata.value().replicas) {
+        if (candidate == stale_node) continue;
+        auto info = registry_.get_node(candidate);
+        if (info.has_value() && info->state == NodeState::HEALTHY) {
+            source = candidate;
+            found_source = true;
+            break;
+        }
+    }
+    if (!found_source) {
+        return;  // no healthy source available right now — a later inventory report may retry
+    }
+
+    OperationId operation_id = next_operation_id();
+    send_copy_block(source, block_id, expected_version, stale_node, operation_id);
+}
+
 OperationId RecoveryManager::next_operation_id() {
     std::lock_guard<std::mutex> lock(rng_mutex_);
     return operation_id_rng_();

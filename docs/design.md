@@ -1153,3 +1153,89 @@ više OS procesa; puna multi-process validacija ostaje za Fazu 16
 177/177 testova prolazi (165 stari + 12 nov: 5 u `test_block_storage.cpp`,
 6 u novom `test_operation_log.cpp`, 1 nov integration `test_recovery.cpp`),
 čisto pod ASan/UBSan.
+
+### 16.3 — Storage Node restart / lokalni recovery + inventory rekonsilijacija
+
+**Wire protokol**: nov `NODE_INVENTORY` tip (odmah nakon `REGISTER_NODE`),
+dodat u `is_data_message()` (neograničen broj blokova po izvještaju).
+StorageNode ga šalje na SVJEŽOJ konekciji odmah nakon `REGISTER_NODE`-ovog
+ACK-a (isti gate na povratnu vrijednost kao sama registracija u `start()`),
+i ponovo reaktivno iz `heartbeat_loop()`-a kad god `HEARTBEAT` ACK javi
+`needs_inventory==1` (taj bit postoji na žici od 12.1, ali je hardkodovan na
+0 sve do 12.4 — u ovom pod-koraku samo kod koji ga ČITA postoji, put koji ga
+stvarno postavlja na 1 dolazi kasnije). Zahtjev: `[u64 node_id][u32
+block_count]{[u64 block_id][u64 version][u32 checksum]} × block_count` →
+Master uvijek odgovara `ACK{}` (rekonsilira sinhrono inline, nikad ne
+odbija malformiran izgled izvještaja kao grešku klijentu). `ALLOCATE_BLOCK`
+odgovor dobija trailing `[u64 version]` (uvijek 1 za svježe alocirani
+blok). `APPEND_FILE` odgovor, kad `has_target==1`, dobija trailing `[u64
+target_version]` (= trenutna verzija bloka + 1).
+
+**`StorageRecovery::build_inventory_payload()`** (nov,
+`storage/recovery.h`/`.cpp`) — čist payload builder, ne klasa (isti stil
+kao `block_header.h`-ove slobodne funkcije), gradi `NODE_INVENTORY`
+payload direktno iz `BlockManager::enumerate_blocks()`-a.
+
+**Block versioning kroz cijeli sistem**: `NamespaceManager::set_block_replicas()`
+sad postavlja `version=1` (bio hardkodovan `0` od 12.2, namjerno odloženo do
+sad). `resolve_append_target()` vraća `target_version = trenutna_verzija +
+1` u `AppendTarget`-u; `commit_append()` upisuje tu vrijednost u
+`BlockMetadata.version` na istom uspješnom CAS-u koji već čuva
+`expected_prior_size` (novo `AppendCommitRequest.expected_target_version`
+polje, dodano na KRAJ struct-a sa default vrijednošću `0` — ne grupisano uz
+ostala `has_existing_target`-samo polja — baš zato da svaki postojeći
+pozicioni `AppendCommitRequest{...}` inicijalizator u `test_namespace.cpp`
+ostane nepromijenjen bez izmjene). `Client::write_new_blocks()`/`append()`
+sad parsiraju stvarne `version`/`target_version` vrijednosti sa žice umjesto
+12.2-ove hardkodovane `0`.
+
+**`Master::handle_node_inventory()`** — tro-grani rekonsilijacija po
+prijavljenom `(block_id, version, checksum)`: (1) nepoznat blok ILI node
+nije u `metadata.replicas` ⇒ §8.34-tip "pravi orphan", log-only (`stderr`),
+NIKAD spojen sa Faza 11-ovim `OrphanedBlock`/`gc_dispatch` mehanizmom —
+strukturno odvojen koncept (isti razlog kao poprečna odluka #6 iz uvoda
+ove faze); (2) `version < meta.version` ⇒ `RecoveryManager::handle_stale_replica()`
+(nova metoda — SINHRONA, za razliku od `handle_node_failure()`-ovog
+worker-pool reda, jer je ovo ograničena one-shot operacija, ne batch koji
+treba throttlovati); (3) `version == meta.version` I ovo bi gurnulo broj
+replika iznad `DEFAULT_REPLICATION_FACTOR` ⇒ ponovo koristi POSTOJEĆI
+`Master::send_delete_block()` (Faza 11) + nova `NamespaceManager::remove_replica()`
+— jedina konkretna §7.14-15 ponovna upotreba koju ova faza traži. Nakon
+cijelog izvještaja: `storage_registry_.set_state(node_id, NodeState::HEALTHY)`.
+
+**Poznata granica**: `replicas.size() > DEFAULT_REPLICATION_FACTOR` grana
+nije dostižna kroz bilo koji postojeći produkcijski put u ovoj fazi —
+`ReplicationManager::choose_replicas()` uvijek vraća tačno RF čvorova ili
+prazan vektor, a `update_block_replicas_after_recovery()` zamjenjuje jedan
+za jedan (nikad ne raste listu). Grana je implementirana tačno po
+odobrenom planu (defanzivan/forward-looking kod za scenario koji trenutna
+implementacija ne proizvodi), i pokrivena direktnim `NamespaceManager`
+unit testovima (`RemoveReplicaDropsExactlyTheNamedNode`,
+`RemoveReplicaOnUnknownBlockOrNodeIsNoOp`) umjesto Master-nivoa
+integration testa — konstruisanje >RF replika stanja kroz `Master`-ov javni
+wire API nije moguće bez test-only backdoor-a koji bi bio nekonzistentan sa
+projektovim "bez apstrakcije/seam-a dok se ne dokaže potreba" presedanom.
+
+**Testovi**: 4 nova u `test_namespace.cpp` (`CommitWriteSetsInitialVersionToOne`,
+`AppendIncrementsBlockVersion`, `RemoveReplicaDropsExactlyTheNamedNode`,
+`RemoveReplicaOnUnknownBlockOrNodeIsNoOp`), 2 nova u `test_master.cpp`
+(`NodeInventoryLogsUnknownBlockAsOrphanWithoutDeleting`,
+`NodeInventoryMarksStaleReplicaForResync` — reuse `RecordingNode`, proširen
+da prati i `COPY_BLOCK` zahtjeve, ne samo `DELETE_BLOCK`), `AllocateBlockReturnsThreeDistinctReplicaLocations`
+ažuriran za novo trailing `version` polje, 1 nov integration test u
+`test_recovery.cpp` (`RestartWithValidBlocksSendsInventoryWithoutRecopying`
+— pravi `Master` + 4 prava `StorageNode` objekta, jedan node se čisto
+gasi/restartuje protiv ISTOG `data_dir`-a, potvrđuje da se blok NE
+prekopira nigdje drugo i da ostaje čitljiv tokom cijelog procesa).
+
+**Ručna E2E verifikacija**: pravi `dfs_master` + 3 prava `dfs_storage`
+procesa preko `scripts/start_*.sh`, `create`+`write`+`stat`, `kill -SIGINT`
+jednog storage procesa, ponovno pokretanje istog `scripts/start_storage.sh N`
+protiv istog `data_dir`-a — potvrđeno čisto gašenje i ponovno pokretanje bez
+grešaka u logovima, `find data/*/blocks` pokazuje TAČNO isti skup blokova
+prije i poslije (nema novih fajlova), naredni `read` vraća bajt-identičan
+sadržaj originalu.
+
+184/184 testova prolazi (177 stari + 7 nov: 4 u `test_namespace.cpp`, 2 u
+`test_master.cpp`, 1 integration u `test_recovery.cpp`), čisto pod
+ASan/UBSan.

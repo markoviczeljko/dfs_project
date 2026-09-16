@@ -52,6 +52,10 @@ bool is_data_message(MessageType type) {
         case MessageType::APPEND_COMMIT:
         case MessageType::COPY_BLOCK:
         case MessageType::COPY_BLOCK_DATA:
+        // Faza 12.3: an unbounded number of blocks per report — needs the
+        // generous data-message size limit, not the small control-message
+        // one (see docs/design.md §16).
+        case MessageType::NODE_INVENTORY:
         // ACK/ERROR carry the reply to whatever request triggered them —
         // in particular a READ_BLOCK's ACK response carries up to one
         // block's worth of data (see docs/design.md §12). The receiver has

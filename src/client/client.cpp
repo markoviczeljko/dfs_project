@@ -314,15 +314,19 @@ Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, c
         if (replicas_result.is_error()) {
             return Result<std::vector<BlockId>>::err(replicas_result.error());
         }
-        if (alloc_response.payload.size() != resp_offset) {
+        // Faza 12.3: trailing [u64 version] — always 1 for a freshly
+        // allocated block (see docs/design.md §16, Master::handle_allocate_block).
+        if (alloc_response.payload.size() != resp_offset + sizeof(uint64_t)) {
             return Result<std::vector<BlockId>>::err(ErrorCode::INTERNAL_ERROR);
         }
+        uint64_t block_version = get_u64(alloc_response.payload.data() + resp_offset);
+        resp_offset += sizeof(uint64_t);
 
         // Step 2: write this chunk (as a brand-new block, offset 0) to
         // every replica.
         ErrorCode write_err =
-            write_chunk_to_replicas(block_id, /*offset=*/0, /*block_version=*/0,
-                                     data + chunk_offset, chunk_len, replicas_result.value());
+            write_chunk_to_replicas(block_id, /*offset=*/0, block_version, data + chunk_offset,
+                                     chunk_len, replicas_result.value());
         if (write_err != ErrorCode::OK) {
             return Result<std::vector<BlockId>>::err(write_err);
         }
@@ -409,6 +413,7 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
     BlockId existing_block_id = 0;
     uint64_t expected_prior_size = 0;
     uint32_t fill_amount = 0;
+    uint64_t target_version = 0;
     if (has_target) {
         if (target_response.payload.size() < resp_offset + 2 * sizeof(uint64_t) + 2 * sizeof(uint32_t)) {
             return ErrorCode::INTERNAL_ERROR;
@@ -426,14 +431,18 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
         if (replicas_result.is_error()) {
             return replicas_result.error();
         }
-        if (target_response.payload.size() != resp_offset) {
+        // Faza 12.3: trailing [u64 target_version] (see docs/design.md §16,
+        // Master::handle_append_file).
+        if (target_response.payload.size() != resp_offset + sizeof(uint64_t)) {
             return ErrorCode::INTERNAL_ERROR;
         }
+        target_version = get_u64(target_response.payload.data() + resp_offset);
+        resp_offset += sizeof(uint64_t);
 
         if (fill_amount > 0) {
-            ErrorCode write_err = write_chunk_to_replicas(
-                existing_block_id, expected_prior_size, /*block_version=*/0, data.data(),
-                fill_amount, replicas_result.value());
+            ErrorCode write_err =
+                write_chunk_to_replicas(existing_block_id, expected_prior_size, target_version,
+                                         data.data(), fill_amount, replicas_result.value());
             if (write_err != ErrorCode::OK) {
                 return write_err;
             }
@@ -475,6 +484,7 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
         put_u64(commit_payload, existing_block_id);
         put_u64(commit_payload, expected_prior_size);
         put_u32(commit_payload, fill_amount);
+        put_u64(commit_payload, target_version);
     }
     put_u32(commit_payload, static_cast<uint32_t>(new_block_ids.size()));
     for (BlockId block_id : new_block_ids) {

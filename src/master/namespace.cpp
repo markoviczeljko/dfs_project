@@ -245,7 +245,11 @@ Result<std::vector<OrphanedBlock>> NamespaceManager::commit_write(
 ErrorCode NamespaceManager::set_block_replicas(BlockId block_id,
                                                 std::vector<StorageNodeId> replicas) {
     std::unique_lock lock(mutex_);
-    blocks_[block_id] = BlockMetadata{block_id, /*size=*/0, /*reserved_size=*/0, /*version=*/0,
+    // Faza 12.3: a freshly allocated block starts at version 1 — matches
+    // what ALLOCATE_BLOCK's response now tells the Client, and what
+    // Master::handle_node_inventory() compares an incoming replica report
+    // against (see docs/design.md §16).
+    blocks_[block_id] = BlockMetadata{block_id, /*size=*/0, /*reserved_size=*/0, /*version=*/1,
                                        std::move(replicas), BlockState::ALLOCATED};
     return ErrorCode::OK;
 }
@@ -287,6 +291,19 @@ void NamespaceManager::update_block_replicas_after_recovery(BlockId block_id, St
     it->second.state = new_state;
 }
 
+void NamespaceManager::remove_replica(BlockId block_id, StorageNodeId node_id) {
+    std::unique_lock lock(mutex_);
+    auto it = blocks_.find(block_id);
+    if (it == blocks_.end()) {
+        return;
+    }
+    auto& replicas = it->second.replicas;
+    auto pos = std::find(replicas.begin(), replicas.end(), node_id);
+    if (pos != replicas.end()) {
+        replicas.erase(pos);
+    }
+}
+
 Result<AppendTarget> NamespaceManager::resolve_append_target(const std::string& path,
                                                                uint64_t append_size) {
     auto normalized_result = normalize_path(path);
@@ -301,7 +318,7 @@ Result<AppendTarget> NamespaceManager::resolve_append_target(const std::string& 
     }
 
     if (file_it->second.blocks.empty() || append_size == 0) {
-        return Result<AppendTarget>::ok(AppendTarget{false, 0, 0, 0, {}});
+        return Result<AppendTarget>::ok(AppendTarget{false, 0, 0, 0, {}, 0});
     }
 
     BlockId last_id = file_it->second.blocks.back();
@@ -311,7 +328,7 @@ Result<AppendTarget> NamespaceManager::resolve_append_target(const std::string& 
     }
 
     if (block_it->second.reserved_size >= BLOCK_SIZE) {
-        return Result<AppendTarget>::ok(AppendTarget{false, 0, 0, 0, {}});
+        return Result<AppendTarget>::ok(AppendTarget{false, 0, 0, 0, {}, 0});
     }
 
     uint64_t free_space = BLOCK_SIZE - block_it->second.reserved_size;
@@ -319,8 +336,12 @@ Result<AppendTarget> NamespaceManager::resolve_append_target(const std::string& 
     uint64_t offset = block_it->second.reserved_size;
     block_it->second.reserved_size += fill;  // Optimistic reservation, no I/O yet.
 
-    return Result<AppendTarget>::ok(
-        AppendTarget{true, last_id, offset, fill, block_it->second.replicas});
+    // Faza 12.3: the version this block will carry once the fill commits —
+    // commit_append() stamps it on a successful CAS (see docs/design.md
+    // §16).
+    return Result<AppendTarget>::ok(AppendTarget{true, last_id, offset, fill,
+                                                  block_it->second.replicas,
+                                                  block_it->second.version + 1});
 }
 
 namespace {
@@ -429,6 +450,10 @@ ErrorCode NamespaceManager::commit_append(const std::string& path,
         }
         block_it->second.size = request.expected_prior_size + request.filled_amount;
         block_it->second.state = BlockState::COMMITTED;
+        // Faza 12.3: advances the block's version on every successful
+        // append commit — lets NODE_INVENTORY reconciliation tell a stale
+        // replica apart from a current one (see docs/design.md §16).
+        block_it->second.version = request.expected_target_version;
     }
 
     if (pending_it != pending_blocks_.end()) {

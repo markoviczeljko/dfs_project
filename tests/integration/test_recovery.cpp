@@ -133,3 +133,63 @@ TEST_F(RecoveryIntegrationTest, KilledNodeTriggersRecoveryAndReadKeepsSucceeding
     ASSERT_TRUE(final_read.is_ok());
     EXPECT_EQ(final_read.value(), data);
 }
+
+TEST_F(RecoveryIntegrationTest, RestartWithValidBlocksSendsInventoryWithoutRecopying) {
+    // Faza 12.3: a Storage Node that restarts with its on-disk blocks still
+    // intact (a clean stop/restart, not a real crash-and-lose-everything)
+    // must report them via NODE_INVENTORY and NOT trigger any re-copying —
+    // Master already knows this replica is current, matching version
+    // (see docs/design.md §16).
+    std::array<uint16_t, 4> storage_ports{40610, 40611, 40612, 40613};
+    Client& client = start_cluster(40609, storage_ports);
+
+    ASSERT_EQ(client.create_file("/s.txt"), ErrorCode::OK);
+    std::vector<uint8_t> data(500, 9);
+    ASSERT_EQ(client.write("/s.txt", data), ErrorCode::OK);
+
+    auto stat_result = client.stat("/s.txt");
+    ASSERT_TRUE(stat_result.is_ok());
+    ASSERT_EQ(stat_result.value().blocks.size(), 1u);
+    BlockId block_id = stat_result.value().blocks[0];
+
+    std::vector<size_t> holders;
+    size_t spare = 4;
+    for (size_t i = 0; i < 4; ++i) {
+        if (block_exists_on_disk(i, block_id)) {
+            holders.push_back(i);
+        } else {
+            spare = i;
+        }
+    }
+    ASSERT_EQ(holders.size(), 3u);
+    ASSERT_LT(spare, 4u);
+    size_t restarted = holders[0];
+
+    // Stop and immediately restart the same node id against the SAME
+    // on-disk directory — its blocks survive, unlike the killed-node
+    // scenario above.
+    storage_nodes_[restarted]->stop();
+
+    StorageNode::Config config{static_cast<StorageNodeId>(restarted + 1),
+                                storage_ports[restarted],
+                                dir_ / ("node" + std::to_string(restarted + 1)),
+                                1024ULL * 1024 * 1024,
+                                "127.0.0.1",
+                                "127.0.0.1",
+                                master_port_};
+    auto result = StorageNode::create(config);
+    ASSERT_TRUE(result.is_ok());
+    storage_nodes_[restarted] = std::move(result.value());
+    ASSERT_EQ(storage_nodes_[restarted]->start(), ErrorCode::OK);
+
+    // start() only returns once register_with_master() AND send_inventory()
+    // have both completed — the reconciliation for this test's single
+    // reported block already happened synchronously inside Master's
+    // handling of that NODE_INVENTORY call by the time start() returns.
+    EXPECT_FALSE(block_exists_on_disk(spare, block_id));   // nothing re-copied to the spare
+    EXPECT_TRUE(block_exists_on_disk(restarted, block_id));  // the restarted node's own copy, untouched
+
+    auto read_result = client.read("/s.txt");
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), data);
+}

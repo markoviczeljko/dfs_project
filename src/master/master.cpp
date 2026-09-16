@@ -2,8 +2,10 @@
 
 #include <endian.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iostream>
 #include <utility>
 
 #include "common/config.h"
@@ -138,6 +140,8 @@ Message Master::handle_message(const Message& request) {
             return handle_append_commit(request);
         case MessageType::HEARTBEAT:
             return handle_heartbeat(request);
+        case MessageType::NODE_INVENTORY:
+            return handle_node_inventory(request);
         default:
             // Includes WRITE_FILE — never given a defined wire flow
             // anywhere in the design notes, out of scope for this phase
@@ -225,7 +229,10 @@ Message Master::handle_allocate_block(const Message& request) {
     namespace_manager_.set_block_replicas(block_id, replicas);
 
     // Wire format: [u64 block_id][u32 replica_count]
-    // {[u32 host_len][host][u16 port]} x replica_count.
+    // {[u32 host_len][host][u16 port]} x replica_count [u64 version].
+    // Faza 12.3: trailing version is always 1 for a freshly allocated block
+    // — matches what set_block_replicas() just stamped onto it (see
+    // docs/design.md §16).
     std::vector<std::byte> response_payload;
     put_u64(response_payload, block_id);
     put_u32(response_payload, static_cast<uint32_t>(replicas.size()));
@@ -237,6 +244,7 @@ Message Master::handle_allocate_block(const Message& request) {
         put_string(response_payload, node->host);
         put_u16(response_payload, node->port);
     }
+    put_u64(response_payload, /*version=*/1);
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
 
@@ -375,12 +383,75 @@ Message Master::handle_heartbeat(const Message& request) {
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
 
+Message Master::handle_node_inventory(const Message& request) {
+    // Faza 12.3 wire format: [u64 node_id][u32 block_count]
+    // {[u64 block_id][u64 version][u32 checksum]} x block_count. Always
+    // ACK{} — Master reconciles synchronously inline rather than rejecting
+    // a malformed-looking report outright (see docs/design.md §16).
+    if (request.payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    size_t offset = 0;
+    StorageNodeId node_id = get_u64(request.payload.data() + offset);
+    offset += sizeof(uint64_t);
+    uint32_t block_count = get_u32(request.payload.data() + offset);
+    offset += sizeof(uint32_t);
+
+    constexpr size_t kEntrySize = sizeof(uint64_t) * 2 + sizeof(uint32_t);
+    if (request.payload.size() != offset + static_cast<size_t>(block_count) * kEntrySize) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    for (uint32_t i = 0; i < block_count; ++i) {
+        BlockId block_id = get_u64(request.payload.data() + offset);
+        offset += sizeof(uint64_t);
+        uint64_t reported_version = get_u64(request.payload.data() + offset);
+        offset += sizeof(uint64_t);
+        offset += sizeof(uint32_t);  // checksum — not consulted this phase, reserved for future use
+
+        auto metadata = namespace_manager_.block_metadata(block_id);
+        bool node_in_replicas =
+            metadata.is_ok() && std::find(metadata.value().replicas.begin(),
+                                           metadata.value().replicas.end(),
+                                           node_id) != metadata.value().replicas.end();
+        if (metadata.is_error() || !node_in_replicas) {
+            // §8.34 "true orphan" — Master doesn't know this block at all,
+            // or knows it but node_id isn't (or is no longer) one of its
+            // replicas. Log only, never merged with Faza 11's
+            // OrphanedBlock/gc_dispatch mechanism — a structurally separate
+            // concept (see docs/design.md §16).
+            std::cerr << "NODE_INVENTORY: node " << node_id
+                      << " reports unknown/unaffiliated block " << block_id
+                      << " (orphan, log only)\n";
+            continue;
+        }
+
+        uint64_t known_version = metadata.value().version;
+        if (reported_version < known_version) {
+            recovery_manager_.handle_stale_replica(node_id, block_id, known_version);
+        } else if (reported_version == known_version) {
+            // Reuses the existing Faza 11 send_delete_block() mechanism —
+            // the one concrete §7.14-15 reuse this phase calls for (see
+            // docs/design.md §16).
+            if (metadata.value().replicas.size() > DEFAULT_REPLICATION_FACTOR) {
+                send_delete_block(node_id, block_id);
+                namespace_manager_.remove_replica(block_id, node_id);
+            }
+        }
+    }
+
+    storage_registry_.set_state(node_id, NodeState::HEALTHY);
+    return Message{MessageType::ACK, request.request_id, {}};
+}
+
 Message Master::handle_append_file(const Message& request) {
     // Wire format: [u32 path_len][path][u64 append_size]. Response:
     // [u8 has_target], then if 1: [u64 block_id][u64 offset]
     // [u32 fill_amount][u32 replica_count]
-    // {[u32 host_len][host][u16 port]} x replica_count — same replica list
-    // shape as ALLOCATE_BLOCK's response (see docs/design.md §14).
+    // {[u32 host_len][host][u16 port]} x replica_count [u64 target_version]
+    // — same replica list shape as ALLOCATE_BLOCK's response (see
+    // docs/design.md §14). target_version is Faza 12.3: the version this
+    // block will carry once the fill commits (see docs/design.md §16).
     if (request.payload.size() < sizeof(uint32_t)) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
@@ -414,6 +485,7 @@ Message Master::handle_append_file(const Message& request) {
             put_string(response_payload, node->host);
             put_u16(response_payload, node->port);
         }
+        put_u64(response_payload, target.target_version);
     }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
@@ -421,10 +493,11 @@ Message Master::handle_append_file(const Message& request) {
 Message Master::handle_append_commit(const Message& request) {
     // Wire format: [u32 path_len][path][u64 total_appended_bytes]
     // [u8 has_existing_target], then if 1: [u64 existing_block_id]
-    // [u64 expected_prior_size][u32 filled_amount], then
-    // [u32 new_block_count]{u64 block_id} x new_block_count
+    // [u64 expected_prior_size][u32 filled_amount][u64 expected_target_version],
+    // then [u32 new_block_count]{u64 block_id} x new_block_count
     // [u64 last_new_block_size] (meaningful only when new_block_count > 0 —
-    // see docs/design.md §14).
+    // see docs/design.md §14). expected_target_version is Faza 12.3 (see
+    // docs/design.md §16).
     if (request.payload.size() < sizeof(uint32_t)) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
@@ -444,8 +517,10 @@ Message Master::handle_append_commit(const Message& request) {
     BlockId existing_block_id = 0;
     uint64_t expected_prior_size = 0;
     uint32_t filled_amount = 0;
+    uint64_t expected_target_version = 0;
     if (has_existing_target) {
-        if (request.payload.size() < offset + sizeof(uint64_t) * 2 + sizeof(uint32_t)) {
+        if (request.payload.size() <
+            offset + sizeof(uint64_t) * 2 + sizeof(uint32_t) + sizeof(uint64_t)) {
             return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
         }
         existing_block_id = get_u64(request.payload.data() + offset);
@@ -454,6 +529,8 @@ Message Master::handle_append_commit(const Message& request) {
         offset += sizeof(uint64_t);
         filled_amount = get_u32(request.payload.data() + offset);
         offset += sizeof(uint32_t);
+        expected_target_version = get_u64(request.payload.data() + offset);
+        offset += sizeof(uint64_t);
     }
 
     if (request.payload.size() < offset + sizeof(uint32_t)) {
@@ -479,7 +556,7 @@ Message Master::handle_append_commit(const Message& request) {
     AppendCommitRequest commit_request{has_existing_target,   existing_block_id,
                                         expected_prior_size,   filled_amount,
                                         std::move(new_block_ids), last_new_block_size,
-                                        total_appended_bytes};
+                                        total_appended_bytes,  expected_target_version};
     ErrorCode result = namespace_manager_.commit_append(path, commit_request);
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);

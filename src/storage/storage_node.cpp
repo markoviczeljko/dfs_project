@@ -10,6 +10,7 @@
 #include "network/connection.h"
 #include "network/socket.h"
 #include "storage/block_header.h"
+#include "storage/recovery.h"
 
 namespace {
 
@@ -100,6 +101,13 @@ ErrorCode StorageNode::start() {
     if (ErrorCode err = register_with_master(); err != ErrorCode::OK) {
         return err;
     }
+    // Faza 12.3: reports this node's actual on-disk contents right after
+    // registering — same gate on the return value as registration, since a
+    // node Master can't reconcile is no more useful than one it can't
+    // register (see docs/design.md §16).
+    if (ErrorCode err = send_inventory(); err != ErrorCode::OK) {
+        return err;
+    }
 
     heartbeat_running_ = true;
     heartbeat_thread_ = std::thread(&StorageNode::heartbeat_loop, this);
@@ -141,6 +149,29 @@ ErrorCode StorageNode::register_with_master() {
     return ErrorCode::OK;
 }
 
+ErrorCode StorageNode::send_inventory() {
+    auto socket_result = Socket::create();
+    if (socket_result.is_error()) {
+        return socket_result.error();
+    }
+    Socket socket = std::move(socket_result.value());
+    if (ErrorCode err = socket.connect(config_.master_host, config_.master_port); err != ErrorCode::OK) {
+        return err;
+    }
+    TCPConnection master_connection(std::move(socket));
+
+    std::vector<std::byte> payload =
+        StorageRecovery::build_inventory_payload(config_.node_id, *block_manager_);
+    if (!master_connection.sendMessage(Message{MessageType::NODE_INVENTORY, 1, std::move(payload)})) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    auto response = master_connection.receiveMessage();
+    if (!response.has_value() || response->type != MessageType::ACK) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 void StorageNode::stop() {
     if (heartbeat_running_.exchange(false)) {
         heartbeat_cv_.notify_all();
@@ -173,7 +204,18 @@ void StorageNode::heartbeat_loop() {
                 std::vector<std::byte> payload;
                 put_u64(payload, config_.node_id);
                 master_connection.sendMessage(Message{MessageType::HEARTBEAT, 1, std::move(payload)});
-                master_connection.receiveMessage();  // response ignored in 12.1
+                auto response = master_connection.receiveMessage();
+                // Faza 12.3: needs_inventory==1 means Master lost track of
+                // this node's contents (e.g. after a Faza 12.4 restart) and
+                // needs a fresh report — best-effort, like everything else
+                // in this loop; a failure here just means the next tick's
+                // heartbeat sees needs_inventory again (see docs/design.md
+                // §16).
+                if (response.has_value() && response->type == MessageType::ACK &&
+                    !response->payload.empty() &&
+                    static_cast<uint8_t>(response->payload[0]) == 1) {
+                    send_inventory();
+                }
             }
             // Any failure here (create/timeout/connect/send/recv) is
             // silently ignored — the next tick simply tries again. See

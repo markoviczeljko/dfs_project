@@ -447,6 +447,71 @@ TEST(NamespaceManagerTest, CommitAppendSurvivesConcurrentDeleteFileDuringWait) {
     EXPECT_EQ(result, ErrorCode::TIMEOUT);
 }
 
+// Faza 12.3: block versioning (see docs/design.md §16).
+
+TEST(NamespaceManagerTest, CommitWriteSetsInitialVersionToOne) {
+    NamespaceManager ns;
+    BlockId block_id = create_file_with_one_block(ns, /*last_block_size=*/100);
+
+    auto block_result = ns.block_metadata(block_id);
+    ASSERT_TRUE(block_result.is_ok());
+    EXPECT_EQ(block_result.value().version, 1u);
+}
+
+TEST(NamespaceManagerTest, AppendIncrementsBlockVersion) {
+    NamespaceManager ns;
+    create_file_with_one_block(ns, /*last_block_size=*/100);
+
+    auto target_result = ns.resolve_append_target("/a.txt", 20);
+    ASSERT_TRUE(target_result.is_ok());
+    const AppendTarget& target = target_result.value();
+    EXPECT_EQ(target.target_version, 2u);  // initial version 1 + 1
+
+    ErrorCode result = ns.commit_append(
+        "/a.txt", AppendCommitRequest{/*has_existing_target=*/true, target.block_id,
+                                       /*expected_prior_size=*/100, target.fill_amount, {},
+                                       /*last_new_block_size=*/0, /*total_appended_bytes=*/20,
+                                       target.target_version});
+    ASSERT_EQ(result, ErrorCode::OK);
+
+    auto block_result = ns.block_metadata(target.block_id);
+    ASSERT_TRUE(block_result.is_ok());
+    EXPECT_EQ(block_result.value().version, 2u);
+
+    // A second append must see the version bumped again, from the value
+    // the first append actually landed — not stuck at a stale reading.
+    auto second_target = ns.resolve_append_target("/a.txt", 5);
+    ASSERT_TRUE(second_target.is_ok());
+    EXPECT_EQ(second_target.value().target_version, 3u);
+}
+
+TEST(NamespaceManagerTest, RemoveReplicaDropsExactlyTheNamedNode) {
+    NamespaceManager ns;
+    ns.create_file("/a.txt");
+    BlockId block_id = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(block_id, {1, 2, 3, 4}), ErrorCode::OK);
+
+    ns.remove_replica(block_id, 2);
+
+    auto block_result = ns.block_metadata(block_id);
+    ASSERT_TRUE(block_result.is_ok());
+    EXPECT_EQ(block_result.value().replicas, (std::vector<StorageNodeId>{1, 3, 4}));
+}
+
+TEST(NamespaceManagerTest, RemoveReplicaOnUnknownBlockOrNodeIsNoOp) {
+    NamespaceManager ns;
+    ns.create_file("/a.txt");
+    BlockId block_id = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(block_id, {1, 2, 3}), ErrorCode::OK);
+
+    ns.remove_replica(/*block_id=*/99999, /*node_id=*/1);  // unknown block — no-op, no crash
+    ns.remove_replica(block_id, /*node_id=*/99);            // node not in replicas — no-op
+
+    auto block_result = ns.block_metadata(block_id);
+    ASSERT_TRUE(block_result.is_ok());
+    EXPECT_EQ(block_result.value().replicas, (std::vector<StorageNodeId>{1, 2, 3}));
+}
+
 TEST(NamespaceManagerTest, ConcurrentStatAndListDontRace) {
     NamespaceManager ns;
     ASSERT_EQ(ns.create_file("/data/a.txt"), ErrorCode::OK);

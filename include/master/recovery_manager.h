@@ -46,6 +46,18 @@ public:
     // docs/design.md §16).
     void handle_node_failure(StorageNodeId node_id);
 
+    // Faza 12.3: resyncs one specific block on one specific node whose
+    // NODE_INVENTORY report showed it holding an outdated version — reuses
+    // send_copy_block() with source = any OTHER healthy replica and
+    // destination = stale_node itself (see docs/design.md §16,
+    // Master::handle_node_inventory()). Synchronous (unlike
+    // handle_node_failure(), which enqueues onto the worker pool) — a
+    // single stale-replica resync is a bounded, one-shot operation, not a
+    // batch that needs throttling against MAX_CONCURRENT_RECOVERY_OPERATIONS.
+    // A no-op if the block is gone or no healthy source is currently
+    // available — a later inventory report may retry.
+    void handle_stale_replica(StorageNodeId stale_node, BlockId block_id, uint64_t expected_version);
+
 private:
     struct RecoveryJob {
         BlockId block_id;

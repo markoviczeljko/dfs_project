@@ -111,6 +111,28 @@ Message make_heartbeat_request(uint64_t request_id, StorageNodeId node_id) {
     return Message{MessageType::HEARTBEAT, request_id, std::move(payload)};
 }
 
+// Faza 12.3 wire format: [u64 node_id][u32 block_count]
+// {[u64 block_id][u64 version][u32 checksum]} x block_count (see
+// docs/design.md §16).
+struct InventoryEntry {
+    BlockId block_id;
+    uint64_t version;
+    uint32_t checksum;
+};
+
+Message make_node_inventory_request(uint64_t request_id, StorageNodeId node_id,
+                                     const std::vector<InventoryEntry>& entries) {
+    std::vector<std::byte> payload;
+    put_u64(payload, node_id);
+    put_u32(payload, static_cast<uint32_t>(entries.size()));
+    for (const InventoryEntry& entry : entries) {
+        put_u64(payload, entry.block_id);
+        put_u64(payload, entry.version);
+        put_u32(payload, entry.checksum);
+    }
+    return Message{MessageType::NODE_INVENTORY, request_id, std::move(payload)};
+}
+
 ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
     return static_cast<ErrorCode>(get_u16(payload.data()));
 }
@@ -151,6 +173,14 @@ void register_three_nodes(TCPConnection& client) {
 struct RecordingNode {
     std::mutex mutex;
     std::vector<BlockId> deleted_block_ids;
+    // Faza 12.3: block ids named in any COPY_BLOCK this node receives — the
+    // 2nd u64 field of COPY_BLOCK's payload (see
+    // StorageNode::handle_copy_block's wire format comment). Lets
+    // RecoveryManager::handle_stale_replica() tests observe which node
+    // Master picked as the resync source, without this fake node needing
+    // to actually forward anything on to a destination (see docs/design.md
+    // §16).
+    std::vector<BlockId> copy_block_ids;
     std::unique_ptr<NetworkServer> server;
 
     static std::unique_ptr<RecordingNode> start(uint16_t port) {
@@ -162,6 +192,11 @@ struct RecordingNode {
                 BlockId block_id = get_u64(request.payload.data());
                 std::lock_guard<std::mutex> lock(self->mutex);
                 self->deleted_block_ids.push_back(block_id);
+            } else if (request.type == MessageType::COPY_BLOCK &&
+                       request.payload.size() >= 2 * sizeof(uint64_t)) {
+                BlockId block_id = get_u64(request.payload.data() + sizeof(uint64_t));
+                std::lock_guard<std::mutex> lock(self->mutex);
+                self->copy_block_ids.push_back(block_id);
             }
             return Message{MessageType::ACK, request.request_id, request.payload};
         });
@@ -175,6 +210,12 @@ struct RecordingNode {
         std::lock_guard<std::mutex> lock(mutex);
         return std::find(deleted_block_ids.begin(), deleted_block_ids.end(), block_id) !=
                deleted_block_ids.end();
+    }
+
+    bool received_copy_block(BlockId block_id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::find(copy_block_ids.begin(), copy_block_ids.end(), block_id) !=
+               copy_block_ids.end();
     }
 };
 
@@ -567,6 +608,12 @@ TEST_F(MasterTest, AllocateBlockReturnsThreeDistinctReplicaLocations) {
         ports.insert(port);
     }
     EXPECT_EQ(ports.size(), 3u);
+
+    // Faza 12.3: trailing [u64 version] — always 1 for a freshly allocated
+    // block (see docs/design.md §16).
+    ASSERT_EQ(resp->payload.size(), offset + sizeof(uint64_t));
+    EXPECT_EQ(get_u64(resp->payload.data() + offset), 1u);
+    offset += sizeof(uint64_t);
     EXPECT_EQ(resp->payload.size(), offset);
 }
 
@@ -1104,4 +1151,56 @@ TEST_F(MasterTest, HeartbeatFromUnknownNodeReturnsNodeNotFound) {
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
     EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::NODE_NOT_FOUND);
+}
+
+// Faza 12.3: NODE_INVENTORY (see docs/design.md §16).
+
+TEST_F(MasterTest, NodeInventoryLogsUnknownBlockAsOrphanWithoutDeleting) {
+    start_master(38150);
+    TCPConnection client = connect_client(38150);
+    auto nodes = register_three_recording_nodes(client, 38151, 38152, 38153);
+
+    // node 1 reports a block Master has never heard of — §8.34 "true
+    // orphan": logged only, never dispatched for physical cleanup (see
+    // docs/design.md §16).
+    ASSERT_TRUE(client.sendMessage(
+        make_node_inventory_request(1, /*node_id=*/1, {InventoryEntry{99999, 1, 0}})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+
+    for (auto& node : nodes) {
+        std::lock_guard<std::mutex> lock(node->mutex);
+        EXPECT_TRUE(node->deleted_block_ids.empty());
+        EXPECT_TRUE(node->copy_block_ids.empty());
+    }
+}
+
+TEST_F(MasterTest, NodeInventoryMarksStaleReplicaForResync) {
+    start_master(38154);
+    TCPConnection client = connect_client(38154);
+    auto nodes = register_three_recording_nodes(client, 38155, 38156, 38157);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+    // Freshly allocated — version 1 (see set_block_replicas()).
+
+    // Node 1 (one of the 3 replicas) reports a stale version (0 < 1) — must
+    // trigger a resync: Master dispatches COPY_BLOCK to some OTHER healthy
+    // replica, naming node 1 as the destination (see docs/design.md §16,
+    // RecoveryManager::handle_stale_replica()).
+    ASSERT_TRUE(client.sendMessage(
+        make_node_inventory_request(3, /*node_id=*/1, {InventoryEntry{block_id, 0, 0}})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+
+    bool some_other_node_got_copy_block =
+        nodes[1]->received_copy_block(block_id) || nodes[2]->received_copy_block(block_id);
+    EXPECT_TRUE(some_other_node_got_copy_block);
+    EXPECT_FALSE(nodes[0]->received_copy_block(block_id));  // never itself as the source
 }

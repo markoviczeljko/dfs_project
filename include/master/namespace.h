@@ -125,6 +125,13 @@ public:
     void update_block_replicas_after_recovery(BlockId block_id, StorageNodeId old_node,
                                                StorageNodeId new_node, BlockState new_state);
 
+    // Faza 12.3: removes node_id from a block's replica list — what
+    // Master::handle_node_inventory() uses for over-replication cleanup
+    // (see docs/design.md §16). A no-op if block_id is unknown or node_id
+    // isn't actually in its replica list (same reasoning as
+    // mark_under_replicated()/update_block_replicas_after_recovery()).
+    void remove_replica(BlockId block_id, StorageNodeId node_id);
+
 private:
     static Result<std::string> normalize_path(const std::string& path);
 

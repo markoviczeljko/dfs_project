@@ -57,6 +57,10 @@ enum class MessageType : uint16_t {
     // Master <-> Storage Node (cluster membership)
     REGISTER_NODE,
     HEARTBEAT,
+    // Faza 12.3: full local block inventory report, sent right after
+    // REGISTER_NODE's ACK and again whenever a HEARTBEAT ACK's
+    // needs_inventory bit is 1 — see docs/design.md §16.
+    NODE_INVENTORY,
 
     // Generic
     ACK,

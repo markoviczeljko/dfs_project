@@ -43,12 +43,18 @@ struct BlockMetadata {
 // false means the file has no blocks yet, or its last block is already
 // full — either way the Client falls through to allocating fresh blocks
 // exactly like a normal write.
+// Faza 12.3: the version the target block will have once this append's
+// fill commits (current version + 1) — Client relays it back to
+// StorageNode's WRITE_BLOCK unchanged, since only Master ever advances a
+// block's version (see docs/design.md §16). Meaningless when has_target is
+// false.
 struct AppendTarget {
     bool has_target;
     BlockId block_id;
     uint64_t offset;
     uint32_t fill_amount;
     std::vector<StorageNodeId> replicas;
+    uint64_t target_version;
 };
 
 // Faza 10: everything NamespaceManager::commit_append() needs. A plain
@@ -64,6 +70,16 @@ struct AppendCommitRequest {
     std::vector<BlockId> new_block_ids;
     uint64_t last_new_block_size;  // ignored when new_block_ids is empty
     uint64_t total_appended_bytes;
+    // Faza 12.3: the value commit_append() stamps onto the existing
+    // block's version on a successful CAS — echoed back from the
+    // AppendTarget this commit is finalizing (see docs/design.md §16).
+    // Meaningless when has_existing_target is false. Appended as the LAST
+    // field (rather than grouped with the other has_existing_target-only
+    // fields above) specifically so every existing positional
+    // AppendCommitRequest{...} initializer in tests/master.cpp keeps
+    // compiling unchanged — this is the only new field, so a single
+    // trailing default keeps every call site's field order intact.
+    uint64_t expected_target_version = 0;
 };
 
 // Faza 11: one block Master is dropping from its own bookkeeping — either
