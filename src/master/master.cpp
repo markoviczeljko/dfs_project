@@ -74,7 +74,7 @@ uint64_t get_u64(const std::byte* src) {
 Master::Master(Config config, std::unique_ptr<MetadataStore> metadata_store)
     : config_(std::move(config)),
       metadata_store_(std::move(metadata_store)),
-      replication_manager_(storage_registry_),
+      replication_manager_(storage_registry_, config_.replication_factor),
       recovery_manager_(namespace_manager_, storage_registry_, replication_manager_, statistics_,
                          [this] { persist_metadata(); }),
       failure_detector_(storage_registry_,
@@ -87,6 +87,16 @@ Master::Master(Config config, std::unique_ptr<MetadataStore> metadata_store)
                          }) {}
 
 Result<std::unique_ptr<Master>> Master::create(Config config) {
+    // Faza 17.1: main_master.cpp's config parser already rejects
+    // replication_factor=0, but Config is a public aggregate a future
+    // caller (e.g. Faza 17's benchmark harness, constructing Config
+    // directly rather than through a master.conf file) could still set to
+    // 0 — silently making every ALLOCATE_BLOCK fail with NODE_NOT_FOUND
+    // instead of failing fast here at the actual construction boundary.
+    if (config.replication_factor == 0) {
+        return Result<std::unique_ptr<Master>>::err(ErrorCode::INVALID_REQUEST);
+    }
+
     // Faza 12.4: fallible construction, same pattern as
     // StorageNode::create()'s BlockManager — see docs/design.md §16.
     auto metadata_store_result = MetadataStore::create(config.metadata_dir);
@@ -327,8 +337,9 @@ Message Master::handle_allocate_block(const Message& request) {
     }
     BlockId block_id = result.value();
 
-    // Faza 9: pick DEFAULT_REPLICATION_FACTOR distinct alive nodes for this
-    // block. Fewer than that currently alive/registered is treated as
+    // Faza 9: pick config_.replication_factor distinct alive nodes for this
+    // block (Faza 17.1: configurable, was always DEFAULT_REPLICATION_FACTOR).
+    // Fewer than that currently alive/registered is treated as
     // NODE_NOT_FOUND rather than allocating a permanently under-replicated
     // block this phase can never repair (see docs/design.md §13).
     std::vector<StorageNodeId> replicas = replication_manager_.choose_replicas(block_id);
@@ -565,7 +576,7 @@ Message Master::handle_node_inventory(const Message& request) {
             // Reuses the existing Faza 11 send_delete_block() mechanism —
             // the one concrete §7.14-15 reuse this phase calls for (see
             // docs/design.md §16).
-            if (metadata.value().replicas.size() > DEFAULT_REPLICATION_FACTOR) {
+            if (metadata.value().replicas.size() > config_.replication_factor) {
                 send_delete_block(node_id, block_id);
                 namespace_manager_.remove_replica(block_id, node_id);
             }

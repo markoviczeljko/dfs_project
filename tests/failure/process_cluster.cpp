@@ -131,11 +131,13 @@ bool wait_for_port_ready(const std::string& host, uint16_t port, std::chrono::mi
 }
 
 std::filesystem::path write_master_config(const std::filesystem::path& dir, uint16_t port,
-                                           const std::filesystem::path& metadata_dir) {
+                                           const std::filesystem::path& metadata_dir,
+                                           uint32_t replication_factor) {
     std::filesystem::path path = dir / "master.conf";
     std::ofstream out(path);
     out << "port=" << port << "\n";
     out << "metadata_dir=" << metadata_dir.string() << "\n";
+    out << "replication_factor=" << replication_factor << "\n";
     return path;
 }
 
@@ -245,10 +247,12 @@ void SpawnedCluster::stop_all() {
 
 std::optional<SpawnedCluster> spawn_cluster(const std::filesystem::path& dir, uint16_t master_port,
                                              const std::vector<uint16_t>& storage_ports,
-                                             std::chrono::milliseconds ready_timeout) {
+                                             std::chrono::milliseconds ready_timeout,
+                                             uint32_t replication_factor) {
     SpawnedCluster cluster;
 
-    auto master_config = write_master_config(dir, master_port, dir / "master_metadata");
+    auto master_config =
+        write_master_config(dir, master_port, dir / "master_metadata", replication_factor);
     auto master_handle = ProcessHandle::spawn(kDfsMasterPath, {"--config", master_config.string()});
     if (master_handle.is_error()) {
         return std::nullopt;

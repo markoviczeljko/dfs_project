@@ -118,6 +118,11 @@ target_link_libraries(test_storage_failure PRIVATE failure_test_support gtest_ma
 add_executable(test_failure_recovery failure/test_recovery.cpp)
 target_link_libraries(test_failure_recovery PRIVATE failure_test_support gtest_main)
 
+# Faza 17.1: replication_factor runtime config knob, verified end to end
+# via the same real-process harness (see docs/design.md §21).
+add_executable(test_replication_factor_config failure/test_replication_factor_config.cpp)
+target_link_libraries(test_replication_factor_config PRIVATE failure_test_support gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
 gtest_discover_tests(test_protocol)
@@ -148,3 +153,4 @@ gtest_discover_tests(test_concurrent_append)
 gtest_discover_tests(test_restart)
 gtest_discover_tests(test_storage_failure)
 gtest_discover_tests(test_failure_recovery)
+gtest_discover_tests(test_replication_factor_config)

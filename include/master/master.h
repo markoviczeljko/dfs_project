@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include "common/config.h"
 #include "common/errors.h"
 #include "master/failure_detector.h"
 #include "master/metadata_store.h"
@@ -33,6 +34,12 @@ public:
         // Faza 12.4: where MetadataStore reads/writes metadata.snapshot —
         // see docs/design.md §16.
         std::filesystem::path metadata_dir;
+        // Faza 17.1: optional `replication_factor` key in master.conf (see
+        // docs/design.md §21) — defaults to DEFAULT_REPLICATION_FACTOR so
+        // every existing config file/test keeps working unchanged. Exists
+        // so Faza 17's benchmark suite can compare RF=1 vs RF=3 without
+        // rebuilding the binary.
+        uint32_t replication_factor = DEFAULT_REPLICATION_FACTOR;
     };
 
     static Result<std::unique_ptr<Master>> create(Config config);

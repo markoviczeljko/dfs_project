@@ -2061,3 +2061,82 @@ ništa novo da testira za ovu fazu.
 Faze 15), čisto pod ASan/UBSan (uklj. pravi subprocess-i pod istim
 sanitizer flagovima, pošto se `CMAKE_CXX_FLAGS` primjenjuje na cijeli
 projekat).
+
+---
+
+## 21. Faza 17.1 — replication_factor kao runtime config (priprema za Fazu 17 Benchmarking)
+
+Prva pod-faza Faze 17 (Benchmarking, §16.6-§16.8, §10.36-§10.37). Faza
+17.4-ov Eksperiment 4 (poređenje RF=1 vs RF=3) zahtijeva da replication
+factor bude promjenjiv bez rebuild-a — do sada je `DEFAULT_REPLICATION_FACTOR`
+(`include/common/config.h`) bio jedini izvor istine, hardkodiran u
+`ReplicationManager::choose_replicas()` i u `Master::handle_node_inventory()`-
+ovoj provjeri prekomjerne replikacije.
+
+**`ReplicationManager`** (`include/master/replication_manager.h`,
+`src/master/replication_manager.cpp`): konstruktor dobija drugi parametar
+`uint32_t replication_factor = DEFAULT_REPLICATION_FACTOR` (default
+sačuvan radi kompatibilnosti — svaki postojeći poziv, uključujući svih pet
+postojećih `ReplicationManagerTest` slučajeva, ostaje nepromijenjen), čuva
+ga u novom `replication_factor_` članu, `choose_replicas()` sad koristi taj
+član umjesto globalne konstante na sva tri mjesta (donji prag, `reserve()`,
+petlja, `cursor_ +=`).
+
+**`Master::Config`** (`include/master/master.h`) dobija
+`uint32_t replication_factor = DEFAULT_REPLICATION_FACTOR;` polje.
+`main_master.cpp`-ov `load_config()` parsira opcioni `replication_factor`
+ključ u `master.conf` (isti stil kao postojeći `parse_port` lambda:
+`std::stoul` + provjera da je cijela vrijednost potrošena; odbacuje `0` i
+vrijednosti van `uint32_t` opsega) — ključ nije obavezan, izostavljanjem
+ostaje default member initializer. `Master`-ov konstruktor prosljeđuje
+`config_.replication_factor` u `replication_manager_`; `handle_node_inventory()`-
+ova provjera prekomjerne replikacije (`replicas.size() > ...`) sad poredi
+protiv `config_.replication_factor` umjesto konstante.
+
+**`Master::create()` odbrambena provjera**: nezavisni cpp-reviewer pass je
+ispravno primijetio da `main_master.cpp`-ov parser odbacuje RF=0, ali
+`Config` je javni agregat — buduci poziv koji ga konstruiše direktno (npr.
+Faza 17.4-ov benchmark harness, bez prolaska kroz `master.conf` tekst) bi
+mogao tiho postaviti `replication_factor=0`, što bi svaki `ALLOCATE_BLOCK`
+tiho pretvorilo u `NODE_NOT_FOUND` bez ijedne jasne greške na granici
+konstrukcije. `Master::create()` sad odmah vraća `INVALID_REQUEST` za
+`replication_factor == 0`, prije bilo kakvog drugog rada.
+
+**Proces-harness proširen, ne premješten** — odstupanje od originalno
+najavljenog plana: plan je predviđao izdvajanje `tests/failure/
+process_cluster.h/.cpp`-a u neutralan `tools/process_harness/` modul da bi
+i budući `bench/` (Faza 17.3+) mogao da ga linkuje. Pri samoj implementaciji
+procijenjeno da je to premature — CMake `failure_test_support` je već
+samostalan static-library target koji bilo koji budući `bench/` executable
+može linkovati (`target_link_libraries(bench_x PRIVATE failure_test_support)`)
+bez obzira gdje `.cpp` fajl fizički živi, a `bench/` ne postoji do Faze
+17.3. Premještanje fajlova sada bi bio rizik (mogao pokvariti Fazu 16-ove
+testove) bez ijedne stvarne koristi danas — čisto YAGNI. Umjesto toga,
+`write_master_config()` i `spawn_cluster()` dobijaju samo novi opcioni
+`replication_factor` parametar (default `DEFAULT_REPLICATION_FACTOR`,
+dodat na kraj liste parametara — nijedan postojeći poziv iz `test_restart.cpp`/
+`test_storage_failure.cpp`/`test_recovery.cpp` nije pogođen).
+
+**`tests/failure/test_replication_factor_config.cpp`** (novi fajl, CMake
+target `test_replication_factor_config`): dva end-to-end testa preko
+pravog procesnog klastera — `replication_factor=1` fizički stavlja blok na
+tačno 1 od 3 Storage Node-a (`has_any_block_on_disk()`, već postojeći
+helper iz Faze 16), default i dalje stavlja na sva 3 (regresiona provjera).
+Dokazuje da RF-konfiguracija stvarno radi end-to-end (klijent → Master →
+`ALLOCATE_BLOCK` odgovor → data-plane write), ne samo da se kompajlira —
+`Client::write_chunk_to_replicas()` (`src/client/client.cpp`) već iterira
+preko dinamički-veličinske liste replika iz Master-ovog odgovora, nema
+hardkodirane "3" u data-plane putanji, potvrđeno čitanjem koda prije
+pisanja testa.
+
+**Nezavisni cpp-review prije commit-a otkrio jedan MEDIUM bag**: nova
+`test_replication_factor_config.cpp` je prvobitno koristila isti port-opseg
+(41720-41727) koji već koristi `tests/failure/test_recovery.cpp` — svaki
+drugi failure-test fajl koristi disjunktan opseg od 10 (41700-e restart,
+41710-e storage_failure, 41720-e recovery), pa bi paralelno pokretanje
+(`ctest -j`) moglo izazvati spurious bind failures. Ispravljeno dodjelom
+svježeg opsega (41730-41737).
+
+3 nova unit testa (`ReplicationManagerTest`, RF=1/RF=2/"manje node-ova od
+konfigurisanog RF-a") + 2 nova end-to-end testa = **249/249 testova
+prolazi**, čisto pod ASan/UBSan.

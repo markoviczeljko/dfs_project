@@ -47,6 +47,17 @@ Result<Master::Config> load_config(const std::filesystem::path& path) {
         out = static_cast<uint16_t>(parsed);
     };
 
+    // Faza 17.1: replication_factor must be at least 1 — RF=0 would mean
+    // no replicas ever chosen, silently breaking every ALLOCATE_BLOCK.
+    auto parse_replication_factor = [](const std::string& value, uint32_t& out) {
+        size_t consumed = 0;
+        unsigned long parsed = std::stoul(value, &consumed);
+        if (consumed != value.size() || parsed == 0 || parsed > 0xFFFFFFFFUL) {
+            throw std::invalid_argument("replication_factor out of range");
+        }
+        out = static_cast<uint32_t>(parsed);
+    };
+
     std::string line;
     try {
         while (std::getline(file, line)) {
@@ -68,6 +79,8 @@ Result<Master::Config> load_config(const std::filesystem::path& path) {
             } else if (key == "metadata_dir") {
                 config.metadata_dir = value;
                 has_metadata_dir = true;
+            } else if (key == "replication_factor") {
+                parse_replication_factor(value, config.replication_factor);
             }
         }
     } catch (const std::exception&) {

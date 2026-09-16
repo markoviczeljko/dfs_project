@@ -75,6 +75,40 @@ TEST(ReplicationManagerTest, ChooseReplicasRoundRobinsAcrossSuccessiveCalls) {
     EXPECT_EQ(second, (std::vector<StorageNodeId>{4, 5, 1}));
 }
 
+TEST(ReplicationManagerTest, ChooseReplicasRespectsConfiguredReplicationFactorOfOne) {
+    // Faza 17.1: replication_factor is now a runtime Master config knob
+    // (see docs/design.md §21) rather than always DEFAULT_REPLICATION_FACTOR.
+    StorageRegistry registry;
+    registry.register_node(make_node(1));
+    registry.register_node(make_node(2));
+    registry.register_node(make_node(3));
+    ReplicationManager manager(registry, /*replication_factor=*/1);
+
+    auto replicas = manager.choose_replicas(1);
+    ASSERT_EQ(replicas.size(), 1u);
+}
+
+TEST(ReplicationManagerTest, ChooseReplicasRespectsConfiguredReplicationFactorOfTwo) {
+    StorageRegistry registry;
+    registry.register_node(make_node(1));
+    registry.register_node(make_node(2));
+    registry.register_node(make_node(3));
+    ReplicationManager manager(registry, /*replication_factor=*/2);
+
+    auto replicas = manager.choose_replicas(1);
+    ASSERT_EQ(replicas.size(), 2u);
+    std::set<StorageNodeId> distinct(replicas.begin(), replicas.end());
+    EXPECT_EQ(distinct.size(), 2u);
+}
+
+TEST(ReplicationManagerTest, ChooseReplicasReturnsEmptyWhenFewerThanConfiguredFactorAlive) {
+    StorageRegistry registry;
+    registry.register_node(make_node(1));
+    ReplicationManager manager(registry, /*replication_factor=*/2);
+
+    EXPECT_TRUE(manager.choose_replicas(1).empty());
+}
+
 TEST(ReplicationManagerTest, ConcurrentChooseReplicasAlwaysReturnsThreeValidDistinctNodes) {
     // Exercises the cursor_ mutex under real concurrency (run under
     // ASan/UBSan as part of the usual verification pass) — every

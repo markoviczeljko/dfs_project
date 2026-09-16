@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <vector>
 
+#include "common/config.h"
 #include "common/errors.h"
 #include "common/types.h"
 
@@ -62,9 +63,12 @@ private:
 bool wait_for_port_ready(const std::string& host, uint16_t port, std::chrono::milliseconds timeout);
 
 // Writes a master.conf-format file (see src/master/main_master.cpp's
-// parser) under `dir` and returns its path.
-std::filesystem::path write_master_config(const std::filesystem::path& dir, uint16_t port,
-                                           const std::filesystem::path& metadata_dir);
+// parser) under `dir` and returns its path. replication_factor (Faza 17.1)
+// defaults to DEFAULT_REPLICATION_FACTOR — always written explicitly so a
+// test config is self-documenting, even when it matches the default.
+std::filesystem::path write_master_config(
+    const std::filesystem::path& dir, uint16_t port, const std::filesystem::path& metadata_dir,
+    uint32_t replication_factor = DEFAULT_REPLICATION_FACTOR);
 
 // Writes a storageN.conf-format file (see src/storage/main_storage.cpp's
 // parser) under `dir` and returns its path.
@@ -118,9 +122,13 @@ struct SpawnedCluster {
 // `storage_ports`, waits for every port to accept connections (bounded by
 // `ready_timeout`, applied independently to each process — not a shared
 // budget). Returns std::nullopt if any process fails to become ready.
-std::optional<SpawnedCluster> spawn_cluster(const std::filesystem::path& dir, uint16_t master_port,
-                                             const std::vector<uint16_t>& storage_ports,
-                                             std::chrono::milliseconds ready_timeout);
+// replication_factor (Faza 17.1) defaults to DEFAULT_REPLICATION_FACTOR —
+// pass a lower value (with enough storage_ports to still satisfy it) to
+// spawn a cluster for Faza 17.4's RF=1-vs-RF=3 benchmark/test scenarios.
+std::optional<SpawnedCluster> spawn_cluster(
+    const std::filesystem::path& dir, uint16_t master_port,
+    const std::vector<uint16_t>& storage_ports, std::chrono::milliseconds ready_timeout,
+    uint32_t replication_factor = DEFAULT_REPLICATION_FACTOR);
 
 }  // namespace dfs_test
 
