@@ -8,6 +8,7 @@
 #include <array>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <system_error>
 
 #include "common/config.h"
@@ -151,6 +152,8 @@ std::filesystem::path BlockStorage::temp_path(BlockId id) const {
 }
 
 ErrorCode BlockStorage::recover() {
+    // Runs once from create(), before any other thread has a reference to
+    // this BlockStorage — no locking needed here.
     std::error_code ec;
     std::filesystem::directory_iterator it(blocks_dir_, ec);
     if (ec) {
@@ -191,29 +194,65 @@ ErrorCode BlockStorage::recover() {
 
         if (compute_block_checksum(data) != header.checksum) continue;  // corrupted, exclude from index
 
-        local_blocks_[header.block_id] =
-            LocalBlockInfo{header.data_size, header.checksum, header.block_version};
+        auto state = std::make_shared<BlockState>();
+        state->has_data = true;
+        state->info = LocalBlockInfo{header.data_size, header.checksum, header.block_version};
+        local_blocks_[header.block_id] = std::move(state);
         used_space_ += header.data_size;
     }
 
     return ErrorCode::OK;
 }
 
-ErrorCode BlockStorage::write_block(BlockId id, const std::vector<uint8_t>& data,
-                                     uint64_t block_version) {
-    std::unique_lock lock(mutex_);
-    return write_block_locked(id, data, block_version);
+std::shared_ptr<BlockStorage::BlockState> BlockStorage::find_block_state(BlockId id) const {
+    std::shared_lock lock(map_mutex_);
+    auto it = local_blocks_.find(id);
+    if (it == local_blocks_.end()) {
+        return nullptr;
+    }
+    return it->second;
 }
 
-ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t>& data,
-                                            uint64_t block_version) {
-    uint64_t existing_size = 0;
-    if (auto it = local_blocks_.find(id); it != local_blocks_.end()) {
-        existing_size = it->second.size;
+std::shared_ptr<BlockStorage::BlockState> BlockStorage::get_or_create_block_state(BlockId id) {
+    std::unique_lock lock(map_mutex_);
+    auto it = local_blocks_.find(id);
+    if (it != local_blocks_.end()) {
+        return it->second;
     }
-    uint64_t prospective_used = used_space_ - existing_size + data.size();
-    if (prospective_used > capacity_) {
-        return ErrorCode::STORAGE_FULL;
+    auto state = std::make_shared<BlockState>();
+    local_blocks_.emplace(id, state);
+    return state;
+}
+
+ErrorCode BlockStorage::try_apply_space_delta(int64_t delta) {
+    std::lock_guard<std::mutex> lock(space_mutex_);
+    if (delta > 0) {
+        uint64_t increase = static_cast<uint64_t>(delta);
+        if (used_space_ + increase > capacity_) {
+            return ErrorCode::STORAGE_FULL;
+        }
+        used_space_ += increase;
+    } else if (delta < 0) {
+        used_space_ -= static_cast<uint64_t>(-delta);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode BlockStorage::write_block(BlockId id, const std::vector<uint8_t>& data,
+                                     uint64_t block_version) {
+    auto state = get_or_create_block_state(id);
+    std::unique_lock lock(state->mutex);
+    return write_block_locked(*state, id, data, block_version);
+}
+
+ErrorCode BlockStorage::write_block_locked(BlockState& state, BlockId id,
+                                            const std::vector<uint8_t>& data,
+                                            uint64_t block_version) {
+    uint64_t existing_size = state.has_data ? state.info.size : 0;
+    int64_t delta = static_cast<int64_t>(data.size()) - static_cast<int64_t>(existing_size);
+    ErrorCode space_result = try_apply_space_delta(delta);
+    if (space_result != ErrorCode::OK) {
+        return space_result;
     }
 
     BlockHeader header{BLOCK_MAGIC,
@@ -227,6 +266,7 @@ ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t
     std::filesystem::path tmp = temp_path(id);
     int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
+        try_apply_space_delta(-delta);
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -240,6 +280,7 @@ ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t
     if (!ok) {
         std::error_code remove_ec;
         std::filesystem::remove(tmp, remove_ec);
+        try_apply_space_delta(-delta);
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -247,6 +288,7 @@ ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t
     std::filesystem::rename(tmp, block_path(id), rename_ec);
     if (rename_ec) {
         std::filesystem::remove(tmp, rename_ec);
+        try_apply_space_delta(-delta);
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -258,19 +300,23 @@ ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t
         ::close(dir_fd);
     }
 
-    local_blocks_[id] = LocalBlockInfo{data.size(), header.checksum, block_version};
-    used_space_ = prospective_used;
+    state.info = LocalBlockInfo{data.size(), header.checksum, block_version};
+    state.has_data = true;
 
     return ErrorCode::OK;
 }
 
 Result<std::vector<uint8_t>> BlockStorage::read_block(BlockId id) {
-    std::shared_lock lock(mutex_);
-    return read_block_locked(id);
+    auto state = find_block_state(id);
+    if (!state) {
+        return Result<std::vector<uint8_t>>::err(ErrorCode::BLOCK_NOT_FOUND);
+    }
+    std::shared_lock lock(state->mutex);
+    return read_block_locked(*state, id);
 }
 
-Result<std::vector<uint8_t>> BlockStorage::read_block_locked(BlockId id) const {
-    if (local_blocks_.find(id) == local_blocks_.end()) {
+Result<std::vector<uint8_t>> BlockStorage::read_block_locked(const BlockState& state, BlockId id) const {
+    if (!state.has_data) {
         return Result<std::vector<uint8_t>>::err(ErrorCode::BLOCK_NOT_FOUND);
     }
 
@@ -306,16 +352,20 @@ Result<std::vector<uint8_t>> BlockStorage::read_block_locked(BlockId id) const {
 
 ErrorCode BlockStorage::write_block_at(BlockId id, uint64_t offset,
                                         const std::vector<uint8_t>& data, uint64_t block_version) {
-    std::unique_lock lock(mutex_);
+    auto state = find_block_state(id);
+    if (!state) {
+        return ErrorCode::BLOCK_NOT_FOUND;
+    }
 
-    if (local_blocks_.find(id) == local_blocks_.end()) {
+    std::unique_lock lock(state->mutex);
+    if (!state->has_data) {
         return ErrorCode::BLOCK_NOT_FOUND;
     }
     if (offset > BLOCK_SIZE || data.size() > BLOCK_SIZE - offset) {
         return ErrorCode::INVALID_REQUEST;
     }
 
-    auto current = read_block_locked(id);
+    auto current = read_block_locked(*state, id);
     if (current.is_error()) {
         return current.error();
     }
@@ -325,53 +375,75 @@ ErrorCode BlockStorage::write_block_at(BlockId id, uint64_t offset,
     }
     std::copy(data.begin(), data.end(), merged.begin() + static_cast<ptrdiff_t>(offset));
 
-    return write_block_locked(id, merged, block_version);
+    return write_block_locked(*state, id, merged, block_version);
 }
 
 ErrorCode BlockStorage::delete_block(BlockId id) {
-    std::unique_lock lock(mutex_);
+    // Deliberately does NOT erase the map entry — see the class-level
+    // comment in block_storage.h. A BlockState, once created, is a
+    // permanent handle for that id; find_block_state()/
+    // get_or_create_block_state() will always return this same object, so
+    // a write_block() that already resolved its shared_ptr before this
+    // delete runs can never write into a state the map no longer knows
+    // about.
+    auto state = find_block_state(id);
+    if (!state) {
+        return ErrorCode::OK;  // idempotent — never touched
+    }
 
-    auto it = local_blocks_.find(id);
-    if (it == local_blocks_.end()) {
-        return ErrorCode::OK;  // idempotent
+    std::unique_lock lock(state->mutex);
+    if (!state->has_data) {
+        return ErrorCode::OK;  // idempotent — never had real data
     }
 
     std::error_code ec;
     std::filesystem::remove(block_path(id), ec);
 
-    used_space_ -= it->second.size;
-    local_blocks_.erase(it);
+    try_apply_space_delta(-static_cast<int64_t>(state->info.size));
+    state->has_data = false;
+    state->info = LocalBlockInfo{};
 
     return ErrorCode::OK;
 }
 
 bool BlockStorage::block_exists(BlockId id) const {
-    std::shared_lock lock(mutex_);
-    return local_blocks_.contains(id);
+    auto state = find_block_state(id);
+    if (!state) {
+        return false;
+    }
+    std::shared_lock lock(state->mutex);
+    return state->has_data;
 }
 
 Result<BlockStorage::BlockInfo> BlockStorage::get_block_info(BlockId id) const {
-    std::shared_lock lock(mutex_);
-    auto it = local_blocks_.find(id);
-    if (it == local_blocks_.end()) {
+    auto state = find_block_state(id);
+    if (!state) {
         return Result<BlockInfo>::err(ErrorCode::BLOCK_NOT_FOUND);
     }
-    return Result<BlockInfo>::ok(BlockInfo{it->second.size, it->second.checksum, it->second.version});
+    std::shared_lock lock(state->mutex);
+    if (!state->has_data) {
+        return Result<BlockInfo>::err(ErrorCode::BLOCK_NOT_FOUND);
+    }
+    return Result<BlockInfo>::ok(BlockInfo{state->info.size, state->info.checksum, state->info.version});
 }
 
 Result<BlockStorage::ConditionalReadResult> BlockStorage::read_block_if_changed(
     BlockId id, uint64_t known_version) {
-    std::shared_lock lock(mutex_);
-    auto it = local_blocks_.find(id);
-    if (it == local_blocks_.end()) {
+    auto state = find_block_state(id);
+    if (!state) {
         return Result<ConditionalReadResult>::err(ErrorCode::BLOCK_NOT_FOUND);
     }
-    uint64_t current_version = it->second.version;
+
+    std::shared_lock lock(state->mutex);
+    if (!state->has_data) {
+        return Result<ConditionalReadResult>::err(ErrorCode::BLOCK_NOT_FOUND);
+    }
+    uint64_t current_version = state->info.version;
     if (known_version != 0 && known_version == current_version) {
         return Result<ConditionalReadResult>::ok(ConditionalReadResult{true, current_version, {}});
     }
 
-    auto data_result = read_block_locked(id);
+    auto data_result = read_block_locked(*state, id);
     if (data_result.is_error()) {
         return Result<ConditionalReadResult>::err(data_result.error());
     }
@@ -380,21 +452,31 @@ Result<BlockStorage::ConditionalReadResult> BlockStorage::read_block_if_changed(
 }
 
 std::vector<std::pair<BlockId, BlockStorage::BlockInfo>> BlockStorage::enumerate_blocks() const {
-    std::shared_lock lock(mutex_);
+    std::vector<std::pair<BlockId, std::shared_ptr<BlockState>>> snapshot;
+    {
+        std::shared_lock map_lock(map_mutex_);
+        snapshot.reserve(local_blocks_.size());
+        for (const auto& [id, state] : local_blocks_) {
+            snapshot.emplace_back(id, state);
+        }
+    }
+
     std::vector<std::pair<BlockId, BlockInfo>> blocks;
-    blocks.reserve(local_blocks_.size());
-    for (const auto& [id, info] : local_blocks_) {
-        blocks.emplace_back(id, BlockInfo{info.size, info.checksum, info.version});
+    blocks.reserve(snapshot.size());
+    for (const auto& [id, state] : snapshot) {
+        std::shared_lock block_lock(state->mutex);
+        if (!state->has_data) continue;
+        blocks.emplace_back(id, BlockInfo{state->info.size, state->info.checksum, state->info.version});
     }
     return blocks;
 }
 
 uint64_t BlockStorage::used_space() const {
-    std::shared_lock lock(mutex_);
+    std::lock_guard<std::mutex> lock(space_mutex_);
     return used_space_;
 }
 
 uint64_t BlockStorage::free_space() const {
-    std::shared_lock lock(mutex_);
+    std::lock_guard<std::mutex> lock(space_mutex_);
     return capacity_ - used_space_;
 }

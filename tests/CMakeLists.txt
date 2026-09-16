@@ -78,6 +78,17 @@ target_link_libraries(test_list_stat PRIVATE client master storage gtest_main)
 add_executable(test_recovery integration/test_recovery.cpp)
 target_link_libraries(test_recovery PRIVATE client master storage gtest_main)
 
+# Faza 15: concurrency stress tests (design notes §11.41-43), exercised
+# directly against BlockStorage rather than through the network stack.
+add_executable(test_concurrent_reads concurrency/test_concurrent_reads.cpp)
+target_link_libraries(test_concurrent_reads PRIVATE storage gtest_main)
+
+add_executable(test_concurrent_writes concurrency/test_concurrent_writes.cpp)
+target_link_libraries(test_concurrent_writes PRIVATE storage gtest_main)
+
+add_executable(test_concurrent_append concurrency/test_concurrent_append.cpp)
+target_link_libraries(test_concurrent_append PRIVATE storage gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
 gtest_discover_tests(test_protocol)
@@ -102,3 +113,6 @@ gtest_discover_tests(test_append)
 gtest_discover_tests(test_delete)
 gtest_discover_tests(test_list_stat)
 gtest_discover_tests(test_recovery)
+gtest_discover_tests(test_concurrent_reads)
+gtest_discover_tests(test_concurrent_writes)
+gtest_discover_tests(test_concurrent_append)
