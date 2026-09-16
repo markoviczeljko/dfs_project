@@ -839,3 +839,160 @@ potvrđuje identične veličine `.block` fajlova (uključujući header) na svako
 cpp-reviewer-ove dva CRITICAL nalaza — i 5 u
 `tests/integration/test_append.cpp`), čisto pod ASan/UBSan, stabilno kroz
 ponovljena pokretanja.
+
+## 15. Faza 11 — DELETE / LIST / STAT (replication-aware) + WRITE overwrite GC
+
+Zatvara `dfs_design_notes.md` §12/§13 u potpunosti. Prije ove faze,
+`DELETE_FILE` je bio čisti namespace tombstone: `NamespaceManager::delete_file()`
+brisao je samo `files_[path]`/`pending_blocks_[path]`, nikad `blocks_` mapu
+niti fizičke blokove na Storage Node-ovima — trajno curenje. Isto tako,
+`commit_write()`-ovo WRITE-overwrite ponašanje je već ispravno zamjenjivalo
+`FileMetadata.blocks` (i time već davalo besplatnu "stara verzija preživi
+neuspio WRITE" garanciju iz §13.4), ali je stare `BlockId`-jeve prosto
+odbacivalo — isto curenje. `StorageNode::handle_delete_block()` je već bio
+potpuno implementiran i idempotentan (od Faze 5); ova faza mu je samo dala
+pozivaoca.
+
+**Rezolucija nejasnoća iz dokumentacije** (§5.22/§5.23 kontradiktorno navode
+i Client i Master kao moguće pošiljaoce `DELETE_BLOCK`-a; kasnija, autoritativnija
+poglavlja §12.9/§13.2/§13.3 i sam `IMPLEMENTATION_PLAN.md` pretpostavljaju
+Master-only) — odabrano: **Master je jedini pošiljalac `DELETE_BLOCK`-a**.
+Takođe: dokument koristi termin "orphan" za DVA različita koncepta — §8.34
+(blok koji StorageNode ima a Master ga uopšte ne poznaje, zahtijeva
+rekonsilijaciju, "ne treba ga odmah automatski obrisati") i §13.2 (blok koji
+Master EKSPLICITNO zna da je superseded i želi ga obrisati). Ova faza
+implementira ISKLJUČIVO §13.2-tip — §8.34-tip zahtijeva heartbeat/inventory
+infrastrukturu koja ne postoji do Faze 12.
+
+**Novi tip** (`include/master/metadata.h`): `OrphanedBlock{BlockId id,
+std::vector<StorageNodeId> replicas}` — snapshot replika bloka u trenutku
+uklanjanja iz `blocks_`, jer se `BlockMetadata` unos briše u istom pozivu
+koji ovaj struct proizvodi. Namjerno BEZ novog `gc.h`/`gc.cpp` (kako je
+`IMPLEMENTATION_PLAN.md` predlagao) — cijeli mehanizam je jedan plain struct
+plus dvije `NamespaceManager` metode plus mali Master-side dispatch loop,
+bez ikakvog nezavisnog stanja/threadinga koji bi opravdali novu klasu/fajl.
+
+**`NamespaceManager::delete_file()`/`commit_write()`** mijenjaju povratni tip
+iz `ErrorCode` u `Result<std::vector<OrphanedBlock>>` — pod već držanim
+`unique_lock`-om, prije brisanja/zamjene `FileMetadata.blocks`, uhvate
+replika-snapshot svakog starog bloka i obrišu ga iz `blocks_`. Bezbjedno
+bezuslovno u `commit_write()`-u: stari i novi block-id skupovi se nikad ne
+preklapaju jer `allocate_block()` strogo inkrementira `next_block_id_`.
+
+**Master** dobija `gc_dispatch()`/`send_delete_block()`/`next_request_id()`
+— nakon uspješnog `delete_file()`/`commit_write()`, Master otvara svježu
+odlaznu TCP konekciju ka svakoj replici svakog orphan bloka i šalje
+`DELETE_BLOCK`, **sinhrono** (blokira klijentov ACK dok se svi pokušaji ne
+završe — čini kriterijum "fizički uklonjeno sa sve 3 replike" deterministički
+testabilnim bez polling-a, po §3.11-ovom "jednostavniji sinhroni model za
+prvu verziju") i **best-effort** (connect failure/timeout/non-ACK se guta,
+nikad ne propagira klijentu kao greška — isti obrazac kao Faza 9 "manje od
+RF=3 živih čvorova" i Faza 10 liveness gap).
+
+**Client** dobija `delete_file()`, `list()`, `stat()` (+ `FileStat` struct),
+prateći tačan `create_file()`-stil jednog round-trip-a ka Masteru.
+`main_client.cpp` dobija `delete`/`list`/`stat` CLI podkomande. Imenovanje
+`delete_file()` (ne dizajn-dokov skicirani `remove()` iz §17.11, koji
+predatira stvarni kod i već je nekonzistentan sa `create_file()`) —
+`delete` je uostalom C++ ključna riječ.
+
+**Protokol bez izmjena** — `DELETE_FILE`, `LIST_FILES`, `STAT_FILE`,
+`DELETE_BLOCK` su već postojali u `MessageType` enumu sa potpuno
+implementiranim wire formatima na strani koja ih prima; Master samo postaje
+nov POŠILJALAC `DELETE_BLOCK`-a.
+
+**Nezavisan `cpp-reviewer` agent — 1 CRITICAL + 1 HIGH + 2 MEDIUM nalaza:**
+
+- **CRITICAL: `send_delete_block()` nije imao I/O timeout.** `Socket` nigdje
+  u projektu nije imao mehanizam za ograničavanje trajanja `send`/`recv`
+  poziva. Storage Node koji prihvati konekciju ali nikad ne odgovori
+  (zaglavljen proces, spor handler) bi zauvijek blokirao worker thread koji
+  opslužuje klijentov `DELETE_FILE`/`WRITE_COMMIT` — i, pošto
+  `NetworkServer::stop()` zna samo da zatvori KLIJENTOV fd svakog worker-a
+  (ne i ODLAZNU konekciju koju `send_delete_block()` otvara), mogao je
+  učiniti CIJELI `Master::stop()` (pa i destrukciju) trajno nemogućim.
+  Popravljeno: nov `Socket::set_timeout(int timeout_ms)` (postavlja
+  `SO_RCVTIMEO`/`SO_SNDTIMEO`), pozvan u `send_delete_block()` sa novom
+  `DELETE_BLOCK_TIMEOUT_MS = 2000` konstantom (`common/config.h`) — istek
+  se ponaša identično postojećem connect-failure putu (`recv`/`send` vraćaju
+  -1, `TCPConnection::sendAll`/`recvAll` to već tretiraju kao običnu
+  grešku). Regresioni test: `MasterTest.DeleteFileWithHangingReplicaCompletesWithinBoundedTime`
+  (fake node koji prihvati konekciju pa spava duže od timeout-a).
+- **(Otkriveno TOKOM popravke gornjeg nalaza, ne od strane reviewer-a)
+  Zatvaranje odlazne konekcije nakon timeout-a otkrilo je DRUGI, skriveni
+  bug: proces bez ikakvog rukovanja `SIGPIPE`-om.** Kad Master zatvori
+  konekciju (timeout istekao), a spori Storage Node kasnije ipak pokuša
+  poslati svoj ACK na tu već zatvorenu vezu, `send()` diže `SIGPIPE` čija je
+  DEFAULT akcija ubijanje CIJELOG procesa (ne samo thread-a) — u produkciji
+  bi ovo mogao srušiti sam Storage Node proces zbog Master-ove strane
+  timeout logike. Nigdje u projektu se `SIGPIPE` nije ni ignorisao ni
+  blokirao. Reprodukovano direktno (test proces je umro sa exit kodom 141 =
+  128+SIGPIPE) prije popravke. Popravljeno: `Socket::create()` jednom po
+  procesu (`std::call_once`) ignoriše `SIGPIPE` (`signal(SIGPIPE, SIG_IGN)`)
+  — svaki proces koji ikad napravi `Socket` (Master, Client, StorageNode, svi
+  test binariji) sada dobija ovu zaštitu automatski; pogođen `send()` sada
+  samo vraća -1/`EPIPE`, tretiran identično svakom drugom I/O neuspjehu.
+- **HIGH: data race na `Master::next_request_id_`.** Prije ove faze Master
+  nikad nije sam inicirao odlazne zahtjeve (samo je odjekivao klijentov
+  `request_id`) — `next_request_id_++` na plain `uint64_t`-u, čitano-mijenjano
+  iz konkurentnih `NetworkServer` worker thread-ova (thread-per-connection),
+  je čist data race. Popravljeno: `std::atomic<uint64_t>` +
+  `fetch_add(1, std::memory_order_relaxed)`.
+- **MEDIUM (dokumentovano komentarom, ne promjena ponašanja): orphan-capture
+  petlja tiho preskače `BlockId` koji je u `file.blocks` ali nedostaje u
+  `blocks_`-mapi.** Ovo bi bio invarijant-prekršaj koji se ne bi trebao
+  desiti; namjerno tretiran kao no-op (fajl-level operacija i dalje uspijeva)
+  umjesto greške, konzistentno sa identičnim `if (block_it != blocks_.end())`
+  tretmanom iste situacije nekoliko linija niže u `commit_write()`-ovom
+  COMMITTED-state loop-u.
+- **MEDIUM (prihvaćeno, nije "bug" nego posljedica dizajna): `gc_dispatch()`
+  je sekvencijalan** (jedan connect+send+recv po blok×replika paru) —
+  N×RF×timeout najgori slučaj za veliki DELETE. Prihvaćeno za ovu fazu;
+  paralelizacija bi bila prirodan sljedeći korak ako ikad postane problem u
+  praksi.
+
+**Samostalno pronađen bug (ASan, tokom pisanja `test_list_stat.cpp`):**
+`ConcurrentCreateAndListBasicCorrectness`/`ConcurrentDeleteAndListBasicCorrectness`
+su prvobitno pozivali `new_client()` (koji radi `clients_.push_back(...)` na
+fixture-ovom NESINHRONIZOVANOM `std::vector`-u) IZNUTRA dva odvojena
+`std::thread`-a — konkurentan `push_back` na dijeljenom vektoru je data race
+(ASan: heap-use-after-free pri realokaciji vektora). Popravljeno kreiranjem
+oba `Client` objekta na glavnoj niti PRIJE pokretanja thread-ova, isti obrazac
+kao `AppendIntegrationTest`-ov postojeći `ConcurrentAppendsFromTwoClientsDoNotOverlapOrLoseData`.
+
+**Prihvaćeni, dokumentovani gapovi (nisu ove faze bug-ovi, nego namjerne
+odluke)**:
+
+- **GC dispatch je in-memory, bez perzistencije/fronte.** Ako Master padne
+  usred `gc_dispatch()`-a, neki već-superseded blokovi mogu ostati fizički
+  zaglavljeni na disku zauvijek. Pravi fix čeka Fazu 12 (Master
+  persistence/restart).
+- **Race: concurrent READ vs fizičko brisanje.** Klijent koji je upravo
+  dohvatio stari block-list (`READ_FILE`) tačno prije konkurentnog
+  DELETE-a/overwrite-a može dobiti `BLOCK_NOT_FOUND` sa Storage Node-a čiji
+  je blok već fizički obrisan. Eksplicitno predstavljeno korisniku kao
+  tradeoff (refcounting/lease infrastruktura čeka Fazu 12) — korisnik je
+  potvrdio prihvatanje ovog gap-a.
+- **Storage Node nedostupan tokom DELETE/GC dispatch-a** — best-effort,
+  ne-fatalno, isti obrazac kao Faza 9/10.
+
+**Ručna provjera**: Master + 3 prava `dfs_storage` procesa preko `dfs_client`
+CLI-ja. `create`+`write`+`stat` → potvrđen blok fizički prisutan na sve 3
+replike (`find .../blocks -name '*.block'`) → `delete` → isti `find` vraća 0
+pogodaka na sve 3 (kriterijum 3) → `list /` više ne prikazuje fajl.
+WRITE-overwrite GC: `write` v1 (blok X) → `write` v2 (blok Y) → X fizički
+nestao sa sve 3, Y prisutan na sve 3 → `read` == v2 sadržaj bajt-po-bajt.
+Kriterijum 2 (partial-write-failure): `kill -SIGINT` na jedan `dfs_storage`
+proces → overwrite `write` propada (`error_code=10`, replika nedostupna) →
+`read` i dalje vraća staru (v2) verziju nepromijenjenu, bajt-po-bajt
+identično.
+
+152/152 testova prolazi (131 stari + 21 nov: 5 u `test_namespace.cpp`
+(`DeleteFileReturnsOrphanedBlocksWithReplicas`,
+`DeleteFileOnZeroBlockFileReturnsEmptyOrphanList`,
+`CommitWriteOnFreshFileWithNoPriorBlocksReturnsEmptyOrphanList`,
+`CommitWriteOverExistingBlocksReturnsOldBlocksAsOrphans`,
+`CommitWriteFailureLeavesOldBlocksIntact`), 5 u `test_master.cpp` (uključujući
+`DeleteFileWithHangingReplicaCompletesWithinBoundedTime`, regresioni test za
+cpp-reviewer-ov CRITICAL nalaz), 6 u novom `tests/integration/test_delete.cpp`,
+5 u novom `tests/integration/test_list_stat.cpp`), čisto pod ASan/UBSan.

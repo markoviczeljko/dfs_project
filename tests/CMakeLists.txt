@@ -54,6 +54,12 @@ target_link_libraries(test_read PRIVATE client master storage gtest_main)
 add_executable(test_append integration/test_append.cpp)
 target_link_libraries(test_append PRIVATE client master storage gtest_main)
 
+add_executable(test_delete integration/test_delete.cpp)
+target_link_libraries(test_delete PRIVATE client master storage gtest_main)
+
+add_executable(test_list_stat integration/test_list_stat.cpp)
+target_link_libraries(test_list_stat PRIVATE client master storage gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(test_common_types)
 gtest_discover_tests(test_protocol)
@@ -70,3 +76,5 @@ gtest_discover_tests(test_create)
 gtest_discover_tests(test_write)
 gtest_discover_tests(test_read)
 gtest_discover_tests(test_append)
+gtest_discover_tests(test_delete)
+gtest_discover_tests(test_list_stat)

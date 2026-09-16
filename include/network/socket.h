@@ -27,6 +27,12 @@ public:
     ErrorCode listen(int backlog);
     Result<Socket> accept();
 
+    // Sets SO_RCVTIMEO and SO_SNDTIMEO, bounding every future send()/recv()
+    // on this socket — send()/recv() return -1 (EAGAIN/EWOULDBLOCK) past the
+    // deadline, which TCPConnection::sendAll()/recvAll() already treat as a
+    // plain failure. Does NOT bound connect() — see docs/design.md §15.
+    ErrorCode set_timeout(int timeout_ms);
+
     ssize_t send(const std::byte* data, size_t size);
     ssize_t recv(std::byte* buffer, size_t size);
 

@@ -66,4 +66,18 @@ struct AppendCommitRequest {
     uint64_t total_appended_bytes;
 };
 
+// Faza 11: one block Master is dropping from its own bookkeeping — either
+// because a file was DELETEd, or because a WRITE overwrote it (the §13.2
+// kind of "orphan" — NOT the §8.34 kind, an unknown-to-Master block a
+// Storage Node reports, which needs Faza 12's inventory/heartbeat
+// reconciliation and is out of scope here). Carries a snapshot of the
+// replicas from BlockMetadata at the moment of removal, since the
+// BlockMetadata entry itself is erased in the same NamespaceManager call
+// that produces this struct — Master needs the replica list afterward to
+// dispatch DELETE_BLOCK. See docs/design.md §15.
+struct OrphanedBlock {
+    BlockId id;
+    std::vector<StorageNodeId> replicas;
+};
+
 #endif  // DFS_MASTER_METADATA_H_

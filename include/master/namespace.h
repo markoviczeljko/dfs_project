@@ -22,7 +22,12 @@ public:
     NamespaceManager& operator=(const NamespaceManager&) = delete;
 
     ErrorCode create_file(const std::string& path);
-    ErrorCode delete_file(const std::string& path);
+
+    // Faza 11: returns the blocks the deleted file owned (with their
+    // replica snapshots) so Master can dispatch DELETE_BLOCK to physically
+    // remove them — see docs/design.md §15. An empty vector (not an error)
+    // means the file had zero blocks.
+    Result<std::vector<OrphanedBlock>> delete_file(const std::string& path);
     Result<FileMetadata> stat_file(const std::string& path) const;
     Result<std::vector<std::string>> list_files(const std::string& path) const;
 
@@ -49,8 +54,16 @@ public:
     // which would otherwise accumulate forever with no way to ever be
     // committed (see docs/design.md §12).
     Result<BlockId> allocate_block(const std::string& path);
-    ErrorCode commit_write(const std::string& path, const std::vector<BlockId>& block_ids,
-                           uint64_t size, uint64_t last_block_size);
+
+    // Faza 11: WRITE overwrites the file's whole block list; the blocks it
+    // replaces are returned as orphans (see delete_file()'s comment above
+    // and docs/design.md §15) so Master can physically clean them up the
+    // same way. Safe to capture unconditionally before the swap: old and
+    // new block-id sets can never overlap, since allocate_block() strictly
+    // increments next_block_id_.
+    Result<std::vector<OrphanedBlock>> commit_write(const std::string& path,
+                                                     const std::vector<BlockId>& block_ids,
+                                                     uint64_t size, uint64_t last_block_size);
 
     // Faza 10: resolves how much of a pending append fits into a file's
     // current last block, optimistically reserving that space (bumping

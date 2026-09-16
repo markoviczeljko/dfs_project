@@ -28,7 +28,9 @@ TEST(NamespaceManagerTest, CreateOnExistingPathFails) {
 TEST(NamespaceManagerTest, DeleteThenStatFails) {
     NamespaceManager ns;
     ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
-    ASSERT_EQ(ns.delete_file("/a.txt"), ErrorCode::OK);
+    auto delete_result = ns.delete_file("/a.txt");
+    ASSERT_TRUE(delete_result.is_ok());
+    EXPECT_TRUE(delete_result.value().empty());
 
     auto stat_result = ns.stat_file("/a.txt");
     ASSERT_TRUE(stat_result.is_error());
@@ -37,7 +39,9 @@ TEST(NamespaceManagerTest, DeleteThenStatFails) {
 
 TEST(NamespaceManagerTest, DeleteNonexistentFails) {
     NamespaceManager ns;
-    EXPECT_EQ(ns.delete_file("/never-created.txt"), ErrorCode::FILE_NOT_FOUND);
+    auto delete_result = ns.delete_file("/never-created.txt");
+    ASSERT_TRUE(delete_result.is_error());
+    EXPECT_EQ(delete_result.error(), ErrorCode::FILE_NOT_FOUND);
 }
 
 TEST(NamespaceManagerTest, StatNonexistentFails) {
@@ -100,6 +104,80 @@ BlockId create_file_with_one_block(NamespaceManager& ns, uint64_t last_block_siz
     return block_id;
 }
 }  // namespace
+
+// Faza 11: delete_file()/commit_write() orphan-block bookkeeping (see
+// docs/design.md §15).
+
+TEST(NamespaceManagerTest, DeleteFileReturnsOrphanedBlocksWithReplicas) {
+    NamespaceManager ns;
+    BlockId block_id = create_file_with_one_block(ns, /*last_block_size=*/100);
+
+    auto delete_result = ns.delete_file("/a.txt");
+    ASSERT_TRUE(delete_result.is_ok());
+    ASSERT_EQ(delete_result.value().size(), 1u);
+    EXPECT_EQ(delete_result.value()[0].id, block_id);
+    EXPECT_EQ(delete_result.value()[0].replicas, (std::vector<StorageNodeId>{1, 2, 3}));
+
+    EXPECT_TRUE(ns.block_metadata(block_id).is_error());
+    EXPECT_EQ(ns.block_metadata(block_id).error(), ErrorCode::BLOCK_NOT_FOUND);
+}
+
+TEST(NamespaceManagerTest, DeleteFileOnZeroBlockFileReturnsEmptyOrphanList) {
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/empty.txt"), ErrorCode::OK);
+
+    auto delete_result = ns.delete_file("/empty.txt");
+    ASSERT_TRUE(delete_result.is_ok());
+    EXPECT_TRUE(delete_result.value().empty());
+}
+
+TEST(NamespaceManagerTest, CommitWriteOnFreshFileWithNoPriorBlocksReturnsEmptyOrphanList) {
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId block_id = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(block_id, {1, 2, 3}), ErrorCode::OK);
+
+    auto commit_result = ns.commit_write("/a.txt", {block_id}, 100, 100);
+    ASSERT_TRUE(commit_result.is_ok());
+    EXPECT_TRUE(commit_result.value().empty());
+}
+
+TEST(NamespaceManagerTest, CommitWriteOverExistingBlocksReturnsOldBlocksAsOrphans) {
+    NamespaceManager ns;
+    BlockId old_block = create_file_with_one_block(ns, /*last_block_size=*/100);
+
+    BlockId new_block = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(new_block, {4, 5, 6}), ErrorCode::OK);
+
+    auto commit_result = ns.commit_write("/a.txt", {new_block}, 50, 50);
+    ASSERT_TRUE(commit_result.is_ok());
+    ASSERT_EQ(commit_result.value().size(), 1u);
+    EXPECT_EQ(commit_result.value()[0].id, old_block);
+    EXPECT_EQ(commit_result.value()[0].replicas, (std::vector<StorageNodeId>{1, 2, 3}));
+
+    EXPECT_TRUE(ns.block_metadata(old_block).is_error());
+    EXPECT_EQ(ns.block_metadata(old_block).error(), ErrorCode::BLOCK_NOT_FOUND);
+
+    auto stat_result = ns.stat_file("/a.txt");
+    ASSERT_TRUE(stat_result.is_ok());
+    EXPECT_EQ(stat_result.value().blocks, (std::vector<BlockId>{new_block}));
+}
+
+TEST(NamespaceManagerTest, CommitWriteFailureLeavesOldBlocksIntact) {
+    NamespaceManager ns;
+    BlockId old_block = create_file_with_one_block(ns, /*last_block_size=*/100);
+
+    // 999 was never allocated for this path, so the pending-set subset
+    // check rejects it before anything is mutated.
+    auto commit_result = ns.commit_write("/a.txt", {999}, 50, 50);
+    ASSERT_TRUE(commit_result.is_error());
+    EXPECT_EQ(commit_result.error(), ErrorCode::INVALID_REQUEST);
+
+    EXPECT_TRUE(ns.block_metadata(old_block).is_ok());
+    auto stat_result = ns.stat_file("/a.txt");
+    ASSERT_TRUE(stat_result.is_ok());
+    EXPECT_EQ(stat_result.value().blocks, (std::vector<BlockId>{old_block}));
+}
 
 TEST(NamespaceManagerTest, ResolveAppendTargetOnEmptyFileReturnsNoTarget) {
     NamespaceManager ns;

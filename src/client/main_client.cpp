@@ -4,6 +4,9 @@
 //   dfs_client --master-host <host> --master-port <port> write <path> <local_source_file>
 //   dfs_client --master-host <host> --master-port <port> read <path> <local_dest_file>
 //   dfs_client --master-host <host> --master-port <port> append <path> <local_source_file>
+//   dfs_client --master-host <host> --master-port <port> delete <path>
+//   dfs_client --master-host <host> --master-port <port> list <path>
+//   dfs_client --master-host <host> --master-port <port> stat <path>
 
 #include <exception>
 #include <fstream>
@@ -23,7 +26,10 @@ void print_usage(const char* argv0) {
               << "  " << argv0
               << " --master-host <host> --master-port <port> read <path> <local_dest_file>\n"
               << "  " << argv0
-              << " --master-host <host> --master-port <port> append <path> <local_source_file>\n";
+              << " --master-host <host> --master-port <port> append <path> <local_source_file>\n"
+              << "  " << argv0 << " --master-host <host> --master-port <port> delete <path>\n"
+              << "  " << argv0 << " --master-host <host> --master-port <port> list <path>\n"
+              << "  " << argv0 << " --master-host <host> --master-port <port> stat <path>\n";
 }
 
 Result<std::vector<uint8_t>> read_local_file(const std::string& path) {
@@ -137,6 +143,44 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "appended " << data_result.value().size() << " bytes to " << positional[1] << "\n";
+        return 0;
+    }
+
+    if (command == "delete" && positional.size() == 2) {
+        ErrorCode result = client->delete_file(positional[1]);
+        if (result != ErrorCode::OK) {
+            std::cerr << "delete failed: error_code=" << static_cast<int>(result) << "\n";
+            return 1;
+        }
+        std::cout << "deleted " << positional[1] << "\n";
+        return 0;
+    }
+
+    if (command == "list" && positional.size() == 2) {
+        auto list_result = client->list(positional[1]);
+        if (list_result.is_error()) {
+            std::cerr << "list failed: error_code=" << static_cast<int>(list_result.error()) << "\n";
+            return 1;
+        }
+        for (const std::string& entry : list_result.value()) {
+            std::cout << entry << "\n";
+        }
+        return 0;
+    }
+
+    if (command == "stat" && positional.size() == 2) {
+        auto stat_result = client->stat(positional[1]);
+        if (stat_result.is_error()) {
+            std::cerr << "stat failed: error_code=" << static_cast<int>(stat_result.error()) << "\n";
+            return 1;
+        }
+        const Client::FileStat& stat = stat_result.value();
+        std::cout << "id=" << stat.id << " size=" << stat.size
+                   << " modification_time=" << stat.modification_time
+                   << " blocks=" << stat.blocks.size() << "\n";
+        for (BlockId block_id : stat.blocks) {
+            std::cout << "  block " << block_id << "\n";
+        }
         return 0;
     }
 

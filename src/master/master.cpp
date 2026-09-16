@@ -5,6 +5,10 @@
 #include <cstring>
 #include <utility>
 
+#include "common/config.h"
+#include "network/connection.h"
+#include "network/socket.h"
+
 namespace {
 
 // Mirrors the ad hoc wire-level helpers in storage_node.cpp — kept local
@@ -141,10 +145,11 @@ Message Master::handle_create_file(const Message& request) {
 
 Message Master::handle_delete_file(const Message& request) {
     std::string path = bytes_to_string(request.payload);
-    ErrorCode result = namespace_manager_.delete_file(path);
-    if (result != ErrorCode::OK) {
-        return make_error(request.request_id, result);
+    auto result = namespace_manager_.delete_file(path);
+    if (result.is_error()) {
+        return make_error(request.request_id, result.error());
     }
+    gc_dispatch(result.value());
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -258,10 +263,11 @@ Message Master::handle_write_commit(const Message& request) {
     }
     uint64_t last_block_size = get_u64(request.payload.data() + offset);
 
-    ErrorCode result = namespace_manager_.commit_write(path, block_ids, size, last_block_size);
-    if (result != ErrorCode::OK) {
-        return make_error(request.request_id, result);
+    auto result = namespace_manager_.commit_write(path, block_ids, size, last_block_size);
+    if (result.is_error()) {
+        return make_error(request.request_id, result.error());
     }
+    gc_dispatch(result.value());
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -441,4 +447,51 @@ Message Master::handle_append_commit(const Message& request) {
         return make_error(request.request_id, result);
     }
     return Message{MessageType::ACK, request.request_id, {}};
+}
+
+uint64_t Master::next_request_id() {
+    return next_request_id_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Master::send_delete_block(StorageNodeId node_id, BlockId block_id) {
+    auto node = storage_registry_.get_node(node_id);
+    if (!node.has_value()) {
+        return false;
+    }
+
+    auto socket_result = Socket::create();
+    if (socket_result.is_error()) {
+        return false;
+    }
+    Socket socket = std::move(socket_result.value());
+    // A node that accepts the connection but never replies would otherwise
+    // block this worker thread (and, transitively, NetworkServer::stop())
+    // forever — see docs/design.md §15.
+    if (ErrorCode err = socket.set_timeout(DELETE_BLOCK_TIMEOUT_MS); err != ErrorCode::OK) {
+        return false;
+    }
+    if (ErrorCode err = socket.connect(node->host, node->port); err != ErrorCode::OK) {
+        return false;
+    }
+    TCPConnection node_connection(std::move(socket));
+
+    std::vector<std::byte> payload;
+    put_u64(payload, block_id);
+    if (!node_connection.sendMessage(
+            Message{MessageType::DELETE_BLOCK, next_request_id(), std::move(payload)})) {
+        return false;
+    }
+    auto response = node_connection.receiveMessage();
+    return response.has_value() && response->type == MessageType::ACK;
+}
+
+void Master::gc_dispatch(const std::vector<OrphanedBlock>& orphans) {
+    // Best-effort: a node that's unreachable or doesn't ACK is skipped,
+    // never surfaced as an error to the DELETE_FILE/WRITE_COMMIT caller —
+    // see docs/design.md §15.
+    for (const OrphanedBlock& orphan : orphans) {
+        for (StorageNodeId node_id : orphan.replicas) {
+            send_delete_block(node_id, orphan.id);
+        }
+    }
 }

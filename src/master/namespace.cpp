@@ -73,20 +73,38 @@ ErrorCode NamespaceManager::create_file(const std::string& path) {
     return ErrorCode::OK;
 }
 
-ErrorCode NamespaceManager::delete_file(const std::string& path) {
+Result<std::vector<OrphanedBlock>> NamespaceManager::delete_file(const std::string& path) {
     auto normalized_result = normalize_path(path);
     if (normalized_result.is_error()) {
-        return normalized_result.error();
+        return Result<std::vector<OrphanedBlock>>::err(normalized_result.error());
     }
 
     std::unique_lock lock(mutex_);
     auto it = files_.find(normalized_result.value());
     if (it == files_.end()) {
-        return ErrorCode::FILE_NOT_FOUND;
+        return Result<std::vector<OrphanedBlock>>::err(ErrorCode::FILE_NOT_FOUND);
     }
+
+    // Snapshot each owned block's replicas before erasing it from blocks_ —
+    // Master needs the replica list afterward to dispatch DELETE_BLOCK, and
+    // once erased here there's no other way to recover it (see
+    // docs/design.md §15). A file.blocks id with no blocks_ entry would be
+    // an invariant violation that should never happen; deliberately a
+    // no-op here rather than an error, matching the same
+    // "if (block_it != blocks_.end())" no-op treatment of that identical
+    // condition a few lines below in commit_write()'s COMMITTED-state loop.
+    std::vector<OrphanedBlock> orphans;
+    for (BlockId id : it->second.blocks) {
+        auto block_it = blocks_.find(id);
+        if (block_it != blocks_.end()) {
+            orphans.push_back(OrphanedBlock{id, block_it->second.replicas});
+            blocks_.erase(block_it);
+        }
+    }
+
     files_.erase(it);
     pending_blocks_.erase(normalized_result.value());
-    return ErrorCode::OK;
+    return Result<std::vector<OrphanedBlock>>::ok(std::move(orphans));
 }
 
 Result<FileMetadata> NamespaceManager::stat_file(const std::string& path) const {
@@ -145,19 +163,19 @@ Result<BlockId> NamespaceManager::allocate_block(const std::string& path) {
     return Result<BlockId>::ok(id);
 }
 
-ErrorCode NamespaceManager::commit_write(const std::string& path,
-                                          const std::vector<BlockId>& block_ids, uint64_t size,
-                                          uint64_t last_block_size) {
+Result<std::vector<OrphanedBlock>> NamespaceManager::commit_write(
+    const std::string& path, const std::vector<BlockId>& block_ids, uint64_t size,
+    uint64_t last_block_size) {
     auto normalized_result = normalize_path(path);
     if (normalized_result.is_error()) {
-        return normalized_result.error();
+        return Result<std::vector<OrphanedBlock>>::err(normalized_result.error());
     }
     const std::string& normalized = normalized_result.value();
 
     std::unique_lock lock(mutex_);
     auto it = files_.find(normalized);
     if (it == files_.end()) {
-        return ErrorCode::FILE_NOT_FOUND;
+        return Result<std::vector<OrphanedBlock>>::err(ErrorCode::FILE_NOT_FOUND);
     }
 
     // Every id being committed must have been allocated for this path at
@@ -169,7 +187,7 @@ ErrorCode NamespaceManager::commit_write(const std::string& path,
     for (BlockId id : block_ids) {
         if (pending_it == pending_blocks_.end() ||
             pending_it->second.find(id) == pending_it->second.end()) {
-            return ErrorCode::INVALID_REQUEST;
+            return Result<std::vector<OrphanedBlock>>::err(ErrorCode::INVALID_REQUEST);
         }
     }
     // Clear the whole pending set, not just the committed ids — any
@@ -181,6 +199,22 @@ ErrorCode NamespaceManager::commit_write(const std::string& path,
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+
+    // Faza 11: the blocks this WRITE is about to replace become orphans —
+    // captured (with their replicas) and erased from blocks_ before the
+    // swap below, so Master can physically clean them up afterward. Safe
+    // unconditionally: block_ids can never contain any of these, since
+    // allocate_block() strictly increments next_block_id_ (see
+    // docs/design.md §15). A missing blocks_ entry is a no-op here, same
+    // reasoning as delete_file() above.
+    std::vector<OrphanedBlock> orphans;
+    for (BlockId id : it->second.blocks) {
+        auto old_block_it = blocks_.find(id);
+        if (old_block_it != blocks_.end()) {
+            orphans.push_back(OrphanedBlock{id, old_block_it->second.replicas});
+            blocks_.erase(old_block_it);
+        }
+    }
 
     // WRITE overwrites — the blocks list is replaced wholesale, in the
     // caller-given order, which is the file's byte order (see
@@ -205,7 +239,7 @@ ErrorCode NamespaceManager::commit_write(const std::string& path,
             last_it->second.reserved_size = last_block_size;
         }
     }
-    return ErrorCode::OK;
+    return Result<std::vector<OrphanedBlock>>::ok(std::move(orphans));
 }
 
 ErrorCode NamespaceManager::set_block_replicas(BlockId block_id,

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -12,8 +13,10 @@
 #include <thread>
 #include <vector>
 
+#include "common/config.h"
 #include "master/master.h"
 #include "network/connection.h"
+#include "network/network_server.h"
 #include "network/socket.h"
 
 namespace {
@@ -133,6 +136,79 @@ void register_three_nodes(TCPConnection& client) {
         ASSERT_TRUE(resp.has_value());
         ASSERT_EQ(resp->type, MessageType::ACK);
     }
+}
+
+// Faza 11: a fake Storage Node that just records the block ids of every
+// DELETE_BLOCK it receives and ACKs them, so gc_dispatch()'s behavior can be
+// observed directly (see docs/design.md §15).
+struct RecordingNode {
+    std::mutex mutex;
+    std::vector<BlockId> deleted_block_ids;
+    std::unique_ptr<NetworkServer> server;
+
+    static std::unique_ptr<RecordingNode> start(uint16_t port) {
+        auto node = std::make_unique<RecordingNode>();
+        RecordingNode* self = node.get();
+        auto result = NetworkServer::create(port, [self](const Message& request) -> Message {
+            if (request.type == MessageType::DELETE_BLOCK &&
+                request.payload.size() == sizeof(uint64_t)) {
+                BlockId block_id = get_u64(request.payload.data());
+                std::lock_guard<std::mutex> lock(self->mutex);
+                self->deleted_block_ids.push_back(block_id);
+            }
+            return Message{MessageType::ACK, request.request_id, request.payload};
+        });
+        EXPECT_TRUE(result.is_ok());
+        node->server = std::move(result.value());
+        EXPECT_EQ(node->server->start(), ErrorCode::OK);
+        return node;
+    }
+
+    bool received(BlockId block_id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::find(deleted_block_ids.begin(), deleted_block_ids.end(), block_id) !=
+               deleted_block_ids.end();
+    }
+};
+
+// A fake Storage Node that accepts the connection but never replies within
+// sleep_ms — regression coverage for send_delete_block()'s I/O timeout (see
+// docs/design.md §15).
+struct HangingNode {
+    std::unique_ptr<NetworkServer> server;
+
+    static std::unique_ptr<HangingNode> start(uint16_t port, int sleep_ms) {
+        auto node = std::make_unique<HangingNode>();
+        auto result = NetworkServer::create(port, [sleep_ms](const Message& request) -> Message {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+            return Message{MessageType::ACK, request.request_id, {}};
+        });
+        EXPECT_TRUE(result.is_ok());
+        node->server = std::move(result.value());
+        EXPECT_EQ(node->server->start(), ErrorCode::OK);
+        return node;
+    }
+};
+
+// Registers 3 RecordingNodes (ids 1-3) at the given ports and REGISTER_NODEs
+// them with master over client — like register_three_nodes(), but backed by
+// real listening servers so DELETE_BLOCK dispatch can be observed.
+std::vector<std::unique_ptr<RecordingNode>> register_three_recording_nodes(
+    TCPConnection& client, uint16_t port1, uint16_t port2, uint16_t port3) {
+    std::vector<std::unique_ptr<RecordingNode>> nodes;
+    nodes.push_back(RecordingNode::start(port1));
+    nodes.push_back(RecordingNode::start(port2));
+    nodes.push_back(RecordingNode::start(port3));
+
+    uint16_t ports[3] = {port1, port2, port3};
+    for (uint64_t i = 0; i < 3; ++i) {
+        EXPECT_TRUE(client.sendMessage(make_register_node_request(
+            800 + i, i + 1, "127.0.0.1", ports[i], /*capacity_bytes=*/1024)));
+        auto resp = client.receiveMessage();
+        EXPECT_TRUE(resp.has_value());
+        EXPECT_EQ(resp->type, MessageType::ACK);
+    }
+    return nodes;
 }
 
 }  // namespace
@@ -840,4 +916,149 @@ TEST_F(MasterTest, ReadFileOnNonexistentFileFails) {
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
     EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::FILE_NOT_FOUND);
+}
+
+// Faza 11: DELETE_FILE / WRITE_COMMIT-overwrite orphan-block GC dispatch
+// (see docs/design.md §15).
+
+TEST_F(MasterTest, DeleteFileDispatchesDeleteBlockToAllRegisteredReplicas) {
+    start_master(38033);
+    TCPConnection client = connect_client(38033);
+    auto nodes = register_three_recording_nodes(client, 38133, 38134, 38135);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/10, 10)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::DELETE_FILE, 4, "/a.txt")));
+    auto delete_resp = client.receiveMessage();
+    ASSERT_TRUE(delete_resp.has_value());
+    EXPECT_EQ(delete_resp->type, MessageType::ACK);
+
+    for (auto& node : nodes) {
+        EXPECT_TRUE(node->received(block_id));
+    }
+}
+
+TEST_F(MasterTest, DeleteFileWithUnreachableReplicaStillReturnsAckToClient) {
+    // register_three_nodes() points at ports nothing listens on — exercises
+    // the best-effort/non-fatal dispatch policy (see docs/design.md §15).
+    start_master(38034);
+    TCPConnection client = connect_client(38034);
+    register_three_nodes(client);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/10, 10)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::DELETE_FILE, 4, "/a.txt")));
+    auto delete_resp = client.receiveMessage();
+    ASSERT_TRUE(delete_resp.has_value());
+    EXPECT_EQ(delete_resp->type, MessageType::ACK);
+}
+
+TEST_F(MasterTest, WriteCommitOverwriteDispatchesDeleteBlockForOldBlocksOnly) {
+    start_master(38035);
+    TCPConnection client = connect_client(38035);
+    auto nodes = register_three_recording_nodes(client, 38136, 38137, 38138);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto first_alloc = client.receiveMessage();
+    ASSERT_TRUE(first_alloc.has_value());
+    BlockId old_block = get_u64(first_alloc->payload.data());
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {old_block}, /*size=*/10, 10)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 4, "/a.txt")));
+    auto second_alloc = client.receiveMessage();
+    ASSERT_TRUE(second_alloc.has_value());
+    BlockId new_block = get_u64(second_alloc->payload.data());
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(5, "/a.txt", {new_block}, /*size=*/5, 5)));
+    auto overwrite_resp = client.receiveMessage();
+    ASSERT_TRUE(overwrite_resp.has_value());
+    EXPECT_EQ(overwrite_resp->type, MessageType::ACK);
+
+    for (auto& node : nodes) {
+        EXPECT_TRUE(node->received(old_block));
+        EXPECT_FALSE(node->received(new_block));
+    }
+}
+
+TEST_F(MasterTest, DeleteNonexistentFileReturnsErrorWithoutDispatch) {
+    start_master(38036);
+    TCPConnection client = connect_client(38036);
+    auto nodes = register_three_recording_nodes(client, 38139, 38140, 38141);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::DELETE_FILE, 1, "/nope.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::FILE_NOT_FOUND);
+
+    for (auto& node : nodes) {
+        std::lock_guard<std::mutex> lock(node->mutex);
+        EXPECT_TRUE(node->deleted_block_ids.empty());
+    }
+}
+
+TEST_F(MasterTest, DeleteFileWithHangingReplicaCompletesWithinBoundedTime) {
+    // Regression test for the CRITICAL fix to send_delete_block()'s
+    // previously-unbounded blocking recv(): a node that accepts the
+    // connection but never replies within DELETE_BLOCK_TIMEOUT_MS must not
+    // hang the worker thread handling the client's DELETE_FILE forever (see
+    // docs/design.md §15).
+    start_master(38037);
+    TCPConnection client = connect_client(38037);
+
+    auto hanging_node = HangingNode::start(38142, DELETE_BLOCK_TIMEOUT_MS + 500);
+    auto fast_node_a = RecordingNode::start(38143);
+    auto fast_node_b = RecordingNode::start(38144);
+
+    ASSERT_TRUE(client.sendMessage(make_register_node_request(
+        850, /*node_id=*/1, "127.0.0.1", 38142, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_register_node_request(
+        851, /*node_id=*/2, "127.0.0.1", 38143, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_register_node_request(
+        852, /*node_id=*/3, "127.0.0.1", 38144, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/10, 10)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::DELETE_FILE, 4, "/a.txt")));
+    auto delete_resp = client.receiveMessage();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    ASSERT_TRUE(delete_resp.has_value());
+    EXPECT_EQ(delete_resp->type, MessageType::ACK);
+    // Bounded by ~DELETE_BLOCK_TIMEOUT_MS for the one hanging replica, plus
+    // slack for the two fast replicas — nowhere near "forever".
+    EXPECT_LT(elapsed, std::chrono::milliseconds(DELETE_BLOCK_TIMEOUT_MS * 2));
 }

@@ -1,6 +1,7 @@
 #ifndef DFS_MASTER_MASTER_H_
 #define DFS_MASTER_MASTER_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -49,11 +50,28 @@ private:
     Message handle_append_commit(const Message& request);
     static Message make_error(uint64_t request_id, ErrorCode error);
 
+    // Faza 11: best-effort physical cleanup of blocks DELETE_FILE/WRITE
+    // overwrite just dropped from the namespace. Synchronous — the caller's
+    // ACK isn't sent until every DELETE_BLOCK attempt has been made — and
+    // non-fatal: a node that's unreachable or doesn't ACK is skipped, never
+    // turned into an error for the client. See docs/design.md §15.
+    void gc_dispatch(const std::vector<OrphanedBlock>& orphans);
+    // Opens a fresh connection to node_id and sends DELETE_BLOCK(block_id).
+    // Returns true only on an ACK response; false for an unknown node,
+    // connect failure, or any non-ACK response.
+    bool send_delete_block(StorageNodeId node_id, BlockId block_id);
+    uint64_t next_request_id();
+
     Config config_;
     NamespaceManager namespace_manager_;
     StorageRegistry storage_registry_;
     ReplicationManager replication_manager_;
     std::unique_ptr<NetworkServer> network_server_;
+    // Atomic: unlike Client (single-threaded/CLI use), Master's NetworkServer
+    // is thread-per-connection, so concurrent DELETE_FILE/WRITE_COMMIT
+    // requests can call next_request_id() from different threads at once
+    // (see docs/design.md §15).
+    std::atomic<uint64_t> next_request_id_{1};
 };
 
 #endif  // DFS_MASTER_MASTER_H_

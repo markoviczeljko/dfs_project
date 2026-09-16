@@ -119,6 +119,94 @@ ErrorCode Client::create_file(const std::string& path) {
     return error_from_payload(response.payload);
 }
 
+ErrorCode Client::delete_file(const std::string& path) {
+    Message request{MessageType::DELETE_FILE, next_request_id(), string_to_bytes(path)};
+    auto result = call_master(request);
+    if (result.is_error()) {
+        return result.error();
+    }
+    const Message& response = result.value();
+    if (response.type == MessageType::ACK) {
+        return ErrorCode::OK;
+    }
+    return error_from_payload(response.payload);
+}
+
+Result<std::vector<std::string>> Client::list(const std::string& path) {
+    Message request{MessageType::LIST_FILES, next_request_id(), string_to_bytes(path)};
+    auto result = call_master(request);
+    if (result.is_error()) {
+        return Result<std::vector<std::string>>::err(result.error());
+    }
+    const Message& response = result.value();
+    if (response.type != MessageType::ACK) {
+        return Result<std::vector<std::string>>::err(error_from_payload(response.payload));
+    }
+
+    // Wire format: [u32 count]{[u32 name_len][name]} x count (see
+    // Master::handle_list_files, docs/design.md §15).
+    const std::vector<std::byte>& payload = response.payload;
+    if (payload.size() < sizeof(uint32_t)) {
+        return Result<std::vector<std::string>>::err(ErrorCode::INTERNAL_ERROR);
+    }
+    uint32_t count = get_u32(payload.data());
+    size_t offset = sizeof(uint32_t);
+    std::vector<std::string> entries;
+    entries.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (payload.size() < offset + sizeof(uint32_t)) {
+            return Result<std::vector<std::string>>::err(ErrorCode::INTERNAL_ERROR);
+        }
+        uint32_t name_length = get_u32(payload.data() + offset);
+        offset += sizeof(uint32_t);
+        if (payload.size() < offset + name_length) {
+            return Result<std::vector<std::string>>::err(ErrorCode::INTERNAL_ERROR);
+        }
+        entries.emplace_back(reinterpret_cast<const char*>(payload.data() + offset), name_length);
+        offset += name_length;
+    }
+    if (payload.size() != offset) {
+        return Result<std::vector<std::string>>::err(ErrorCode::INTERNAL_ERROR);
+    }
+    return Result<std::vector<std::string>>::ok(std::move(entries));
+}
+
+Result<Client::FileStat> Client::stat(const std::string& path) {
+    Message request{MessageType::STAT_FILE, next_request_id(), string_to_bytes(path)};
+    auto result = call_master(request);
+    if (result.is_error()) {
+        return Result<FileStat>::err(result.error());
+    }
+    const Message& response = result.value();
+    if (response.type != MessageType::ACK) {
+        return Result<FileStat>::err(error_from_payload(response.payload));
+    }
+
+    // Wire format: [u64 id][u64 size][u64 mtime][u32 block_count]
+    // {u64 block_id} x block_count (see Master::handle_stat_file,
+    // docs/design.md §15).
+    const std::vector<std::byte>& payload = response.payload;
+    size_t offset = 3 * sizeof(uint64_t) + sizeof(uint32_t);
+    if (payload.size() < offset) {
+        return Result<FileStat>::err(ErrorCode::INTERNAL_ERROR);
+    }
+    FileStat stat_result;
+    stat_result.id = get_u64(payload.data());
+    stat_result.size = get_u64(payload.data() + sizeof(uint64_t));
+    stat_result.modification_time = get_u64(payload.data() + 2 * sizeof(uint64_t));
+    uint32_t block_count = get_u32(payload.data() + 3 * sizeof(uint64_t));
+
+    if (payload.size() != offset + static_cast<size_t>(block_count) * sizeof(uint64_t)) {
+        return Result<FileStat>::err(ErrorCode::INTERNAL_ERROR);
+    }
+    stat_result.blocks.reserve(block_count);
+    for (uint32_t i = 0; i < block_count; ++i) {
+        stat_result.blocks.push_back(get_u64(payload.data() + offset));
+        offset += sizeof(uint64_t);
+    }
+    return Result<FileStat>::ok(std::move(stat_result));
+}
+
 Result<std::vector<Client::ReplicaLocation>> Client::parse_replica_list(
     const std::vector<std::byte>& payload, size_t& offset, uint32_t count) {
     std::vector<ReplicaLocation> replicas;

@@ -43,6 +43,22 @@ public:
     // Faza 10: appends data to the end of path. See docs/design.md §14.
     ErrorCode append(const std::string& path, const std::vector<uint8_t>& data);
 
+    // Faza 11: removes path and, best-effort, the physical blocks it owned
+    // from every replica. See docs/design.md §15.
+    ErrorCode delete_file(const std::string& path);
+
+    // Faza 11: immediate children of path (one level, not recursive — see
+    // docs/design.md §12/§15).
+    Result<std::vector<std::string>> list(const std::string& path);
+
+    struct FileStat {
+        FileId id;
+        uint64_t size;
+        uint64_t modification_time;
+        std::vector<BlockId> blocks;
+    };
+    Result<FileStat> stat(const std::string& path);
+
 private:
     struct ReplicaLocation {
         std::string host;
