@@ -91,6 +91,47 @@ TEST(FailureDetectorTest, OnNodeDeadFiresExactlyOnceForOneFailure) {
     EXPECT_EQ(calls, (std::vector<StorageNodeId>{1}));
 }
 
+TEST(FailureDetectorTest, ClearNotificationAllowsOnNodeDeadToFireAgainForSameNode) {
+    // Bugfix regression: without clear_notification(), a node's SECOND
+    // death would never re-fire on_node_dead_ once notified_dead_ already
+    // contains its id from the first death — silently defeating recovery
+    // for any node that dies more than once in a Master's lifetime (see
+    // docs/design.md §16).
+    StorageRegistry registry;
+    registry.register_node(make_node(1));
+
+    std::mutex calls_mutex;
+    std::vector<StorageNodeId> calls;
+    FailureDetector detector(
+        registry,
+        [&](StorageNodeId id) {
+            std::lock_guard<std::mutex> lock(calls_mutex);
+            calls.push_back(id);
+        },
+        kSuspectedTimeout, kDeadTimeout, kSweepInterval);
+    detector.start();
+
+    // First death.
+    std::this_thread::sleep_for(kSuspectedTimeout + kDeadTimeout + kDeadTimeout);
+    {
+        std::lock_guard<std::mutex> lock(calls_mutex);
+        ASSERT_EQ(calls, (std::vector<StorageNodeId>{1}));
+    }
+
+    // Reconciliation promotes it back to HEALTHY (as
+    // Master::handle_node_inventory() does) and clears the notification.
+    registry.set_state(1, NodeState::HEALTHY);
+    ASSERT_EQ(detector.process_heartbeat(1), ErrorCode::OK);
+    detector.clear_notification(1);
+
+    // Second death — must fire on_node_dead_ again, not just once total.
+    std::this_thread::sleep_for(kSuspectedTimeout + kDeadTimeout + kDeadTimeout);
+    detector.stop();
+
+    std::lock_guard<std::mutex> lock(calls_mutex);
+    EXPECT_EQ(calls, (std::vector<StorageNodeId>{1, 1}));
+}
+
 TEST(FailureDetectorTest, ProcessHeartbeatOnUnknownNodeReturnsNodeNotFound) {
     StorageRegistry registry;
     FailureDetector detector(registry);

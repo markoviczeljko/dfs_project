@@ -1,11 +1,61 @@
 #include <gtest/gtest.h>
 
+#include <endian.h>
+
+#include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
 
 #include "master/metadata_store.h"
+
+namespace {
+
+// Same CRC-32 (IEEE 802.3, 0xEDB88320) as MetadataStore's own — duplicated
+// here (matching this project's convention of duplicating small
+// wire-format helpers per module) to construct a deliberately malicious
+// but still CRC-valid snapshot for the reserve()-bounds regression test
+// below.
+uint32_t compute_crc32(const std::vector<std::byte>& data) {
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (std::byte b : data) {
+        crc = table[(crc ^ static_cast<uint8_t>(b)) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+void put_u16(std::vector<std::byte>& buf, uint16_t value) {
+    uint16_t be = htobe16(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+void put_u32(std::vector<std::byte>& buf, uint32_t value) {
+    uint32_t be = htobe32(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+void put_u64(std::vector<std::byte>& buf, uint64_t value) {
+    uint64_t be = htobe64(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+}  // namespace
 
 class MetadataStoreTest : public ::testing::Test {
 protected:
@@ -136,6 +186,38 @@ TEST_F(MetadataStoreTest, LoadOnCorruptedSnapshotReturnsEmptyStateNotError) {
     ASSERT_TRUE(load_result.is_ok());  // corrupted => treated as fresh, never a hard error
     EXPECT_TRUE(load_result.value().files.empty());
     EXPECT_EQ(load_result.value().next_file_id, 1u);
+}
+
+TEST_F(MetadataStoreTest, LoadWithHugeCountFieldDoesNotCrashOrThrow) {
+    // Bugfix regression: .reserve(count) used to be called directly on an
+    // unvalidated on-disk count field. A crafted (still CRC-valid — CRC32
+    // isn't cryptographically secure) snapshot with an absurd file_count
+    // and no actual entries after it used to throw
+    // std::length_error/bad_alloc, an uncaught exception that would crash
+    // Master at startup — directly contradicting load()'s own documented
+    // "a corrupted snapshot never refuses to boot" contract (see
+    // docs/design.md §16).
+    auto result = MetadataStore::create(dir_);
+    ASSERT_TRUE(result.is_ok());
+    auto store = std::move(result.value());
+
+    std::vector<std::byte> buf;
+    put_u32(buf, 0x4D455453);   // magic "METS"
+    put_u16(buf, 1);            // format_version
+    put_u64(buf, 1);            // next_file_id
+    put_u64(buf, 1);            // next_block_id
+    put_u32(buf, 0xFFFFFFFFu);  // file_count — bogus, far beyond remaining bytes
+    // (deliberately truncated here — no actual file entries follow)
+    put_u32(buf, compute_crc32(buf));
+
+    std::ofstream file(snapshot_path(), std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    file.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+    file.close();
+
+    auto load_result = store->load();
+    ASSERT_TRUE(load_result.is_ok());  // must not throw or crash
+    EXPECT_TRUE(load_result.value().files.empty());  // truncated mid-parse — discarded
 }
 
 TEST_F(MetadataStoreTest, MultipleSavesOverwritePreviousSnapshot) {

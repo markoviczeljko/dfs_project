@@ -29,6 +29,11 @@ ErrorCode FailureDetector::process_heartbeat(StorageNodeId id) {
     return registry_.record_heartbeat(id);
 }
 
+void FailureDetector::clear_notification(StorageNodeId id) {
+    std::lock_guard<std::mutex> lock(notified_mutex_);
+    notified_dead_.erase(id);
+}
+
 void FailureDetector::sweep_loop() {
     std::unique_lock lock(cv_mutex_);
     while (running_.load()) {

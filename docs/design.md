@@ -1328,3 +1328,70 @@ kroz Master restart) rekonsilira ispravno u oba slučaja istovremeno.
 191/191 → **193/193** testova prolazi (184 stari + 9 nov: 5 u
 `test_metadata_store.cpp`, 3 u `test_master.cpp`, 1 integration u
 `test_recovery.cpp`), čisto pod ASan/UBSan.
+
+**Nezavisan `cpp-reviewer` agent na CIJELOJ Fazi 12 (sva 4 pod-koraka
+zajedno) — 2 HIGH + 2 MEDIUM nalaza, sva 4 popravljena** (isti obrazac kao
+Faze 10/11 — bar jedan netrivijalan nalaz očekivan i ovaj put potvrđen):
+
+- **HIGH: `FailureDetector::notified_dead_` se nikad nije čistio, pa DRUGO
+  umiranje istog čvora tiho nikad ne bi pokrenulo recovery.** 12.1-ov
+  komentar je ovo eksplicitno najavio kao "NOTE for Faza 12.3", ali 12.3/12.4
+  nikad nisu dodali stvarnu kuku. Scenario: čvor umre → `on_node_dead_`
+  se okine → `notified_dead_` ga zapamti → 12.3-ova `NODE_INVENTORY`
+  rekonsilijacija ga promoviše nazad u `HEALTHY` → isti čvor OPET umre
+  (drugi pravi pad, realno za dugotrajan klaster) → `notified_dead_.insert(X).second`
+  je već `false` → `RecoveryManager::handle_node_failure()` se nikad
+  ponovo ne pozove → njegovi blokovi ostaju trajno under-replicated, bez
+  ijedne greške ili log linije. Popravljeno: nova
+  `FailureDetector::clear_notification(StorageNodeId)`, pozvana iz
+  `Master::handle_node_inventory()` odmah nakon
+  `storage_registry_.set_state(node_id, NodeState::HEALTHY)`. Regresioni
+  test: `FailureDetectorTest.ClearNotificationAllowsOnNodeDeadToFireAgainForSameNode`
+  (prva smrt → promocija → `clear_notification()` → druga smrt → potvrđeno
+  da `on_node_dead_` puca DVA puta, ne jednom).
+- **HIGH: `StorageNode::send_inventory()` i `register_with_master()` nisu
+  imali `Socket::set_timeout()`**, za razliku od svake druge nove odlazne
+  konekcije ove faze (heartbeat sender, obje `COPY_BLOCK` noge) — baš ta
+  lekcija koju je Faza 11 već naučila (§16.2's "KRITIČNA lekcija") promašena
+  je na ova dva mjesta. Master koji prihvati konekciju ali nikad ne
+  odgovori bi zauvijek objesio `StorageNode::start()` (ili
+  `heartbeat_loop()`-ovu reaktivnu `send_inventory()`). Popravljeno: nova
+  `MASTER_RPC_TIMEOUT_MS = 5000` konstanta (`common/config.h`), primijenjena
+  na oba poziva. Regresioni test:
+  `StorageNodeTest.StartTimesOutRatherThanHangingWhenMasterNeverReplies`
+  (fake "Master" koji prihvati konekciju pa nikad ne odgovori — potvrđeno
+  da `start()` vrati grešku za ~5s, ne zauvijek).
+- **MEDIUM: `handle_node_inventory()`-ova provjera verzije je tiho
+  ignorisala `reported_version > known_version` slučaj** (samo `<` i `==`
+  su bili obrađeni). Može se desiti ako je fizički upis stigao na SVE
+  replike (strict 3/3, nikad djelimično) ali je sam `APPEND_COMMIT` ka
+  Master-u izgubljen/istekao (`APPEND_COMMIT_WAIT_TIMEOUT_MS`) — Master-ova
+  verzija nikad ne sustigne stvarnu, i nijedan budući inventory izvještaj
+  to nikad ne prijavi. Popravljeno: dodat `else` grana koja loguje anomaliju
+  (stderr) — namjerno BEZ automatske korekcije, jer `NODE_INVENTORY`-ov
+  `(block_id, version, checksum)` izvještaj ne nosi dovoljno informacije
+  (nema `size`/`reserved_size`) da se bezbjedno rekonstruiše ostatak
+  `BlockMetadata`-e; slijepo "sustizanje" verzije bez tih polja moglo bi
+  ostaviti `reserved_size` zastarelim i pokvariti offset-računicu
+  narednog append-a. Regresioni test:
+  `MasterTest.NodeInventoryVersionAheadOfMasterIsLoggedWithoutAction`.
+- **MEDIUM: `MetadataStore::load()` je pozivao `.reserve(count)` na
+  neprovjerenim on-disk count poljima PRIJE bilo kakve provjere granica** —
+  u suprotnosti sa sopstvenim dokumentovanim obećanjem ("oštećen snapshot
+  nikad ne obara Master"). CRC32 nije kriptografski siguran (trivijalno
+  krivotvoriv za bilo koga sa lokalnim pristupom `metadata_dir`-u), pa
+  namjerno napravljen (i dalje CRC-validan) snapshot sa ogromnim count
+  poljem (npr. `0xFFFFFFFF`) baca neuhvaćen `std::length_error`/`bad_alloc`
+  i ruši Master pri startu. Popravljeno: nova `Reader::bounded_count()`
+  metoda — pošto svaki element treba bar 1 preostali bajt, stvarni count
+  nikad ne može biti veći od bajtova koji su stvarno ostali u baferu; sva 4
+  `.reserve()` poziva (`state.files`, `file.blocks`, `state.blocks`,
+  `metadata.replicas`, `state.nodes`) sad prolaze kroz ovu granicu.
+  Regresioni test: `MetadataStoreTest.LoadWithHugeCountFieldDoesNotCrashOrThrow`
+  (ručno-napravljen CRC-validan snapshot sa `file_count=0xFFFFFFFF` i
+  odsječenim tijelom — potvrđeno da `load()` vrati prazno stanje umjesto da
+  baci exception).
+
+193/193 → **197/197** testova prolazi (4 nova regresiona testa, jedan po
+nalazu), čisto pod ASan/UBSan (uključujući ponovljenu punu ASan/UBSan
+provjeru nakon ovih popravki).

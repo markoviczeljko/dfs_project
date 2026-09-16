@@ -36,6 +36,12 @@ constexpr int FAILURE_SWEEP_INTERVAL_MS = 500;
 // accepts the connection but never replies must not hang the heartbeat
 // thread forever.
 constexpr int HEARTBEAT_SEND_TIMEOUT_MS = 1000;
+// Bugfix: bounds StorageNode's outbound REGISTER_NODE and NODE_INVENTORY
+// calls to Master — same rationale as HEARTBEAT_SEND_TIMEOUT_MS/
+// COPY_BLOCK_TIMEOUT_MS, missed on these two call sites when they were
+// first written. A Master that accepts the connection but never replies
+// must not hang StorageNode::start()/heartbeat_loop() forever.
+constexpr int MASTER_RPC_TIMEOUT_MS = 5000;
 
 // Faza 12.2: recovery / re-replication + idempotency (see docs/design.md
 // §16).

@@ -1215,6 +1215,39 @@ TEST_F(MasterTest, NodeInventoryMarksStaleReplicaForResync) {
     EXPECT_FALSE(nodes[0]->received_copy_block(block_id));  // never itself as the source
 }
 
+TEST_F(MasterTest, NodeInventoryVersionAheadOfMasterIsLoggedWithoutAction) {
+    // Bugfix regression: reported_version > known_version used to be
+    // silently ignored entirely (no branch handled it at all). Now it's
+    // logged as an anomaly — this test confirms the ACK still comes back
+    // and, crucially, that nothing destructive or incorrect happens: no
+    // COPY_BLOCK (that would be resync logic for the OPPOSITE, stale
+    // case), no DELETE_BLOCK (that's the == case's over-replication
+    // cleanup) — see docs/design.md §16.
+    start_master(38161);
+    TCPConnection client = connect_client(38161);
+    auto nodes = register_three_recording_nodes(client, 38162, 38163, 38164);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+    // Freshly allocated — Master's known version is 1.
+
+    ASSERT_TRUE(client.sendMessage(
+        make_node_inventory_request(3, /*node_id=*/1, {InventoryEntry{block_id, /*version=*/2, 0}})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+
+    for (auto& node : nodes) {
+        std::lock_guard<std::mutex> lock(node->mutex);
+        EXPECT_TRUE(node->deleted_block_ids.empty());
+        EXPECT_TRUE(node->copy_block_ids.empty());
+    }
+}
+
 // Faza 12.4: Master persistence + restart (see docs/design.md §16).
 
 TEST_F(MasterTest, MasterRestartPreservesNamespaceAndBlockMetadata) {

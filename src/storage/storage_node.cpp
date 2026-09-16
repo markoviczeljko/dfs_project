@@ -120,6 +120,12 @@ ErrorCode StorageNode::register_with_master() {
         return socket_result.error();
     }
     Socket socket = std::move(socket_result.value());
+    // Bugfix: a Master that accepts the connection but never replies must
+    // not hang start() forever — same rationale as HEARTBEAT_SEND_TIMEOUT_MS
+    // (see docs/design.md §16).
+    if (ErrorCode err = socket.set_timeout(MASTER_RPC_TIMEOUT_MS); err != ErrorCode::OK) {
+        return err;
+    }
     if (ErrorCode err = socket.connect(config_.master_host, config_.master_port); err != ErrorCode::OK) {
         return err;
     }
@@ -155,6 +161,12 @@ ErrorCode StorageNode::send_inventory() {
         return socket_result.error();
     }
     Socket socket = std::move(socket_result.value());
+    // Bugfix: same rationale as register_with_master() above — a Master
+    // that accepts the connection but never replies must not hang the
+    // caller forever (see docs/design.md §16).
+    if (ErrorCode err = socket.set_timeout(MASTER_RPC_TIMEOUT_MS); err != ErrorCode::OK) {
+        return err;
+    }
     if (ErrorCode err = socket.connect(config_.master_host, config_.master_port); err != ErrorCode::OK) {
         return err;
     }

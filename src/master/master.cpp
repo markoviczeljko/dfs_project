@@ -486,10 +486,36 @@ Message Master::handle_node_inventory(const Message& request) {
                 send_delete_block(node_id, block_id);
                 namespace_manager_.remove_replica(block_id, node_id);
             }
+        } else {
+            // reported_version > known_version: the replica's on-disk
+            // content is AHEAD of what Master's own bookkeeping believes
+            // was committed — can happen if a WRITE/APPEND's data-plane
+            // fill landed on every replica (write_chunk_to_replicas()
+            // requires strict 3/3, so this is never a partial write) but
+            // the final COMMIT round-trip to Master was lost or timed out
+            // (APPEND_COMMIT_WAIT_TIMEOUT_MS). BlockMetadata also carries
+            // size/reserved_size, which this NODE_INVENTORY report's
+            // (block_id, version, checksum) tuple doesn't — there isn't
+            // enough information here to safely reconstruct the rest of
+            // that state (blindly bumping just the version could leave
+            // size/reserved_size stale and corrupt a future append's
+            // offset calculation), so this is logged as an anomaly rather
+            // than silently ignored or auto-corrected (see docs/design.md
+            // §16).
+            std::cerr << "NODE_INVENTORY: node " << node_id << " reports block " << block_id
+                       << " at version " << reported_version
+                       << ", ahead of Master's known version " << known_version
+                       << " (anomaly, no automatic action taken)\n";
         }
     }
 
     storage_registry_.set_state(node_id, NodeState::HEALTHY);
+    // Bugfix: a node promoted back to HEALTHY here might die again later —
+    // without clearing this, FailureDetector's single-fire dedup
+    // (notified_dead_) would never learn this promotion happened, and a
+    // SECOND death of the same node would silently never re-trigger
+    // recovery (see docs/design.md §16).
+    failure_detector_.clear_notification(node_id);
     return Message{MessageType::ACK, request.request_id, {}};
 }
 

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <system_error>
@@ -171,6 +172,20 @@ struct Reader {
         offset += len;
         return s;
     }
+
+    // Bugfix: a count field read straight off (untrusted) disk must never
+    // be handed directly to std::vector::reserve() — a crafted snapshot
+    // with a valid CRC32 (CRC32 isn't cryptographically secure) but an
+    // absurd count field (e.g. 0xFFFFFFFF) would otherwise throw
+    // std::length_error/bad_alloc and crash Master at startup, defeating
+    // this whole function's "never refuse to boot" contract. Since each
+    // element needs at least 1 remaining byte, the true count can never
+    // exceed the bytes actually left in the buffer — a safe, cheap upper
+    // bound that doesn't require knowing each container's real per-element
+    // size (see docs/design.md §16).
+    size_t bounded_count(uint32_t requested) const {
+        return std::min<size_t>(requested, offset <= size ? size - offset : 0);
+    }
 };
 
 }  // namespace
@@ -333,7 +348,7 @@ Result<MetadataStore::LoadedState> MetadataStore::load() {
     state.next_block_id = reader.u64();
 
     uint32_t file_count = reader.u32();
-    state.files.reserve(file_count);
+    state.files.reserve(reader.bounded_count(file_count));
     for (uint32_t i = 0; i < file_count && reader.ok; ++i) {
         FileMetadata file{};
         file.id = reader.u64();
@@ -341,7 +356,7 @@ Result<MetadataStore::LoadedState> MetadataStore::load() {
         file.size = reader.u64();
         file.modification_time = reader.u64();
         uint32_t block_count = reader.u32();
-        file.blocks.reserve(block_count);
+        file.blocks.reserve(reader.bounded_count(block_count));
         for (uint32_t b = 0; b < block_count && reader.ok; ++b) {
             file.blocks.push_back(reader.u64());
         }
@@ -350,7 +365,7 @@ Result<MetadataStore::LoadedState> MetadataStore::load() {
     }
 
     uint32_t block_count = reader.ok ? reader.u32() : 0;
-    state.blocks.reserve(block_count);
+    state.blocks.reserve(reader.bounded_count(block_count));
     for (uint32_t i = 0; i < block_count && reader.ok; ++i) {
         BlockId block_id = reader.u64();
         BlockMetadata metadata{};
@@ -360,7 +375,7 @@ Result<MetadataStore::LoadedState> MetadataStore::load() {
         metadata.version = reader.u64();
         metadata.state = static_cast<BlockState>(reader.u8());
         uint32_t replica_count = reader.u32();
-        metadata.replicas.reserve(replica_count);
+        metadata.replicas.reserve(reader.bounded_count(replica_count));
         for (uint32_t r = 0; r < replica_count && reader.ok; ++r) {
             metadata.replicas.push_back(reader.u64());
         }
@@ -369,7 +384,7 @@ Result<MetadataStore::LoadedState> MetadataStore::load() {
     }
 
     uint32_t node_count = reader.ok ? reader.u32() : 0;
-    state.nodes.reserve(node_count);
+    state.nodes.reserve(reader.bounded_count(node_count));
     for (uint32_t i = 0; i < node_count && reader.ok; ++i) {
         StorageNodeInfo node{};
         node.id = reader.u64();

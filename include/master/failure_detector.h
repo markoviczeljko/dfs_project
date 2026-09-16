@@ -58,6 +58,14 @@ public:
     // not reach past it into the registry it manages.
     ErrorCode process_heartbeat(StorageNodeId id);
 
+    // Faza 12.3 bugfix: erases id's single-fire DEAD notification marker.
+    // MUST be called by whatever promotes a node back out of DEAD
+    // (currently only Master::handle_node_inventory()'s reconciliation),
+    // or a SECOND failure of the same node silently never re-fires
+    // on_node_dead_ again — see the NOTE this replaces above and
+    // docs/design.md §16.
+    void clear_notification(StorageNodeId id);
+
 private:
     void sweep_loop();
     void check_timeouts();
@@ -73,14 +81,13 @@ private:
     std::condition_variable cv_;
     std::atomic<bool> running_{false};
 
-    // A DEAD node stays DEAD in this sub-phase — nothing here promotes it
-    // back (that's Faza 12.3's inventory-reconciliation job), so this only
-    // needs to track "have we already fired on_node_dead_ for this id" to
-    // guarantee single-fire without re-notifying on every sweep tick.
-    // NOTE for Faza 12.3: once reconciliation can promote a DEAD node back
-    // to HEALTHY, whatever does that promotion must also erase the id from
-    // here (a currently-nonexistent hook), or a SECOND failure of the same
-    // node will silently never re-fire on_node_dead_.
+    // A DEAD node stays DEAD until something promotes it back (Faza 12.3's
+    // NODE_INVENTORY reconciliation) — this tracks "have we already fired
+    // on_node_dead_ for this id" to guarantee single-fire without
+    // re-notifying on every sweep tick between the DEAD transition and
+    // that promotion. clear_notification() is the hook the promotion path
+    // uses to reset this, so a SECOND failure of the same node still
+    // fires on_node_dead_ again.
     std::mutex notified_mutex_;
     std::unordered_set<StorageNodeId> notified_dead_;
 };

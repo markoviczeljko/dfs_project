@@ -2,14 +2,18 @@
 
 #include <endian.h>
 
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "common/config.h"
 #include "master/master.h"
 #include "network/connection.h"
+#include "network/network_server.h"
 #include "network/socket.h"
 #include "storage/storage_node.h"
 
@@ -74,6 +78,26 @@ ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
     return static_cast<ErrorCode>(get_u16(payload.data()));
 }
 
+// A fake Master that accepts the connection but never replies — regression
+// coverage for register_with_master()/send_inventory()'s missing
+// Socket::set_timeout() (bugfix: see docs/design.md §16, cpp-reviewer
+// finding — same pattern as MasterTest's HangingNode in test_master.cpp).
+struct HangingMaster {
+    std::unique_ptr<NetworkServer> server;
+
+    static std::unique_ptr<HangingMaster> start(uint16_t port, int sleep_ms) {
+        auto master = std::make_unique<HangingMaster>();
+        auto result = NetworkServer::create(port, [sleep_ms](const Message& request) -> Message {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+            return Message{MessageType::ACK, request.request_id, {}};
+        });
+        EXPECT_TRUE(result.is_ok());
+        master->server = std::move(result.value());
+        EXPECT_EQ(master->server->start(), ErrorCode::OK);
+        return master;
+    }
+};
+
 }  // namespace
 
 class StorageNodeTest : public ::testing::Test {
@@ -126,6 +150,25 @@ protected:
     std::unique_ptr<Master> master_;
     std::unique_ptr<StorageNode> node_;
 };
+
+TEST_F(StorageNodeTest, StartTimesOutRatherThanHangingWhenMasterNeverReplies) {
+    // Bugfix regression: register_with_master() had no Socket::set_timeout()
+    // — before the fix, this test would hang forever instead of returning
+    // (see docs/design.md §16, cpp-reviewer finding).
+    auto hanging_master = HangingMaster::start(38170, MASTER_RPC_TIMEOUT_MS + 1500);
+
+    StorageNode::Config config{1, 38171, dir_, 1024 * 1024, "127.0.0.1", "127.0.0.1", 38170};
+    auto result = StorageNode::create(config);
+    ASSERT_TRUE(result.is_ok());
+    node_ = std::move(result.value());
+
+    auto start_time = std::chrono::steady_clock::now();
+    ErrorCode start_result = node_->start();
+    auto elapsed = std::chrono::steady_clock::now() - start_time;
+
+    EXPECT_NE(start_result, ErrorCode::OK);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(MASTER_RPC_TIMEOUT_MS * 2));
+}
 
 TEST_F(StorageNodeTest, WriteThenReadReturnsSameBytes) {
     start_node(37001);
