@@ -57,4 +57,9 @@ constexpr int COPY_BLOCK_TIMEOUT_MS = 5000;
 // up, not forever.
 constexpr size_t OPERATION_LOG_CAPACITY = 1024;
 
+// Faza 13: Client-side block cache default capacity (see docs/design.md
+// §17) — §9.14 of the design notes uses 512 MB as its sizing example (~8
+// blocks at the default 64 MB BLOCK_SIZE).
+constexpr uint64_t DEFAULT_CLIENT_CACHE_BYTES = 512ULL * 1024 * 1024;
+
 #endif  // DFS_COMMON_CONFIG_H_

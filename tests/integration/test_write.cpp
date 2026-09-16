@@ -220,9 +220,10 @@ TEST_F(WriteIntegrationTest, WriteReplicatesBlockToAllThreeNodes) {
 
         std::vector<std::byte> payload;
         put_u64(payload, block_id);
+        put_u64(payload, /*known_version=*/0);
         ASSERT_TRUE(connection.sendMessage(Message{MessageType::READ_BLOCK, 1, std::move(payload)}));
         auto resp = connection.receiveMessage();
         ASSERT_TRUE(resp.has_value());
-        EXPECT_EQ(resp->type, MessageType::ACK) << "block missing on port " << port;
+        EXPECT_EQ(resp->type, MessageType::READ_OK) << "block missing on port " << port;
     }
 }

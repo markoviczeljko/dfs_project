@@ -55,6 +55,21 @@ public:
         uint64_t version;
     };
     Result<BlockInfo> get_block_info(BlockId id) const;
+
+    // Faza 13: version-check-then-read, atomic under a single lock
+    // acquisition (see docs/design.md §17 — cpp-reviewer finding). Doing
+    // this as get_block_info() followed by a separate read_block() call
+    // would let a concurrent write land between the two, producing a
+    // response whose version and data don't actually correspond to the
+    // same on-disk state. not_modified is true (data left empty) when
+    // known_version matches the current version; known_version == 0 never
+    // matches (real versions start at 1, see docs/design.md §16).
+    struct ConditionalReadResult {
+        bool not_modified;
+        uint64_t version;
+        std::vector<uint8_t> data;
+    };
+    Result<ConditionalReadResult> read_block_if_changed(BlockId id, uint64_t known_version);
     // Snapshot of every block currently on disk — used to build a
     // NODE_INVENTORY report (Faza 12.3) and by RecoveryManager/tests to
     // confirm a node's actual contents without going through read_block()

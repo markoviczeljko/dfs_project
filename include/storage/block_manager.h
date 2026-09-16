@@ -38,6 +38,9 @@ public:
     Result<BlockStorage::BlockInfo> get_block_info(BlockId id) const;
     std::vector<std::pair<BlockId, BlockStorage::BlockInfo>> enumerate_blocks() const;
 
+    // Faza 13: see BlockStorage::read_block_if_changed.
+    Result<BlockStorage::ConditionalReadResult> read_block_if_changed(BlockId id, uint64_t known_version);
+
 private:
     explicit BlockManager(std::unique_ptr<BlockStorage> storage);
 

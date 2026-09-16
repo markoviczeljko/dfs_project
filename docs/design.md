@@ -1395,3 +1395,140 @@ Faze 10/11 — bar jedan netrivijalan nalaz očekivan i ovaj put potvrđen):
 193/193 → **197/197** testova prolazi (4 nova regresiona testa, jedan po
 nalazu), čisto pod ASan/UBSan (uključujući ponovljenu punu ASan/UBSan
 provjeru nakon ovih popravki).
+
+## 17. Faza 13 — Client Cache (§9 u potpunosti)
+
+Block-level LRU keš unutar `Client`-a (`include/client/cache.h`,
+`src/client/cache.cpp`) — čista optimizacija, nikad izvor istine (§9.32).
+Nema cross-client koherencije (§9.13, eksplicitno van scope-a): keš postoji
+samo unutar jednog `Client` procesa, koji je jedini sposoban da mutira
+blokove koje sam kešira.
+
+**Ključna odluka o conditional READ-u naspram Definicije gotovog**: §9.6-§9.8
+opisuju conditional `READ_BLOCK` (`known_version` → `NOT_MODIFIED`/`READ_OK`)
+kao validacioni mehanizam, što i dalje ide na mrežu (samo ne prenosi podatke).
+Ali plan-ova sopstvena Definicija gotovog za ovu fazu eksplicitno traži da
+ponovljeni READ istog bloka **ne** proizvede dodatni Storage Node network
+poziv — jače od conditional-GET modela. Razrešeno ovako: budući da je jedan
+`Client` jedini pisac blokova koje sam kešira i već ih invalidira na svaki
+uspješan WRITE/APPEND (§9.9-§9.11), cache hit je uvijek validan bez
+revalidacije. `Client::read()` na pogodak vraća podatak direktno, bez ijednog
+mrežnog poziva. Conditional `READ_BLOCK` wire mehanizam (`known_version`,
+`READ_OK`, `NOT_MODIFIED` — sve tri već rezervisane u `MessageType`-u od Faze
+1, nikad ranije korišćene) je ipak potpuno implementiran na Storage Node
+strani (`StorageNode::handle_read_block()`, provjerava verziju preko
+`BlockManager::get_block_info()` prije čitanja podatka sa diska, izbjegavajući
+nepotreban disk I/O na `NOT_MODIFIED`), pošto je eksplicitno imenovan kao
+deliverable u §9.8. Testiran je direktno protiv `StorageNode`-a
+(`StorageNodeTest.ReadBlockWithMatchingKnownVersionReturnsNotModified`/
+`...StaleKnownVersionReturnsFullData`). Client ga trenutno poziva samo sa
+`known_version=0` na cache-miss putanji (siguran sentinel — verzije uvijek
+kreću od 1, §16.1) — nikad sa nenultom vrijednošću, jer za to nema
+legitimnog poziva unutar single-client modela ove faze. Isti obrazac kao
+Faza 12's "over-replication test coverage" napomena: izgrađen-ali-neiskorišćen
+mehanizam, dokumentovan eksplicitno umjesto tiho izostavljen.
+
+**Jedini stvarni coherence hazard unutar jednog Client-a**: `append()` može
+proširiti *postojeći* poslednji blok fajla in-place (isti `BlockId`, novi
+sadržaj na kraju, §6.10/Faza 12.3-ov `AppendTarget`) — zato `Client::append()`
+zove `cache_.invalidate(existing_block_id)` nakon uspješnog `APPEND_COMMIT`-a.
+`Client::write()` overwrite uvijek alocira potpuno nove `BlockId`-eve (Faza 11
+semantika), pa je njegova invalidacija bezopasan no-op — primijenjena radi
+doslednosti sa §9.9-§9.11-ovom bukvalnom "WRITE → invalidate" politikom i
+otpornosti na buduću promjenu te semantike.
+
+**`ClientCache`** (§9.16-§9.21): `std::list<BlockId>` LRU red +
+`std::unordered_map<BlockId, Entry>`, `Entry` čuva iterator za O(1)
+move-to-front. Jedan `std::mutex`, kritična sekcija samo oko mape/liste —
+`get()`/`put()`/`invalidate()` nikad ne rade I/O, pa Client sam obezbjeđuje
+"unlock prije mrežnog poziva" pravilo (§9.19-§9.20) time što zove `get()`
+PRIJE i `put()` TEK POSLIJE mrežnog poziva. Edge slučaj: pojedinačni blok
+veći od `max_bytes_` se ipak kešira sam (nema drugih entrija za evikciju) —
+namjerno pojednostavljenje. Statistika (`CacheStats`: hits/misses/evictions/
+invalidations/bytes_served) je samo interni brojač u `ClientCache`-u — nema
+stvarnog `StatisticsManager`-a još (potvrđeno grep-om, ne postoji nigdje u
+kodu; Faza 14 ga tek uvodi).
+
+`Client::Config` dobija `cache_max_bytes` (default `DEFAULT_CLIENT_CACHE_BYTES`
+= 512 MB, §9.14-ov primjer), novi field na kraju strukture — postojeći
+pozicioni `Client::Config{...}` pozivi u testovima ostaju nepromijenjeni.
+
+Wire format: `READ_BLOCK` request `[u64 block_id]` → `[u64 block_id][u64
+known_version]`. Odgovor mijenja tip sa generičkog `ACK` na `READ_OK{[u64
+version][u32 data_size][data]}` ili `NOT_MODIFIED{[u64 version]}` — `Master`-ov
+`READ_FILE` odgovor se ne mijenja (Client ne treba per-block verziju od
+Master-a, dobija je direktno od Storage Node-a pri svakom stvarnom fetch-u).
+
+**Testovi**: `tests/unit/test_cache.cpp` (nov, 10 testova — čist `ClientCache`
+bez mreže, uključujući §9.15-ov tačan LRU primjer `A B C D`, pristup
+`A,C,A,B` → `D` evikovan); `tests/unit/test_storage_node.cpp` proširen sa 2
+nova conditional-READ testa (i 3 postojeća READ_BLOCK poziva ažurirana za
+novi wire format); `tests/integration/test_read.cpp` proširen sa 2 nova
+scenarija preko pravog klastera:
+`RepeatReadHitsCacheAndSurvivesAllStorageNodesStopped` (ugasi SVE storage
+node-ove poslije prvog READ-a — drugi READ i dalje uspijeva, jače od bilo kog
+brojača) i `AppendInvalidatesCachedBlockSoReadSeesNewContent` (append pa READ
+vraća prošireni, ne stari keširan sadržaj).
+
+211/211 testova prolazi (14 novih: 10 `test_cache` + 2 `test_storage_node` + 2
+`test_read`), čisto pod ASan/UBSan.
+
+**Nezavisan `cpp-reviewer` na cijeloj Fazi 13 — 1 HIGH + 1 MEDIUM + 2 LOW
+nalaza, sva 4 popravljena**:
+
+- **HIGH: `StorageNode::handle_read_block()` je provjeravao verziju i
+  čitao podatak kao DVA odvojena zaključavanja** (`get_block_info()` pa
+  `read_block()`), pa je konkurentan pisac mogao da izvrši cijeli WRITE
+  između njih — rezultat: `READ_OK` čiji `version` opisuje stanje PRIJE
+  te pisanje, a `data` opisuje stanje POSLIJE. Potvrđeno ručnim
+  reprodukcionim skriptom van test suite-a: 2000 iteracija istog obrasca
+  (dva odvojena `get_block_info()`+`read_block()` poziva) je pouzdano
+  proizvelo mismatch, dok popravljena verzija (jedno zaključavanje) —
+  nula mismatch-eva. Popravljeno: nova `BlockStorage::read_block_if_changed(id,
+  known_version)` (i `BlockManager` passthrough) koja radi provjeru verzije
+  i čitanje podatka pod JEDNIM `shared_lock`-om — vraća `{not_modified,
+  version, data}` odjednom, i to je jedino mjesto odakle
+  `handle_read_block()` sad čita. Regresioni test:
+  `BlockStorageTest.ReadBlockIfChangedNeverMixesVersionFromOneWriteWithDataFromAnother`
+  (writer thread taguje svaki upis sopstvenom verzijom kao sadržaj bloka;
+  reader thread provjerava da vraćeni `(version, data)` par UVIJEK
+  odgovara — 500 iteracija, čisto).
+- **MEDIUM: `Client::append()` je invalidirao keširani target blok TEK
+  poslije uspješnog `APPEND_COMMIT`-a**, iako fill-write fizički mijenja
+  taj blok na disku RANIJE, prije komit poziva. Ako fill-write uspije ali
+  `APPEND_COMMIT` otkaže (mrežni pad, Master timeout), `append()` vraća
+  grešku, ali keširani (sad zastarjeli) sadržaj bloka ostaje netaknut —
+  širi rizik oko invarijante "keš se mijenja samo u skladu sa
+  Master-commit-ovanim stanjem" bez trenutno dohvatljivog puta koji bi ga
+  stvarno servirao pogrešno (Master-ova metapodaci su isto tako
+  neažurirani do komita, pa se dva "pogrešna" pogleda trenutno slažu), ali
+  je pravi propust u redoslijedu. Popravljeno: `cache_.invalidate(existing_block_id)`
+  premješteno odmah nakon uspješnog fill-write-a (linija ~459), ne poslije
+  komita — invalidacija je jeftina i idempotentna, nema razloga da čeka.
+  **Bez posvećenog failure-injection regresionog testa** — namjerno
+  zaobiđeno pravljenje test-only kuke za deterministično kvarenje SAMO
+  `APPEND_COMMIT`-a poslije uspješnog fill-write-a preko pravog klastera
+  (isti presedan kao Faza 12-ova "over-replication test coverage"
+  napomena — testabilno samo preko backdoor-a koji ništa drugo ne bi
+  koristio); pokrivenost dolazi od koda same popravke (jednostavno
+  premještanje jedne linije, provjereno kompajliranjem+postojećim
+  `AppendInvalidatesCachedBlockSoReadSeesNewContent` testom da opšte
+  ponašanje ostaje ispravno) i eksplicitno dokumentovanog rezonovanja
+  ovdje.
+- **LOW: `CacheEntry::last_access` se pisao na svaki hit a nikad nigdje
+  nije čitan** (LRU redosled dolazi isključivo iz `lru_list_`/splice, ne
+  iz timestamp-a). Uklonjen — namjerno odstupanje od §9.16-ovog doslovnog
+  `CacheEntry` struct-a (koji uključuje `lastAccess`), isti presedan kao
+  `FileMetadata`-ino izostavljanje `replication_factor`-a (§12.2): polje
+  bez ijedne stvarne upotrebe se ne drži samo da bi pratilo spec dijagram.
+- **LOW: `ClientCache::get()` kopira cijeli blok podataka DOK je `mutex_`
+  još zaključan** — nije živ bug danas (`Client` je dokumentovano
+  single-threaded), ali `ClientCache` sama po sebi nema tu napomenu u
+  svom headeru. Popravljeno dokumentacionim komentarom na `get()`
+  (`include/client/cache.h`) koji eksplicitno imenuje trade-off i kad bi
+  trebalo revizitovati (ako se `ClientCache` ikad podijeli između
+  thread-ova) — bez spekulativnog `shared_ptr<const vector>` refaktora
+  koji trenutno ništa ne rješava.
+
+216/216 testova prolazi (5 novih regresionih: 5 u `test_block_storage.cpp`),
+čisto pod ASan/UBSan (ponovljena puna provjera nakon ovih popravki).

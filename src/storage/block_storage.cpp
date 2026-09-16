@@ -359,6 +359,26 @@ Result<BlockStorage::BlockInfo> BlockStorage::get_block_info(BlockId id) const {
     return Result<BlockInfo>::ok(BlockInfo{it->second.size, it->second.checksum, it->second.version});
 }
 
+Result<BlockStorage::ConditionalReadResult> BlockStorage::read_block_if_changed(
+    BlockId id, uint64_t known_version) {
+    std::shared_lock lock(mutex_);
+    auto it = local_blocks_.find(id);
+    if (it == local_blocks_.end()) {
+        return Result<ConditionalReadResult>::err(ErrorCode::BLOCK_NOT_FOUND);
+    }
+    uint64_t current_version = it->second.version;
+    if (known_version != 0 && known_version == current_version) {
+        return Result<ConditionalReadResult>::ok(ConditionalReadResult{true, current_version, {}});
+    }
+
+    auto data_result = read_block_locked(id);
+    if (data_result.is_error()) {
+        return Result<ConditionalReadResult>::err(data_result.error());
+    }
+    return Result<ConditionalReadResult>::ok(
+        ConditionalReadResult{false, current_version, std::move(data_result.value())});
+}
+
 std::vector<std::pair<BlockId, BlockStorage::BlockInfo>> BlockStorage::enumerate_blocks() const {
     std::shared_lock lock(mutex_);
     std::vector<std::pair<BlockId, BlockInfo>> blocks;

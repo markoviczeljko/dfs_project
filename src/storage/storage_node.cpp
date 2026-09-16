@@ -338,24 +338,40 @@ Message StorageNode::handle_write_block(const Message& request) {
 }
 
 Message StorageNode::handle_read_block(const Message& request) {
-    if (request.payload.size() != kBlockIdSize) {
+    // Faza 13: [u64 block_id][u64 known_version] (see docs/design.md §17).
+    // known_version == 0 is a safe "nothing cached" sentinel — real block
+    // versions always start at 1 (see namespace.cpp).
+    if (request.payload.size() != kBlockIdSize + kBlockVersionSize) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 
     BlockId block_id = get_u64(request.payload.data());
-    auto result = block_manager_->read_block(block_id);
+    uint64_t known_version = get_u64(request.payload.data() + kBlockIdSize);
+
+    // Faza 13 (cpp-reviewer fix): version-check and data-read must happen
+    // under one lock acquisition, or a concurrent write between two
+    // separate calls (get_block_info() then read_block()) could produce a
+    // READ_OK whose version and data don't correspond to the same on-disk
+    // state (see docs/design.md §17).
+    auto result = block_manager_->read_block_if_changed(block_id, known_version);
     if (result.is_error()) {
         return make_error(request.request_id, result.error());
     }
+    const auto& conditional = result.value();
 
-    const std::vector<uint8_t>& data = result.value();
+    if (conditional.not_modified) {
+        std::vector<std::byte> response_payload;
+        put_u64(response_payload, conditional.version);
+        return Message{MessageType::NOT_MODIFIED, request.request_id, std::move(response_payload)};
+    }
+
     std::vector<std::byte> response_payload;
-    put_u64(response_payload, block_id);
-    put_u32(response_payload, static_cast<uint32_t>(data.size()));
-    const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data());
-    response_payload.insert(response_payload.end(), data_bytes, data_bytes + data.size());
+    put_u64(response_payload, conditional.version);
+    put_u32(response_payload, static_cast<uint32_t>(conditional.data.size()));
+    const auto* data_bytes = reinterpret_cast<const std::byte*>(conditional.data.data());
+    response_payload.insert(response_payload.end(), data_bytes, data_bytes + conditional.data.size());
 
-    return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
+    return Message{MessageType::READ_OK, request.request_id, std::move(response_payload)};
 }
 
 Message StorageNode::handle_delete_block(const Message& request) {

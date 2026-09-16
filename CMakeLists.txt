@@ -43,6 +43,7 @@ target_link_libraries(master PUBLIC common network Threads::Threads)
 
 add_library(client
     src/client/client.cpp
+    src/client/cache.cpp
 )
 target_include_directories(client PUBLIC include)
 target_link_libraries(client PUBLIC common network Threads::Threads)

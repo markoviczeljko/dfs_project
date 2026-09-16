@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "client/cache.h"
 #include "common/config.h"
 #include "common/errors.h"
 #include "common/types.h"
@@ -30,6 +31,11 @@ public:
         // never need to know what chunk size was used (see docs/design.md
         // §12).
         uint64_t block_size = BLOCK_SIZE;
+
+        // Faza 13: max bytes the Client's block cache may hold (see
+        // docs/design.md §17). Tests may shrink this to exercise eviction
+        // cheaply.
+        uint64_t cache_max_bytes = DEFAULT_CLIENT_CACHE_BYTES;
     };
 
     static Result<std::unique_ptr<Client>> create(Config config);
@@ -105,6 +111,8 @@ private:
     TCPConnection master_connection_;
     uint64_t next_request_id_ = 1;
     std::mt19937_64 operation_id_rng_{std::random_device{}()};
+    // Faza 13: block-level read cache (see docs/design.md §17).
+    ClientCache cache_;
 };
 
 #endif  // DFS_CLIENT_CLIENT_H_

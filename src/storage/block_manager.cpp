@@ -50,3 +50,8 @@ Result<BlockStorage::BlockInfo> BlockManager::get_block_info(BlockId id) const {
 std::vector<std::pair<BlockId, BlockStorage::BlockInfo>> BlockManager::enumerate_blocks() const {
     return storage_->enumerate_blocks();
 }
+
+Result<BlockStorage::ConditionalReadResult> BlockManager::read_block_if_changed(BlockId id,
+                                                                                  uint64_t known_version) {
+    return storage_->read_block_if_changed(id, known_version);
+}

@@ -46,6 +46,12 @@ enum class MessageType : uint16_t {
     GET_BLOCK_INFO,
 
     // Client <-> Storage Node (data plane)
+    // Faza 13: READ_BLOCK request carries [block_id][known_version];
+    // Storage Node replies READ_OK{version,data} if known_version doesn't
+    // match its on-disk version (or is 0, meaning "nothing cached"), or
+    // NOT_MODIFIED{version} if it does (see docs/design.md §17, design
+    // notes §9.8). STALE_VERSION stays reserved/unused — no call site
+    // needs it yet.
     READ_BLOCK,
     WRITE_BLOCK,
     READ_OK,

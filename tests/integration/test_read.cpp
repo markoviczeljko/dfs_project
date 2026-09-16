@@ -140,6 +140,53 @@ TEST_F(ReadIntegrationTest, ReadAfterOverwriteWithFewerBlocksReturnsNewContentOn
     EXPECT_EQ(read_result.value(), small_data);
 }
 
+// Faza 13: a cache hit must never touch the network (see docs/design.md
+// §17) — proved here more strongly than a hit counter could: after the
+// first read populates the cache, every Storage Node holding the block is
+// stopped, yet the second read of the same file still succeeds with
+// byte-identical data.
+TEST_F(ReadIntegrationTest, RepeatReadHitsCacheAndSurvivesAllStorageNodesStopped) {
+    start_cluster(40270, 40271, 40272, 40273);
+
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+    std::vector<uint8_t> data = {11, 22, 33, 44, 55};
+    ASSERT_EQ(client_->write("/a.txt", data), ErrorCode::OK);
+
+    auto first_read = client_->read("/a.txt");
+    ASSERT_TRUE(first_read.is_ok());
+    EXPECT_EQ(first_read.value(), data);
+
+    for (auto& node : storage_nodes_) node->stop();
+
+    auto second_read = client_->read("/a.txt");
+    ASSERT_TRUE(second_read.is_ok());
+    EXPECT_EQ(second_read.value(), data);
+}
+
+// Faza 13: append() extends the file's existing last block in place (same
+// BlockId, more data) — the one real cache-coherence hazard within a single
+// Client (see docs/design.md §17). A read after append must return the
+// extended content, not the stale pre-append bytes that were cached.
+TEST_F(ReadIntegrationTest, AppendInvalidatesCachedBlockSoReadSeesNewContent) {
+    start_cluster(40280, 40281, 40282, 40283);
+
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+    std::vector<uint8_t> original = {1, 2, 3};
+    ASSERT_EQ(client_->write("/a.txt", original), ErrorCode::OK);
+
+    auto first_read = client_->read("/a.txt");
+    ASSERT_TRUE(first_read.is_ok());
+    EXPECT_EQ(first_read.value(), original);
+
+    std::vector<uint8_t> appended = {4, 5};
+    ASSERT_EQ(client_->append("/a.txt", appended), ErrorCode::OK);
+
+    std::vector<uint8_t> expected = {1, 2, 3, 4, 5};
+    auto second_read = client_->read("/a.txt");
+    ASSERT_TRUE(second_read.is_ok());
+    EXPECT_EQ(second_read.value(), expected);
+}
+
 TEST_F(ReadIntegrationTest, ReadFallsBackToSurvivingReplicaAfterOneNodeStops) {
     // Faza 9's own "definition of done" node-failure check: kill one of 3
     // Storage Node processes (here, stop one in-process StorageNode

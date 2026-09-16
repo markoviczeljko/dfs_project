@@ -75,7 +75,9 @@ ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
 }  // namespace
 
 Client::Client(Config config, TCPConnection master_connection)
-    : config_(std::move(config)), master_connection_(std::move(master_connection)) {}
+    : config_(std::move(config)),
+      master_connection_(std::move(master_connection)),
+      cache_(config_.cache_max_bytes) {}
 
 Result<std::unique_ptr<Client>> Client::create(Config config) {
     auto socket_result = Socket::create();
@@ -378,6 +380,15 @@ ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& dat
     if (commit_result.value().type != MessageType::ACK) {
         return error_from_payload(commit_result.value().payload);
     }
+
+    // Faza 13: invalidate any cache entry for these block ids now that
+    // they're committed under new content (see docs/design.md §17). write()
+    // always allocates brand-new BlockIds (Faza 11 overwrite semantics), so
+    // this is a no-op today — kept for symmetry with append()'s real hazard
+    // and to stay correct if that ever changes.
+    for (BlockId block_id : block_ids) {
+        cache_.invalidate(block_id);
+    }
     return ErrorCode::OK;
 }
 
@@ -446,6 +457,15 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
             if (write_err != ErrorCode::OK) {
                 return write_err;
             }
+            // Faza 13 (cpp-reviewer fix): invalidate right after the fill
+            // physically lands, not after APPEND_COMMIT succeeds. The
+            // Storage Node's on-disk bytes for this block are already
+            // stale-for-the-cache at this point regardless of whether the
+            // commit that follows succeeds or fails — waiting for the
+            // commit left a window where a commit failure would return an
+            // error while leaving this entry's now-wrong cached bytes in
+            // place (see docs/design.md §17).
+            cache_.invalidate(existing_block_id);
         }
     } else if (target_response.payload.size() != resp_offset) {
         return ErrorCode::INTERNAL_ERROR;
@@ -499,6 +519,14 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
     }
     if (commit_result.value().type != MessageType::ACK) {
         return error_from_payload(commit_result.value().payload);
+    }
+
+    // Faza 13: invalidate any newly allocated blocks (no-op today — see
+    // write()'s comment above — kept for symmetry). The existing target
+    // block, if any, was already invalidated right after its fill write
+    // landed, above.
+    for (BlockId block_id : new_block_ids) {
+        cache_.invalidate(block_id);
     }
     return ErrorCode::OK;
 }
@@ -581,6 +609,15 @@ Result<std::vector<uint8_t>> Client::read(const std::string& path) {
     std::vector<uint8_t> result;
     result.reserve(total_size);
     for (const BlockLocations& block : blocks) {
+        // Faza 13: a cache hit is trusted unconditionally and never touches
+        // the network — this Client is the sole writer of blocks it
+        // caches, and already invalidates them on its own successful
+        // write()/append() (see docs/design.md §17).
+        if (auto cached = cache_.get(block.block_id); cached.has_value()) {
+            result.insert(result.end(), cached->data.begin(), cached->data.end());
+            continue;
+        }
+
         bool block_read = false;
         for (const Location& location : block.replicas) {
             auto socket_result = Socket::create();
@@ -593,19 +630,24 @@ Result<std::vector<uint8_t>> Client::read(const std::string& path) {
             }
             TCPConnection node_connection(std::move(socket));
 
+            // known_version=0: this is a cache miss, so there is nothing to
+            // validate against — always fetch the full block (see
+            // docs/design.md §17).
             std::vector<std::byte> read_payload;
             put_u64(read_payload, block.block_id);
+            put_u64(read_payload, /*known_version=*/0);
             if (!node_connection.sendMessage(
                     Message{MessageType::READ_BLOCK, next_request_id(), std::move(read_payload)})) {
                 continue;
             }
             auto read_response = node_connection.receiveMessage();
-            if (!read_response.has_value() || read_response->type != MessageType::ACK) {
+            if (!read_response.has_value() || read_response->type != MessageType::READ_OK) {
                 continue;
             }
             if (read_response->payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
                 continue;
             }
+            uint64_t version = get_u64(read_response->payload.data());
             uint32_t data_size = get_u32(read_response->payload.data() + sizeof(uint64_t));
             size_t data_offset = sizeof(uint64_t) + sizeof(uint32_t);
             if (read_response->payload.size() != data_offset + data_size) {
@@ -613,8 +655,10 @@ Result<std::vector<uint8_t>> Client::read(const std::string& path) {
             }
 
             const auto* block_bytes = read_response->payload.data() + data_offset;
-            result.insert(result.end(), reinterpret_cast<const uint8_t*>(block_bytes),
-                           reinterpret_cast<const uint8_t*>(block_bytes) + data_size);
+            std::vector<uint8_t> block_data(reinterpret_cast<const uint8_t*>(block_bytes),
+                                             reinterpret_cast<const uint8_t*>(block_bytes) + data_size);
+            cache_.put(block.block_id, version, block_data);
+            result.insert(result.end(), block_data.begin(), block_data.end());
             block_read = true;
             break;
         }

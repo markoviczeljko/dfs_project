@@ -74,6 +74,16 @@ Message make_block_id_request(MessageType type, uint64_t request_id, BlockId blo
     return Message{type, request_id, std::move(payload)};
 }
 
+// Faza 13: READ_BLOCK's payload also carries known_version (see
+// docs/design.md §17) — 0 means "nothing cached", never matches a real
+// on-disk version (versions start at 1).
+Message make_read_block_request(uint64_t request_id, BlockId block_id, uint64_t known_version) {
+    std::vector<std::byte> payload;
+    put_u64(payload, block_id);
+    put_u64(payload, known_version);
+    return Message{MessageType::READ_BLOCK, request_id, std::move(payload)};
+}
+
 ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
     return static_cast<ErrorCode>(get_u16(payload.data()));
 }
@@ -181,16 +191,16 @@ TEST_F(StorageNodeTest, WriteThenReadReturnsSameBytes) {
     EXPECT_EQ(write_resp->type, MessageType::ACK);
     EXPECT_EQ(write_resp->request_id, 100u);
 
-    ASSERT_TRUE(client.sendMessage(make_block_id_request(MessageType::READ_BLOCK, 101, 1)));
+    ASSERT_TRUE(client.sendMessage(make_read_block_request(101, /*block_id=*/1, /*known_version=*/0)));
     auto read_resp = client.receiveMessage();
     ASSERT_TRUE(read_resp.has_value());
-    EXPECT_EQ(read_resp->type, MessageType::ACK);
+    EXPECT_EQ(read_resp->type, MessageType::READ_OK);
     EXPECT_EQ(read_resp->request_id, 101u);
 
     ASSERT_GE(read_resp->payload.size(), sizeof(uint64_t) + sizeof(uint32_t));
-    BlockId returned_id = get_u64(read_resp->payload.data());
+    uint64_t returned_version = get_u64(read_resp->payload.data());
     uint32_t returned_size = get_u32(read_resp->payload.data() + sizeof(uint64_t));
-    EXPECT_EQ(returned_id, 1u);
+    EXPECT_EQ(returned_version, 0u);  // make_write_request() defaults block_version to 0
     ASSERT_EQ(read_resp->payload.size(), sizeof(uint64_t) + sizeof(uint32_t) + returned_size);
 
     std::vector<uint8_t> returned_data(returned_size);
@@ -212,7 +222,7 @@ TEST_F(StorageNodeTest, DeleteThenReadReturnsBlockNotFound) {
     ASSERT_TRUE(delete_resp.has_value());
     EXPECT_EQ(delete_resp->type, MessageType::ACK);
 
-    ASSERT_TRUE(client.sendMessage(make_block_id_request(MessageType::READ_BLOCK, 3, 5)));
+    ASSERT_TRUE(client.sendMessage(make_read_block_request(3, /*block_id=*/5, /*known_version=*/0)));
     auto read_resp = client.receiveMessage();
     ASSERT_TRUE(read_resp.has_value());
     EXPECT_EQ(read_resp->type, MessageType::ERROR);
@@ -233,11 +243,53 @@ TEST_F(StorageNodeTest, ReadNonexistentBlockReturnsBlockNotFound) {
     start_node(37004);
     TCPConnection client = connect_client(37004);
 
-    ASSERT_TRUE(client.sendMessage(make_block_id_request(MessageType::READ_BLOCK, 1, 42)));
+    ASSERT_TRUE(client.sendMessage(make_read_block_request(1, /*block_id=*/42, /*known_version=*/0)));
     auto resp = client.receiveMessage();
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
     EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::BLOCK_NOT_FOUND);
+}
+
+// Faza 13: conditional READ_BLOCK (see docs/design.md §17).
+TEST_F(StorageNodeTest, ReadBlockWithMatchingKnownVersionReturnsNotModified) {
+    start_node(37008);
+    TCPConnection client = connect_client(37008);
+
+    std::vector<uint8_t> data = {7, 7, 7};
+    ASSERT_TRUE(
+        client.sendMessage(make_write_request(1, /*block_id=*/1, data, /*offset=*/0, /*block_version=*/9)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_read_block_request(2, /*block_id=*/1, /*known_version=*/9)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::NOT_MODIFIED);
+    ASSERT_EQ(resp->payload.size(), sizeof(uint64_t));
+    EXPECT_EQ(get_u64(resp->payload.data()), 9u);
+}
+
+TEST_F(StorageNodeTest, ReadBlockWithStaleKnownVersionReturnsFullData) {
+    start_node(37009);
+    TCPConnection client = connect_client(37009);
+
+    std::vector<uint8_t> data = {8, 8, 8, 8};
+    ASSERT_TRUE(
+        client.sendMessage(make_write_request(1, /*block_id=*/1, data, /*offset=*/0, /*block_version=*/9)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_read_block_request(2, /*block_id=*/1, /*known_version=*/3)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::READ_OK);
+
+    ASSERT_GE(resp->payload.size(), sizeof(uint64_t) + sizeof(uint32_t));
+    EXPECT_EQ(get_u64(resp->payload.data()), 9u);
+    uint32_t returned_size = get_u32(resp->payload.data() + sizeof(uint64_t));
+    ASSERT_EQ(resp->payload.size(), sizeof(uint64_t) + sizeof(uint32_t) + returned_size);
+    std::vector<uint8_t> returned_data(returned_size);
+    std::memcpy(returned_data.data(), resp->payload.data() + sizeof(uint64_t) + sizeof(uint32_t),
+                returned_size);
+    EXPECT_EQ(returned_data, data);
 }
 
 TEST_F(StorageNodeTest, WriteBeyondCapacityReturnsStorageFull) {

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -259,6 +260,102 @@ TEST_F(BlockStorageTest, WriteBlockAtPreservesPassedVersion) {
     auto info = storage->get_block_info(1);
     ASSERT_TRUE(info.is_ok());
     EXPECT_EQ(info.value().version, 2u);
+}
+
+// Faza 13: read_block_if_changed (see docs/design.md §17).
+
+TEST_F(BlockStorageTest, ReadBlockIfChangedReturnsNotModifiedWhenVersionMatches) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, {1, 2, 3}, /*block_version=*/9), ErrorCode::OK);
+
+    auto conditional = storage->read_block_if_changed(1, /*known_version=*/9);
+    ASSERT_TRUE(conditional.is_ok());
+    EXPECT_TRUE(conditional.value().not_modified);
+    EXPECT_EQ(conditional.value().version, 9u);
+    EXPECT_TRUE(conditional.value().data.empty());
+}
+
+TEST_F(BlockStorageTest, ReadBlockIfChangedReturnsFullDataWhenVersionDiffers) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    std::vector<uint8_t> data = {4, 5, 6};
+    ASSERT_EQ(storage->write_block(1, data, /*block_version=*/9), ErrorCode::OK);
+
+    auto conditional = storage->read_block_if_changed(1, /*known_version=*/3);
+    ASSERT_TRUE(conditional.is_ok());
+    EXPECT_FALSE(conditional.value().not_modified);
+    EXPECT_EQ(conditional.value().version, 9u);
+    EXPECT_EQ(conditional.value().data, data);
+}
+
+TEST_F(BlockStorageTest, ReadBlockIfChangedWithZeroKnownVersionAlwaysReturnsFullData) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    // known_version=0 is the "nothing cached" sentinel — must never be
+    // treated as a match even if a block somehow carried version 0.
+    std::vector<uint8_t> data = {7};
+    ASSERT_EQ(storage->write_block(1, data, /*block_version=*/0), ErrorCode::OK);
+
+    auto conditional = storage->read_block_if_changed(1, /*known_version=*/0);
+    ASSERT_TRUE(conditional.is_ok());
+    EXPECT_FALSE(conditional.value().not_modified);
+    EXPECT_EQ(conditional.value().data, data);
+}
+
+TEST_F(BlockStorageTest, ReadBlockIfChangedOnMissingBlockFails) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    EXPECT_EQ(storage->read_block_if_changed(999, 0).error(), ErrorCode::BLOCK_NOT_FOUND);
+}
+
+// cpp-reviewer regression (see docs/design.md §17): the version and data
+// returned together must always describe the SAME on-disk state, even
+// under concurrent writers. Before the fix, handle_read_block() checked
+// the version and read the data as two separate lock acquisitions, so a
+// write landing in between could pair an old version with new data (or
+// vice versa). Each writer thread tags its data with its own version
+// number so any observed (version, data) pair can be checked for a match.
+TEST_F(BlockStorageTest, ReadBlockIfChangedNeverMixesVersionFromOneWriteWithDataFromAnother) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, {0}, /*block_version=*/0), ErrorCode::OK);
+
+    constexpr int kIterations = 500;
+    std::atomic<bool> mismatch{false};
+
+    std::thread writer([&]() {
+        for (uint64_t v = 1; v <= kIterations; ++v) {
+            storage->write_block(1, std::vector<uint8_t>(50, static_cast<uint8_t>(v)), v);
+        }
+    });
+    std::thread reader([&]() {
+        for (int i = 0; i < kIterations; ++i) {
+            auto conditional = storage->read_block_if_changed(1, /*known_version=*/0);
+            if (!conditional.is_ok() || conditional.value().not_modified) continue;
+            const auto& data = conditional.value().data;
+            uint64_t version = conditional.value().version;
+            for (uint8_t byte : data) {
+                if (byte != static_cast<uint8_t>(version)) {
+                    mismatch = true;
+                }
+            }
+        }
+    });
+    writer.join();
+    reader.join();
+
+    EXPECT_FALSE(mismatch) << "returned data did not match its own returned version";
 }
 
 TEST_F(BlockStorageTest, EnumerateBlocksReturnsEveryBlockWithCorrectInfo) {
