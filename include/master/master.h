@@ -3,11 +3,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 
 #include "common/errors.h"
 #include "master/failure_detector.h"
+#include "master/metadata_store.h"
 #include "master/namespace.h"
 #include "master/recovery_manager.h"
 #include "master/replication_manager.h"
@@ -27,6 +29,9 @@ class Master {
 public:
     struct Config {
         uint16_t port;
+        // Faza 12.4: where MetadataStore reads/writes metadata.snapshot —
+        // see docs/design.md §16.
+        std::filesystem::path metadata_dir;
     };
 
     static Result<std::unique_ptr<Master>> create(Config config);
@@ -38,7 +43,7 @@ public:
     void stop();
 
 private:
-    explicit Master(Config config);
+    Master(Config config, std::unique_ptr<MetadataStore> metadata_store);
 
     Message handle_message(const Message& request);
     Message handle_create_file(const Message& request);
@@ -66,8 +71,18 @@ private:
     // connect failure, or any non-ACK response.
     bool send_delete_block(StorageNodeId node_id, BlockId block_id);
     uint64_t next_request_id();
+    // Faza 12.4: saves the whole current namespace/block/node snapshot —
+    // called at the tail of every durably-mutating handler
+    // (CREATE_FILE/DELETE_FILE/WRITE_COMMIT/APPEND_COMMIT/REGISTER_NODE)
+    // and passed as RecoveryManager's on_metadata_changed callback (see
+    // docs/design.md §16). A no-op, not a fatal error, if metadata_store_
+    // is null (never true in production — only relevant if a future test
+    // constructs Master some other way) or save() itself fails: losing
+    // durability on ONE mutation must not crash a running Master.
+    void persist_metadata();
 
     Config config_;
+    std::unique_ptr<MetadataStore> metadata_store_;
     NamespaceManager namespace_manager_;
     StorageRegistry storage_registry_;
     ReplicationManager replication_manager_;

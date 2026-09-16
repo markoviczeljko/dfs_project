@@ -490,6 +490,55 @@ ErrorCode NamespaceManager::commit_append(const std::string& path,
     return ErrorCode::OK;
 }
 
+std::vector<FileMetadata> NamespaceManager::all_files() const {
+    std::shared_lock lock(mutex_);
+    std::vector<FileMetadata> result;
+    result.reserve(files_.size());
+    for (const auto& [path, metadata] : files_) {
+        (void)path;
+        result.push_back(metadata);
+    }
+    return result;
+}
+
+std::vector<std::pair<BlockId, BlockMetadata>> NamespaceManager::all_blocks() const {
+    std::shared_lock lock(mutex_);
+    std::vector<std::pair<BlockId, BlockMetadata>> result;
+    result.reserve(blocks_.size());
+    for (const auto& [id, metadata] : blocks_) {
+        result.emplace_back(id, metadata);
+    }
+    return result;
+}
+
+FileId NamespaceManager::next_file_id() const {
+    std::shared_lock lock(mutex_);
+    return next_file_id_;
+}
+
+BlockId NamespaceManager::next_block_id() const {
+    std::shared_lock lock(mutex_);
+    return next_block_id_;
+}
+
+void NamespaceManager::restore(std::vector<FileMetadata> files,
+                                std::vector<std::pair<BlockId, BlockMetadata>> blocks,
+                                FileId next_file_id, BlockId next_block_id) {
+    std::unique_lock lock(mutex_);
+    files_.clear();
+    for (FileMetadata& file : files) {
+        std::string path = file.path;
+        files_.emplace(std::move(path), std::move(file));
+    }
+    blocks_.clear();
+    for (auto& [id, metadata] : blocks) {
+        blocks_.emplace(id, std::move(metadata));
+    }
+    pending_blocks_.clear();
+    next_file_id_ = next_file_id;
+    next_block_id_ = next_block_id;
+}
+
 Result<BlockMetadata> NamespaceManager::block_metadata(BlockId block_id) const {
     std::shared_lock lock(mutex_);
     auto it = blocks_.find(block_id);

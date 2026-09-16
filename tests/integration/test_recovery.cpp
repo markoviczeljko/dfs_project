@@ -37,7 +37,7 @@ protected:
     }
 
     Client& start_cluster(uint16_t master_port, const std::array<uint16_t, 4>& storage_ports) {
-        Master::Config master_config{master_port};
+        Master::Config master_config{master_port, dir_ / "master_metadata"};
         auto master_result = Master::create(master_config);
         EXPECT_TRUE(master_result.is_ok());
         master_ = std::move(master_result.value());
@@ -190,6 +190,57 @@ TEST_F(RecoveryIntegrationTest, RestartWithValidBlocksSendsInventoryWithoutRecop
     EXPECT_TRUE(block_exists_on_disk(restarted, block_id));  // the restarted node's own copy, untouched
 
     auto read_result = client.read("/s.txt");
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), data);
+}
+
+TEST_F(RecoveryIntegrationTest, LiveNodeIsPromotedBackToHealthyAfterMasterRestartViaInventory) {
+    // Faza 12.4: closes the gap its own design explicitly calls out — a
+    // Storage Node whose OWN process never restarted has no other trigger
+    // to resend its inventory after Master loses its liveness knowledge
+    // across a restart, except the needs_inventory heartbeat bit (see
+    // docs/design.md §16).
+    std::array<uint16_t, 4> storage_ports{40620, 40621, 40622, 40623};
+    Client& client = start_cluster(40619, storage_ports);
+
+    ASSERT_EQ(client.create_file("/before.txt"), ErrorCode::OK);
+    std::vector<uint8_t> data(100, 3);
+    ASSERT_EQ(client.write("/before.txt", data), ErrorCode::OK);
+
+    // Restart Master over the SAME metadata_dir/port — all 4 Storage Nodes
+    // keep running the whole time, unaware anything happened, until their
+    // next heartbeat tick.
+    master_->stop();
+    master_.reset();
+    Master::Config restarted_config{master_port_, dir_ / "master_metadata"};
+    auto restarted_result = Master::create(restarted_config);
+    ASSERT_TRUE(restarted_result.is_ok());
+    master_ = std::move(restarted_result.value());
+    ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+    // The old Client's TCP connection died with the old Master process —
+    // a fresh Client is needed to talk to the restarted one.
+    auto new_client_result = Client::create(Client::Config{"127.0.0.1", master_port_, BLOCK_SIZE});
+    ASSERT_TRUE(new_client_result.is_ok());
+    clients_.push_back(std::move(new_client_result.value()));
+    Client& reconnected_client = *clients_.back();
+
+    // All 4 nodes are restored as JOINING — a fresh write needs >= RF of
+    // them back to HEALTHY, which only happens via each one's next
+    // heartbeat (needs_inventory=1) triggering a NODE_INVENTORY report.
+    ASSERT_EQ(reconnected_client.create_file("/after.txt"), ErrorCode::OK);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool write_succeeded = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (reconnected_client.write("/after.txt", data) == ErrorCode::OK) {
+            write_succeeded = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    ASSERT_TRUE(write_succeeded) << "nodes never re-promoted to HEALTHY after Master restart";
+
+    auto read_result = reconnected_client.read("/after.txt");
     ASSERT_TRUE(read_result.is_ok());
     EXPECT_EQ(read_result.value(), data);
 }

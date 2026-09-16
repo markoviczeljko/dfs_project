@@ -132,6 +132,24 @@ public:
     // mark_under_replicated()/update_block_replicas_after_recovery()).
     void remove_replica(BlockId block_id, StorageNodeId node_id);
 
+    // Faza 12.4: read accessors for MetadataStore::save() — see
+    // docs/design.md §16.
+    std::vector<FileMetadata> all_files() const;
+    std::vector<std::pair<BlockId, BlockMetadata>> all_blocks() const;
+    FileId next_file_id() const;
+    BlockId next_block_id() const;
+
+    // Rehydrates from a MetadataStore snapshot at Master startup, BEFORE
+    // any client traffic is served — replaces whatever's currently in
+    // files_/blocks_ wholesale rather than merging (this is only ever
+    // called once, against a freshly constructed, empty NamespaceManager).
+    // pending_blocks_ is deliberately left empty: any allocation that was
+    // pending-but-never-committed at the moment of the last snapshot is
+    // simply gone, same fate as any other abandoned write attempt (see
+    // docs/design.md §12, §16).
+    void restore(std::vector<FileMetadata> files, std::vector<std::pair<BlockId, BlockMetadata>> blocks,
+                 FileId next_file_id, BlockId next_block_id);
+
 private:
     static Result<std::string> normalize_path(const std::string& path);
 

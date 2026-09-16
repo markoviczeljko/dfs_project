@@ -1239,3 +1239,92 @@ sadržaj originalu.
 184/184 testova prolazi (177 stari + 7 nov: 4 u `test_namespace.cpp`, 2 u
 `test_master.cpp`, 1 integration u `test_recovery.cpp`), čisto pod
 ASan/UBSan.
+
+### 16.4 — Master perzistencija + restart
+
+**On-disk format**: jedan kombinovani binarni snapshot fajl
+(`<metadata_dir>/metadata.snapshot`), custom big-endian layout: `[u32
+magic="METS"][u16 format_version=1][u64 next_file_id][u64 next_block_id]
+[u32 file_count]{...} [u32 block_count]{...} [u32 node_count]{...} [u32
+crc32]`. Pisan kroz identičan tmp+fsync+rename obrazac kao `BlockStorage`,
+**sinhrono** pri svakoj trajnoj mutaciji. `NodeState`/`last_heartbeat` se
+NAMJERNO ne perzistiraju — svaki čvor se učitava kao `JOINING` i promoviše
+u `HEALTHY` isključivo kroz 12.3-ov `NODE_INVENTORY` mehanizam.
+
+**`MetadataStore`** (nova klasa, `include/master/metadata_store.h`/`.cpp`)
+— fallible `create()` (isti obrazac kao `StorageNode::create()`-ov
+`BlockManager`). CRC32 reimplementiran lokalno (ne dijeljen sa
+`storage/block_header.h`-ovim `compute_block_checksum()`) da se izbjegne
+zavisnost master-biblioteke od storage-biblioteke — isti presedan kao
+dupliranje wire-helper funkcija (`put_u16`/`get_u16` itd.) po svakom
+modulu zasebno. `load()` vraća prazan `LoadedState` kao `OK` i za
+NEPOSTOJEĆI fajl I za OŠTEĆEN fajl (loš magic/CRC, skraćen, nečitljiv) —
+isti "izuzmi oštećeno, nastavi da radiš" pristup kao
+`BlockStorage::recover()`-ovo per-block checksum rukovanje; samo prava
+I/O greška na nivou direktorija (`create()`) je fatalna. Parsiranje ide
+kroz interni bounds-checked `Reader` cursor (svaki accessor provjerava
+preostalu veličinu; jednom kad "zapne", svi naredni pozivi su bezbjedni
+no-op-ovi, petlje prekidaju rano umjesto da mljate kroz lažno ogroman
+count polje).
+
+**`NamespaceManager`** dobija `all_files()`/`all_blocks()`/`next_file_id()`/`next_block_id()`
+read accessore i `restore(...)` (zamjenjuje `files_`/`blocks_` u
+potpunosti, čisti `pending_blocks_` — svaka pending-ali-nikad-commit-ovana
+alokacija u trenutku posljednjeg snapshot-a je jednostavno nestala, ista
+sudbina kao svaki drugi napušteni write pokušaj). `StorageRegistry` dobija
+`restore_node()` (forsira `state=JOINING` bez obzira na snapshot sadržaj).
+
+**`Master`**: `Config` dobija `metadata_dir`. `create()` prvo konstruiše
+`MetadataStore` (fallible), `load()`-uje ga, konstruiše `Master`, pa
+poziva `namespace_manager_.restore(...)`/`storage_registry_.restore_node(...)`
+po čvoru. **Napomena o redoslijedu**: iako C++ garantuje da su SVI članovi
+(uključujući `replication_manager_`/`recovery_manager_`/`failure_detector_`)
+već konstruisani prije nego što se ijedan red tijela konstruktora izvrši,
+ta trojka drži samo reference i ne čita stanje eagerly pri konstrukciji —
+pa restore pozivi u `create()`-u (poslije konstrukcije, prije `start()`-a)
+i dalje zadovoljavaju stvarnu namjeru "rehidrirano prije nego što se
+ijedan zahtjev opsluži", ne samo slovo "prije konstrukcije". Nov private
+`persist_metadata()` pozvan na kraju `handle_create_file`,
+`handle_delete_file`, `handle_write_commit`, `handle_append_commit`,
+`handle_register_node`, i proslijeđen kao `RecoveryManager`-ov
+`on_metadata_changed` callback (pripremljen unaprijed u 12.2 baš za ovo).
+
+**Zatvorena rupa otkrivena tokom dizajna**: `Master::handle_heartbeat()`
+je do sad UVIJEK vraćao `needs_inventory=0` (nije bilo potrebe — jedini
+put ka `JOINING` bio je hipotetičan prije 12.4). Sada provjerava
+prijavljenog čvora stvarno stanje i vraća `needs_inventory=1` tačno kad je
+`JOINING` — bez ovoga, Storage Node čiji SOPSTVENI proces nikad nije
+restartovan (pa je svoj jedini inventory izvještaj poslao davno, prije
+OVOG Master restarta) nikad ne bi imao drugi okidač da ga ponovo pošalje,
+i ostao bi zauvijek `JOINING`. Pokriveno sa dva nova testa: jedan direktan
+(`HeartbeatFromJoiningNodeSetsNeedsInventoryBit`) i jedan pun end-to-end
+integration test gdje pravi `StorageNode` procesi ostaju živi kroz cijeli
+Master restart (`LiveNodeIsPromotedBackToHealthyAfterMasterRestartViaInventory`).
+
+**Testovi**: nov `test_metadata_store.cpp` (5 testova: prazan direktorij,
+save/load round-trip, stray `.tmp` odbačen bez uticaja na kanonski fajl,
+oštećen snapshot → prazno stanje umjesto greške, uzastopni save-ovi
+prepisuju prethodni). 3 nova u `test_master.cpp`
+(`MasterRestartPreservesNamespaceAndBlockMetadata`,
+`MasterRestartRestoresNodesAsJoiningNotHealthy`,
+`HeartbeatFromJoiningNodeSetsNeedsInventoryBit`) — sve tri koriste
+doslovno gašenje (`stop()`+`reset()`) i ponovnu konstrukciju `Master`-a
+nad ISTIM `metadata_dir`-om unutar iste `MasterTest` fixture. 1 nov
+integration u `test_recovery.cpp`
+(`LiveNodeIsPromotedBackToHealthyAfterMasterRestartViaInventory`).
+
+**Ručna E2E verifikacija**: pravi `dfs_master` + 3 prava `dfs_storage`
+procesa, `create`+`write`+`stat` preko pravog `dfs_client`-a, `kill
+-SIGINT` Master-a, restart preko `scripts/start_master.sh`, `stat`/`list`
+vraćaju identične podatke, `read` odmah uspijeva (čitanje ne provjerava
+`NodeState` uopšte, samo stvarnu dostupnost — dosljedno postojećem
+ponašanju). Zatim složeniji scenario: `SIGINT` jednog storage node-a PRIJE
+restarta Master-a, restart Master-a, pa tek onda ponovno pokretanje tog
+storage node-a — potvrđeno (nakon par sekundi rekonsilijacije) da nov
+`create`+`write`+`read` na drugom fajlu radi čisto, dokazujući da se
+kombinovani scenario (neki čvorovi restartovani, neki samo ostali živi
+kroz Master restart) rekonsilira ispravno u oba slučaja istovremeno.
+
+191/191 → **193/193** testova prolazi (184 stari + 9 nov: 5 u
+`test_metadata_store.cpp`, 3 u `test_master.cpp`, 1 integration u
+`test_recovery.cpp`), čisto pod ASan/UBSan.

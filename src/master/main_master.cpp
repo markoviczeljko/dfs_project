@@ -36,6 +36,7 @@ Result<Master::Config> load_config(const std::filesystem::path& path) {
 
     Master::Config config{};
     bool has_port = false;
+    bool has_metadata_dir = false;
 
     auto parse_port = [](const std::string& value, uint16_t& out) {
         size_t consumed = 0;
@@ -64,13 +65,16 @@ Result<Master::Config> load_config(const std::filesystem::path& path) {
             if (key == "port") {
                 parse_port(value, config.port);
                 has_port = true;
+            } else if (key == "metadata_dir") {
+                config.metadata_dir = value;
+                has_metadata_dir = true;
             }
         }
     } catch (const std::exception&) {
         return Result<Master::Config>::err(ErrorCode::INVALID_REQUEST);
     }
 
-    if (!has_port) {
+    if (!has_port || !has_metadata_dir) {
         return Result<Master::Config>::err(ErrorCode::INVALID_REQUEST);
     }
     return Result<Master::Config>::ok(config);

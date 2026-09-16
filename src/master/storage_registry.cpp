@@ -57,6 +57,13 @@ std::vector<StorageNodeInfo> StorageRegistry::get_all_nodes() const {
     return all;
 }
 
+void StorageRegistry::restore_node(StorageNodeInfo node) {
+    node.state = NodeState::JOINING;
+    node.last_heartbeat = std::chrono::steady_clock::time_point{};
+    std::unique_lock lock(mutex_);
+    nodes_[node.id] = std::move(node);
+}
+
 std::optional<StorageNodeInfo> StorageRegistry::get_node(StorageNodeId id) const {
     std::shared_lock lock(mutex_);
     auto it = nodes_.find(id);

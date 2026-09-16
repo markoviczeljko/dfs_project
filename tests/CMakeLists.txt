@@ -48,6 +48,9 @@ target_link_libraries(test_replication_manager PRIVATE master gtest_main)
 add_executable(test_failure_detector unit/test_failure_detector.cpp)
 target_link_libraries(test_failure_detector PRIVATE master gtest_main)
 
+add_executable(test_metadata_store unit/test_metadata_store.cpp)
+target_link_libraries(test_metadata_store PRIVATE master gtest_main)
+
 add_executable(test_create integration/test_create.cpp)
 target_link_libraries(test_create PRIVATE client master gtest_main)
 
@@ -83,6 +86,7 @@ gtest_discover_tests(test_master)
 gtest_discover_tests(test_storage_registry)
 gtest_discover_tests(test_replication_manager)
 gtest_discover_tests(test_failure_detector)
+gtest_discover_tests(test_metadata_store)
 gtest_discover_tests(test_create)
 gtest_discover_tests(test_write)
 gtest_discover_tests(test_read)

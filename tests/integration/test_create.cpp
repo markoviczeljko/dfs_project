@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <memory>
+#include <string>
 
 #include "client/client.h"
 #include "master/master.h"
@@ -11,12 +13,20 @@
 // forward for every later integration test.
 class CreateIntegrationTest : public ::testing::Test {
 protected:
+    void SetUp() override {
+        dir_ = std::filesystem::temp_directory_path() /
+               ("dfs_create_integration_test_" +
+                std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+        std::filesystem::remove_all(dir_);
+    }
+
     void TearDown() override {
         if (master_) master_->stop();
+        std::filesystem::remove_all(dir_);
     }
 
     void start_master(uint16_t port) {
-        Master::Config config{port};
+        Master::Config config{port, dir_ / "master_metadata"};
         auto result = Master::create(config);
         ASSERT_TRUE(result.is_ok());
         master_ = std::move(result.value());
@@ -29,6 +39,7 @@ protected:
         return std::move(result.value());
     }
 
+    std::filesystem::path dir_;
     std::unique_ptr<Master> master_;
 };
 

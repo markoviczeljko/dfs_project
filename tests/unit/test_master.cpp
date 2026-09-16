@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -263,12 +264,20 @@ std::vector<std::unique_ptr<RecordingNode>> register_three_recording_nodes(
 
 class MasterTest : public ::testing::Test {
 protected:
+    void SetUp() override {
+        dir_ = std::filesystem::temp_directory_path() /
+               ("dfs_master_test_" +
+                std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+        std::filesystem::remove_all(dir_);
+    }
+
     void TearDown() override {
         if (master_) master_->stop();
+        std::filesystem::remove_all(dir_);
     }
 
     void start_master(uint16_t port) {
-        Master::Config config{port};
+        Master::Config config{port, dir_ / "master_metadata"};
         auto result = Master::create(config);
         ASSERT_TRUE(result.is_ok());
         master_ = std::move(result.value());
@@ -283,6 +292,7 @@ protected:
         return TCPConnection(std::move(socket));
     }
 
+    std::filesystem::path dir_;
     std::unique_ptr<Master> master_;
 };
 
@@ -1203,4 +1213,130 @@ TEST_F(MasterTest, NodeInventoryMarksStaleReplicaForResync) {
         nodes[1]->received_copy_block(block_id) || nodes[2]->received_copy_block(block_id);
     EXPECT_TRUE(some_other_node_got_copy_block);
     EXPECT_FALSE(nodes[0]->received_copy_block(block_id));  // never itself as the source
+}
+
+// Faza 12.4: Master persistence + restart (see docs/design.md §16).
+
+TEST_F(MasterTest, MasterRestartPreservesNamespaceAndBlockMetadata) {
+    constexpr uint16_t port = 38158;
+    std::filesystem::path metadata_dir = dir_ / "master_metadata";
+    BlockId block_id = 0;
+
+    {
+        Master::Config config{port, metadata_dir};
+        auto result = Master::create(config);
+        ASSERT_TRUE(result.is_ok());
+        master_ = std::move(result.value());
+        ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+        TCPConnection client = connect_client(port);
+        register_three_nodes(client);
+
+        ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+        ASSERT_TRUE(client.receiveMessage().has_value());
+        ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+        auto alloc_resp = client.receiveMessage();
+        ASSERT_TRUE(alloc_resp.has_value());
+        block_id = get_u64(alloc_resp->payload.data());
+
+        ASSERT_TRUE(
+            client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/42, 42)));
+        ASSERT_TRUE(client.receiveMessage().has_value());
+
+        master_->stop();
+        master_.reset();  // destroyed here, simulating a process restart
+    }
+
+    // Fresh Master instance over the SAME metadata_dir — no storage nodes
+    // re-registered yet, purely testing namespace/block metadata recovery.
+    Master::Config restarted_config{port, metadata_dir};
+    auto restarted_result = Master::create(restarted_config);
+    ASSERT_TRUE(restarted_result.is_ok());
+    master_ = std::move(restarted_result.value());
+    ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+    TCPConnection client = connect_client(port);
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::STAT_FILE, 4, "/a.txt")));
+    auto stat_resp = client.receiveMessage();
+    ASSERT_TRUE(stat_resp.has_value());
+    EXPECT_EQ(stat_resp->type, MessageType::ACK);
+
+    uint64_t size = get_u64(stat_resp->payload.data() + 8);
+    uint32_t block_count = get_u32(stat_resp->payload.data() + 24);
+    BlockId restored_block_id = get_u64(stat_resp->payload.data() + 28);
+    EXPECT_EQ(size, 42u);
+    EXPECT_EQ(block_count, 1u);
+    EXPECT_EQ(restored_block_id, block_id);
+}
+
+TEST_F(MasterTest, MasterRestartRestoresNodesAsJoiningNotHealthy) {
+    constexpr uint16_t port = 38159;
+    std::filesystem::path metadata_dir = dir_ / "master_metadata";
+
+    {
+        Master::Config config{port, metadata_dir};
+        auto result = Master::create(config);
+        ASSERT_TRUE(result.is_ok());
+        master_ = std::move(result.value());
+        ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+        TCPConnection client = connect_client(port);
+        register_three_nodes(client);
+        ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/x.txt")));
+        ASSERT_TRUE(client.receiveMessage().has_value());
+
+        master_->stop();
+        master_.reset();
+    }
+
+    Master::Config restarted_config{port, metadata_dir};
+    auto restarted_result = Master::create(restarted_config);
+    ASSERT_TRUE(restarted_result.is_ok());
+    master_ = std::move(restarted_result.value());
+    ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+    // The 3 previously-registered nodes are known to Master but restored
+    // as JOINING, not HEALTHY — no live proof they're still up after a
+    // restart (see docs/design.md §16). A fresh ALLOCATE_BLOCK must fail
+    // exactly like the zero-registered-nodes case, until nodes re-register
+    // or send inventory.
+    TCPConnection client = connect_client(port);
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 1, "/x.txt")));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::NODE_NOT_FOUND);
+}
+
+TEST_F(MasterTest, HeartbeatFromJoiningNodeSetsNeedsInventoryBit) {
+    constexpr uint16_t port = 38160;
+    std::filesystem::path metadata_dir = dir_ / "master_metadata";
+
+    {
+        Master::Config config{port, metadata_dir};
+        auto result = Master::create(config);
+        ASSERT_TRUE(result.is_ok());
+        master_ = std::move(result.value());
+        ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+        TCPConnection client = connect_client(port);
+        register_three_nodes(client);
+
+        master_->stop();
+        master_.reset();
+    }
+
+    Master::Config restarted_config{port, metadata_dir};
+    auto restarted_result = Master::create(restarted_config);
+    ASSERT_TRUE(restarted_result.is_ok());
+    master_ = std::move(restarted_result.value());
+    ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+    TCPConnection client = connect_client(port);
+    ASSERT_TRUE(client.sendMessage(make_heartbeat_request(1, /*node_id=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+    ASSERT_EQ(resp->payload.size(), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(resp->payload[0]), 1u);  // needs_inventory — node is JOINING
 }

@@ -41,7 +41,7 @@ protected:
     // (see docs/design.md §13).
     void start_cluster(uint16_t master_port, uint16_t storage_port1, uint16_t storage_port2,
                         uint16_t storage_port3, uint64_t block_size = BLOCK_SIZE) {
-        Master::Config master_config{master_port};
+        Master::Config master_config{master_port, dir_ / "master_metadata"};
         auto master_result = Master::create(master_config);
         ASSERT_TRUE(master_result.is_ok());
         master_ = std::move(master_result.value());

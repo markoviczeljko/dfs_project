@@ -35,6 +35,7 @@ add_library(master
     src/master/replication_manager.cpp
     src/master/failure_detector.cpp
     src/master/recovery_manager.cpp
+    src/master/metadata_store.cpp
     src/master/master.cpp
 )
 target_include_directories(master PUBLIC include)

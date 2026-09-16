@@ -86,6 +86,14 @@ public:
     std::vector<StorageNodeInfo> get_all_nodes() const;
     std::optional<StorageNodeInfo> get_node(StorageNodeId id) const;
 
+    // Faza 12.4: rehydrates one node from a MetadataStore snapshot at
+    // Master startup — always forces state=JOINING regardless of what's in
+    // the snapshot (NodeState/last_heartbeat are deliberately never
+    // persisted, see docs/design.md §16); a Master that just restarted has
+    // no live proof any previously-known node is still up until it reports
+    // its inventory.
+    void restore_node(StorageNodeInfo node);
+
 private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<StorageNodeId, StorageNodeInfo> nodes_;

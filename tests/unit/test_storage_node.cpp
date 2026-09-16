@@ -100,7 +100,7 @@ protected:
     // convention below without a separate port table.
     void start_node(uint16_t port, uint64_t capacity_bytes = 1024 * 1024) {
         uint16_t master_port = static_cast<uint16_t>(port + 100);
-        Master::Config master_config{master_port};
+        Master::Config master_config{master_port, dir_ / "master_metadata"};
         auto master_result = Master::create(master_config);
         ASSERT_TRUE(master_result.is_ok());
         master_ = std::move(master_result.value());

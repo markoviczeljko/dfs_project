@@ -70,16 +70,53 @@ uint64_t get_u64(const std::byte* src) {
 
 }  // namespace
 
-Master::Master(Config config)
+Master::Master(Config config, std::unique_ptr<MetadataStore> metadata_store)
     : config_(std::move(config)),
+      metadata_store_(std::move(metadata_store)),
       replication_manager_(storage_registry_),
-      recovery_manager_(namespace_manager_, storage_registry_, replication_manager_),
+      recovery_manager_(namespace_manager_, storage_registry_, replication_manager_,
+                         [this] { persist_metadata(); }),
       failure_detector_(storage_registry_,
                          [this](StorageNodeId node_id) { recovery_manager_.handle_node_failure(node_id); }) {}
 
 Result<std::unique_ptr<Master>> Master::create(Config config) {
-    auto master = std::unique_ptr<Master>(new Master(std::move(config)));
+    // Faza 12.4: fallible construction, same pattern as
+    // StorageNode::create()'s BlockManager — see docs/design.md §16.
+    auto metadata_store_result = MetadataStore::create(config.metadata_dir);
+    if (metadata_store_result.is_error()) {
+        return Result<std::unique_ptr<Master>>::err(metadata_store_result.error());
+    }
+    auto metadata_store = std::move(metadata_store_result.value());
+
+    auto load_result = metadata_store->load();
+    if (load_result.is_error()) {
+        return Result<std::unique_ptr<Master>>::err(load_result.error());
+    }
+    const MetadataStore::LoadedState& state = load_result.value();
+
+    auto master = std::unique_ptr<Master>(new Master(std::move(config), std::move(metadata_store)));
+    // Rehydrate BEFORE any request is ever served. namespace_manager_ and
+    // storage_registry_ are already fully constructed by this point (C++
+    // requires every member to finish construction before the constructor
+    // body runs), but replication_manager_/recovery_manager_/failure_detector_
+    // — declared after them — only ever hold references and never read
+    // state eagerly at construction time, so this still satisfies the real
+    // intent ("restored before start()", i.e. before any of them are
+    // actually exercised), not just the letter of "before construction"
+    // (see docs/design.md §16).
+    master->namespace_manager_.restore(state.files, state.blocks, state.next_file_id,
+                                        state.next_block_id);
+    for (const StorageNodeInfo& node : state.nodes) {
+        master->storage_registry_.restore_node(node);
+    }
     return Result<std::unique_ptr<Master>>::ok(std::move(master));
+}
+
+void Master::persist_metadata() {
+    if (!metadata_store_) return;
+    metadata_store_->save(namespace_manager_.all_files(), namespace_manager_.all_blocks(),
+                           namespace_manager_.next_file_id(), namespace_manager_.next_block_id(),
+                           storage_registry_.get_all_nodes());
 }
 
 ErrorCode Master::start() {
@@ -158,6 +195,7 @@ Message Master::handle_create_file(const Message& request) {
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }
+    persist_metadata();
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -168,6 +206,7 @@ Message Master::handle_delete_file(const Message& request) {
         return make_error(request.request_id, result.error());
     }
     gc_dispatch(result.value());
+    persist_metadata();
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -290,6 +329,7 @@ Message Master::handle_write_commit(const Message& request) {
         return make_error(request.request_id, result.error());
     }
     gc_dispatch(result.value());
+    persist_metadata();
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -363,13 +403,20 @@ Message Master::handle_register_node(const Message& request) {
                                                       NodeState::HEALTHY, capacity_bytes,
                                                       capacity_bytes,
                                                       std::chrono::steady_clock::now()});
+    persist_metadata();
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
 Message Master::handle_heartbeat(const Message& request) {
     // Wire format: [u64 node_id]. Response: ACK{[u8 needs_inventory]} or
-    // ERROR(NODE_NOT_FOUND). needs_inventory is always 0 in this sub-phase
-    // — real semantics land in Faza 12.3/12.4 (see docs/design.md §16).
+    // ERROR(NODE_NOT_FOUND). Faza 12.4: needs_inventory is 1 whenever the
+    // node's CURRENT state is JOINING — the only trigger that re-promotes
+    // it to HEALTHY (via NODE_INVENTORY reconciliation) after a Master
+    // restart. This matters even for a Storage Node whose OWN process
+    // never restarted: it already sent its one-time inventory report long
+    // before this Master restarted and has no other reason to send it
+    // again, so without this bit it would stay JOINING forever (see
+    // docs/design.md §16). 0 in every other state.
     if (request.payload.size() != sizeof(uint64_t)) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
@@ -378,8 +425,10 @@ Message Master::handle_heartbeat(const Message& request) {
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }
+    auto node = storage_registry_.get_node(node_id);
+    bool needs_inventory = node.has_value() && node->state == NodeState::JOINING;
     std::vector<std::byte> response_payload;
-    response_payload.push_back(std::byte{0});  // needs_inventory
+    response_payload.push_back(static_cast<std::byte>(needs_inventory ? 1 : 0));
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
 
@@ -561,6 +610,7 @@ Message Master::handle_append_commit(const Message& request) {
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }
+    persist_metadata();
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
