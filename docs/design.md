@@ -1913,7 +1913,7 @@ Dodata dva teža stress testa (`ConcurrentCreateDeleteAndListStatDontRace`,
 `ConcurrentHeartbeatWritesAndReaderQueriesDontRace`) da se to dokaže pod
 pravom kontencijom, ne samo na papiru.
 
-**15.4 — Finalni TSan gate**: cijeli test suite (241 test, jedan
+**15.4 — Finalni TSan gate**: cijeli test suite (242 testa, jedan
 isključen — vidi ispod) pod `-fsanitize=thread`, potvrđeno DVA PUTA:
 **nula TSan upozorenja**. Baseline iz 15.1 (nula upozorenja na starom
 kodu) se poklapa sa finalnim rezultatom (nula upozorenja na novom
@@ -1949,5 +1949,5 @@ svaki po jednom flake-ovala na jednom od više punih run-ova (oba prošla
 sistema tokom teških integration testova, ne regresiji (nijedan ne dira
 ništa iz ovog diff-a).
 
-241/240 testova prolazi (240 stvarnih + 1 isključen environment flake),
+242/241 testova prolazi (241 stvarnih + 1 isključen environment flake),
 čisto pod ASan/UBSan, čisto pod ThreadSanitizer-om (nula upozorenja).
