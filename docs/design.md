@@ -1628,3 +1628,34 @@ reference na njegov član. Dobra ilustracija zašto ASan/UBSan prolaz posle
 SVAKE pod-faze nije opciono, čak i za "samo testni kod".
 
 15 novih testova (`test_statistics.cpp`), čisto pod ASan/UBSan.
+
+### 18.2 — Client retrofit
+
+`Client` nema centralni dispatcher (nije server), pa svaki javni metod
+(`create_file`, `write`, `read`, `append`, `delete_file`, `list`, `stat`)
+je preimenovan u `*_impl` (privatno), a javno ime postaje tanak wrapper
+koji mjeri `steady_clock` oko poziva `*_impl`-a i zove
+`statistics_.record_operation()`/`record_read()`/`record_write()`/
+`record_append()` — isti obrazac kao `BlockStorage`-ov postojeći
+`read_block()`/`read_block_locked()` par, izbjegava dodirivanje svake
+tačke povratka unutar metoda koji imaju više njih.
+
+`read`/`write`/`append` prosljeđuju stvarnu veličinu fajla (jedino mjesto
+koje zna ukupnu logičku veličinu — Master vidi samo kontrolne metapodatke,
+StorageNode samo pojedinačne blokove).
+
+Dva nova javna accessor-a: `Client::statistics_snapshot() const` i
+`Client::cache_stats() const` (odvojeno, ne spojeno — `StatisticsSnapshot`
+namjerno ne zna za `CacheStats`, koji živi u `client/cache.h`; spajanje bi
+uvelo upward zavisnost od generičke `statistics/` biblioteke ka
+Client-specifičnom tipu, vidi §18-ovu poprečnu odluku).
+
+**Testovi**: proširen postojeći `tests/integration/test_create.cpp`,
+`test_write.cpp`, `test_read.cpp`, `test_append.cpp`, `test_delete.cpp`,
+`test_list_stat.cpp` — po jedna asercija po fajlu da
+`client_->statistics_snapshot()`/`cache_stats()` posle stvarno izvršenih
+operacija pokazuje očekivane brojeve (ne novi fajl, samo dopune postojećih
+fixtures, tačno po planu).
+
+231/231 testova prolazi (bez novih test IZVRŠNIH fajlova — samo dopune
+postojećih), čisto pod ASan/UBSan.

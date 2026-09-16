@@ -49,6 +49,14 @@ TEST_F(CreateIntegrationTest, CreateSucceedsThenDuplicateFails) {
 
     EXPECT_EQ(client->create_file("/data/test.txt"), ErrorCode::OK);
     EXPECT_EQ(client->create_file("/data/test.txt"), ErrorCode::FILE_ALREADY_EXISTS);
+
+    // Faza 14: statistics_snapshot() reflects real operations, not just
+    // the wire calls succeeding (see docs/design.md §18).
+    StatisticsSnapshot snap = client->statistics_snapshot();
+    const OperationStats& create_stats = snap.operations[static_cast<size_t>(OperationType::CREATE)];
+    EXPECT_EQ(create_stats.total, 2u);
+    EXPECT_EQ(create_stats.successful, 1u);
+    EXPECT_EQ(create_stats.failed, 1u);
 }
 
 TEST_F(CreateIntegrationTest, CreateOnInvalidPathFails) {

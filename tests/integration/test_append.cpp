@@ -88,6 +88,14 @@ TEST_F(AppendIntegrationTest, AppendToEmptyFileIsEquivalentToWrite) {
     auto read_result = client.read("/a.txt");
     ASSERT_TRUE(read_result.is_ok());
     EXPECT_EQ(read_result.value(), data);
+
+    // Faza 14 (see docs/design.md §18).
+    StatisticsSnapshot snap = client.statistics_snapshot();
+    const OperationStats& append_stats =
+        snap.operations[static_cast<size_t>(OperationType::APPEND)];
+    EXPECT_EQ(append_stats.total, 1u);
+    EXPECT_EQ(append_stats.successful, 1u);
+    EXPECT_EQ(append_stats.bytes, data.size());
 }
 
 TEST_F(AppendIntegrationTest, AppendFillsExistingBlockWithoutCrossingBoundary) {

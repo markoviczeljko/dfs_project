@@ -97,6 +97,13 @@ TEST_F(DeleteIntegrationTest, DeleteRemovesFileFromNamespace) {
 
     auto read_result = client.read("/a.txt");
     EXPECT_TRUE(read_result.is_error());
+
+    // Faza 14 (see docs/design.md §18).
+    StatisticsSnapshot snap = client.statistics_snapshot();
+    const OperationStats& delete_stats =
+        snap.operations[static_cast<size_t>(OperationType::DELETE)];
+    EXPECT_EQ(delete_stats.total, 1u);
+    EXPECT_EQ(delete_stats.successful, 1u);
 }
 
 TEST_F(DeleteIntegrationTest, DeletePhysicallyRemovesBlocksFromAllThreeReplicasOnDisk) {

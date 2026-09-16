@@ -86,6 +86,13 @@ TEST_F(WriteIntegrationTest, CreateThenWriteSucceeds) {
     ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
     std::vector<uint8_t> data = {1, 2, 3, 4, 5};
     EXPECT_EQ(client_->write("/a.txt", data), ErrorCode::OK);
+
+    // Faza 14 (see docs/design.md §18).
+    StatisticsSnapshot snap = client_->statistics_snapshot();
+    const OperationStats& write_stats = snap.operations[static_cast<size_t>(OperationType::WRITE)];
+    EXPECT_EQ(write_stats.total, 1u);
+    EXPECT_EQ(write_stats.successful, 1u);
+    EXPECT_EQ(write_stats.bytes, data.size());
 }
 
 TEST_F(WriteIntegrationTest, WriteBeyondBlockSizeSplitsIntoMultipleBlocks) {

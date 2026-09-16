@@ -93,6 +93,11 @@ TEST_F(ListStatIntegrationTest, ListAndStatReflectCreateWriteAppend) {
     EXPECT_EQ(stat_result.value().size, 15u);
     EXPECT_EQ(stat_result.value().blocks.size(), 1u);
     EXPECT_GT(stat_result.value().id, 0u);
+
+    // Faza 14 (see docs/design.md §18).
+    StatisticsSnapshot snap = client.statistics_snapshot();
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::LIST)].successful, 1u);
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::STAT)].successful, 1u);
 }
 
 TEST_F(ListStatIntegrationTest, StatAfterDeleteFails) {

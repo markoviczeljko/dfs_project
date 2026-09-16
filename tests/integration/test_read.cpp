@@ -78,6 +78,13 @@ TEST_F(ReadIntegrationTest, WriteThenReadReturnsSameBytes) {
     auto read_result = client_->read("/a.txt");
     ASSERT_TRUE(read_result.is_ok());
     EXPECT_EQ(read_result.value(), data);
+
+    // Faza 14 (see docs/design.md §18).
+    StatisticsSnapshot snap = client_->statistics_snapshot();
+    const OperationStats& read_stats = snap.operations[static_cast<size_t>(OperationType::READ)];
+    EXPECT_EQ(read_stats.total, 1u);
+    EXPECT_EQ(read_stats.successful, 1u);
+    EXPECT_EQ(read_stats.bytes, data.size());
 }
 
 TEST_F(ReadIntegrationTest, ReadEmptyFileReturnsEmptyVector) {
@@ -161,6 +168,13 @@ TEST_F(ReadIntegrationTest, RepeatReadHitsCacheAndSurvivesAllStorageNodesStopped
     auto second_read = client_->read("/a.txt");
     ASSERT_TRUE(second_read.is_ok());
     EXPECT_EQ(second_read.value(), data);
+
+    // Faza 14: Client::cache_stats() exposes the Faza 13 ClientCache
+    // counters (see docs/design.md §18) — one miss (first read) then one
+    // hit (second read, storage nodes already stopped).
+    CacheStats cache_stats = client_->cache_stats();
+    EXPECT_EQ(cache_stats.misses, 1u);
+    EXPECT_EQ(cache_stats.hits, 1u);
 }
 
 // Faza 13: append() extends the file's existing last block in place (same

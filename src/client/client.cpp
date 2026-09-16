@@ -3,6 +3,7 @@
 #include <endian.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -111,6 +112,17 @@ Result<Message> Client::call_master(const Message& request) {
 }
 
 ErrorCode Client::create_file(const std::string& path) {
+    auto start = std::chrono::steady_clock::now();
+    ErrorCode result = create_file_impl(path);
+    statistics_.record_operation(
+        OperationType::CREATE, 0,
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result == ErrorCode::OK);
+    return result;
+}
+
+ErrorCode Client::create_file_impl(const std::string& path) {
     Message request{MessageType::CREATE_FILE, next_request_id(), string_to_bytes(path)};
     auto result = call_master(request);
     if (result.is_error()) {
@@ -124,6 +136,17 @@ ErrorCode Client::create_file(const std::string& path) {
 }
 
 ErrorCode Client::delete_file(const std::string& path) {
+    auto start = std::chrono::steady_clock::now();
+    ErrorCode result = delete_file_impl(path);
+    statistics_.record_operation(
+        OperationType::DELETE, 0,
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result == ErrorCode::OK);
+    return result;
+}
+
+ErrorCode Client::delete_file_impl(const std::string& path) {
     Message request{MessageType::DELETE_FILE, next_request_id(), string_to_bytes(path)};
     auto result = call_master(request);
     if (result.is_error()) {
@@ -137,6 +160,17 @@ ErrorCode Client::delete_file(const std::string& path) {
 }
 
 Result<std::vector<std::string>> Client::list(const std::string& path) {
+    auto start = std::chrono::steady_clock::now();
+    auto result = list_impl(path);
+    statistics_.record_operation(
+        OperationType::LIST, 0,
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result.is_ok());
+    return result;
+}
+
+Result<std::vector<std::string>> Client::list_impl(const std::string& path) {
     Message request{MessageType::LIST_FILES, next_request_id(), string_to_bytes(path)};
     auto result = call_master(request);
     if (result.is_error()) {
@@ -176,6 +210,17 @@ Result<std::vector<std::string>> Client::list(const std::string& path) {
 }
 
 Result<Client::FileStat> Client::stat(const std::string& path) {
+    auto start = std::chrono::steady_clock::now();
+    auto result = stat_impl(path);
+    statistics_.record_operation(
+        OperationType::STAT, 0,
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result.is_ok());
+    return result;
+}
+
+Result<Client::FileStat> Client::stat_impl(const std::string& path) {
     Message request{MessageType::STAT_FILE, next_request_id(), string_to_bytes(path)};
     auto result = call_master(request);
     if (result.is_error()) {
@@ -339,6 +384,17 @@ Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, c
 }
 
 ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& data) {
+    auto start = std::chrono::steady_clock::now();
+    ErrorCode result = write_impl(path, data);
+    statistics_.record_write(
+        data.size(),
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result == ErrorCode::OK);
+    return result;
+}
+
+ErrorCode Client::write_impl(const std::string& path, const std::vector<uint8_t>& data) {
     // block_size must be positive and never exceed the real BLOCK_SIZE — a
     // larger chunk would exceed MAX_DATA_MESSAGE_SIZE at the network layer
     // and fail with a confusing INTERNAL_ERROR deep inside TCPConnection
@@ -393,6 +449,17 @@ ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& dat
 }
 
 ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& data) {
+    auto start = std::chrono::steady_clock::now();
+    ErrorCode result = append_impl(path, data);
+    statistics_.record_append(
+        data.size(),
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result == ErrorCode::OK);
+    return result;
+}
+
+ErrorCode Client::append_impl(const std::string& path, const std::vector<uint8_t>& data) {
     if (config_.block_size == 0 || config_.block_size > BLOCK_SIZE) {
         return ErrorCode::INVALID_REQUEST;
     }
@@ -532,6 +599,18 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
 }
 
 Result<std::vector<uint8_t>> Client::read(const std::string& path) {
+    auto start = std::chrono::steady_clock::now();
+    auto result = read_impl(path);
+    uint64_t bytes = result.is_ok() ? result.value().size() : 0;
+    statistics_.record_read(
+        bytes,
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start),
+        result.is_ok());
+    return result;
+}
+
+Result<std::vector<uint8_t>> Client::read_impl(const std::string& path) {
     // Step 1: ask Master where the file's block(s) live.
     Message meta_request{MessageType::READ_FILE, next_request_id(), string_to_bytes(path)};
     auto meta_result = call_master(meta_request);
@@ -668,3 +747,7 @@ Result<std::vector<uint8_t>> Client::read(const std::string& path) {
     }
     return Result<std::vector<uint8_t>>::ok(std::move(result));
 }
+
+StatisticsSnapshot Client::statistics_snapshot() const { return statistics_.snapshot(); }
+
+CacheStats Client::cache_stats() const { return cache_.stats(); }

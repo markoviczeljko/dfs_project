@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "network/connection.h"
 #include "network/protocol.h"
+#include "statistics/statistics.h"
 
 // The Client: talks to Master for namespace/control operations and directly
 // to a Storage Node for block data (control/data plane split, see
@@ -66,6 +67,19 @@ public:
     };
     Result<FileStat> stat(const std::string& path);
 
+    // Faza 14: this Client instance's own operation/error counters (see
+    // docs/design.md §18). Does not include cache_stats() — see its own
+    // comment for why that's a separate accessor.
+    StatisticsSnapshot statistics_snapshot() const;
+
+    // Faza 13's CacheStats intentionally isn't folded into
+    // StatisticsSnapshot: statistics/ has no business knowing about
+    // client/cache.h's type (would create an upward dependency from a
+    // generic, reusable library to a Client-specific one), so the two are
+    // exposed separately and merged only by callers that want both (see
+    // docs/design.md §18).
+    CacheStats cache_stats() const;
+
 private:
     struct ReplicaLocation {
         std::string host;
@@ -73,6 +87,19 @@ private:
     };
 
     Client(Config config, TCPConnection master_connection);
+
+    // Faza 14: every public operation is a thin timing/stats wrapper
+    // (see .cpp) around one of these — keeps record_operation() calls out
+    // of methods with multiple early-return paths, same pattern this
+    // project already uses for read_block()/read_block_locked() in
+    // BlockStorage (see docs/design.md §18).
+    ErrorCode create_file_impl(const std::string& path);
+    ErrorCode write_impl(const std::string& path, const std::vector<uint8_t>& data);
+    Result<std::vector<uint8_t>> read_impl(const std::string& path);
+    ErrorCode append_impl(const std::string& path, const std::vector<uint8_t>& data);
+    ErrorCode delete_file_impl(const std::string& path);
+    Result<std::vector<std::string>> list_impl(const std::string& path);
+    Result<FileStat> stat_impl(const std::string& path);
 
     Result<Message> call_master(const Message& request);
     uint64_t next_request_id();
@@ -113,6 +140,8 @@ private:
     std::mt19937_64 operation_id_rng_{std::random_device{}()};
     // Faza 13: block-level read cache (see docs/design.md §17).
     ClientCache cache_;
+    // Faza 14: see docs/design.md §18.
+    StatisticsManager statistics_;
 };
 
 #endif  // DFS_CLIENT_CLIENT_H_

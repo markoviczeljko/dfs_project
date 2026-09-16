@@ -53,7 +53,7 @@ add_library(client
     src/client/cache.cpp
 )
 target_include_directories(client PUBLIC include)
-target_link_libraries(client PUBLIC common network Threads::Threads)
+target_link_libraries(client PUBLIC common network statistics Threads::Threads)
 
 add_executable(dfs_storage src/storage/main_storage.cpp)
 target_link_libraries(dfs_storage PRIVATE storage)
