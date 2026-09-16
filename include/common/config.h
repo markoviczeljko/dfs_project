@@ -1,6 +1,7 @@
 #ifndef DFS_COMMON_CONFIG_H_
 #define DFS_COMMON_CONFIG_H_
 
+#include <cstddef>
 #include <cstdint>
 
 constexpr uint64_t BLOCK_SIZE = 64ULL * 1024 * 1024;
@@ -35,5 +36,19 @@ constexpr int FAILURE_SWEEP_INTERVAL_MS = 500;
 // accepts the connection but never replies must not hang the heartbeat
 // thread forever.
 constexpr int HEARTBEAT_SEND_TIMEOUT_MS = 1000;
+
+// Faza 12.2: recovery / re-replication + idempotency (see docs/design.md
+// §16).
+constexpr int MAX_CONCURRENT_RECOVERY_OPERATIONS = 4;
+constexpr int MAX_RECOVERY_ATTEMPTS_PER_BLOCK = 5;
+// Bounds both legs of a COPY_BLOCK transfer (Master->source, source->
+// destination) — same rationale as DELETE_BLOCK_TIMEOUT_MS (Faza 11): a
+// peer that accepts the connection but never replies must not hang the
+// caller's thread forever.
+constexpr int COPY_BLOCK_TIMEOUT_MS = 5000;
+// Bounded FIFO — an OperationLog only needs to remember recently-retried
+// operations long enough for a client's own bounded retry window to give
+// up, not forever.
+constexpr size_t OPERATION_LOG_CAPACITY = 1024;
 
 #endif  // DFS_COMMON_CONFIG_H_

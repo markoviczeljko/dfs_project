@@ -250,6 +250,43 @@ ErrorCode NamespaceManager::set_block_replicas(BlockId block_id,
     return ErrorCode::OK;
 }
 
+std::vector<BlockId> NamespaceManager::blocks_with_replica(StorageNodeId node_id) const {
+    std::shared_lock lock(mutex_);
+    std::vector<BlockId> affected;
+    for (const auto& [id, metadata] : blocks_) {
+        if (std::find(metadata.replicas.begin(), metadata.replicas.end(), node_id) !=
+            metadata.replicas.end()) {
+            affected.push_back(id);
+        }
+    }
+    return affected;
+}
+
+void NamespaceManager::mark_under_replicated(BlockId block_id) {
+    std::unique_lock lock(mutex_);
+    auto it = blocks_.find(block_id);
+    if (it != blocks_.end()) {
+        it->second.state = BlockState::UNDER_REPLICATED;
+    }
+}
+
+void NamespaceManager::update_block_replicas_after_recovery(BlockId block_id, StorageNodeId old_node,
+                                                              StorageNodeId new_node,
+                                                              BlockState new_state) {
+    std::unique_lock lock(mutex_);
+    auto it = blocks_.find(block_id);
+    if (it == blocks_.end()) {
+        return;
+    }
+    auto& replicas = it->second.replicas;
+    auto pos = std::find(replicas.begin(), replicas.end(), old_node);
+    if (pos == replicas.end()) {
+        return;
+    }
+    *pos = new_node;
+    it->second.state = new_state;
+}
+
 Result<AppendTarget> NamespaceManager::resolve_append_target(const std::string& path,
                                                                uint64_t append_size) {
     auto normalized_result = normalize_path(path);

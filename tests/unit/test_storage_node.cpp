@@ -45,11 +45,19 @@ uint64_t get_u64(const std::byte* src) {
     return be64toh(be);
 }
 
+// Faza 12.2 wire format: [u64 operation_id][u64 block_id][u64 offset]
+// [u64 block_version][u32 data_size][data] (see docs/design.md §16).
+// operation_id defaults to request_id — every call site here already uses
+// a distinct request_id per message, which is a fine (if not the "real")
+// source of uniqueness for these tests.
 Message make_write_request(uint64_t request_id, BlockId block_id, const std::vector<uint8_t>& data,
-                            uint64_t offset = 0) {
+                            uint64_t offset = 0, uint64_t block_version = 0,
+                            uint64_t operation_id = 0) {
     std::vector<std::byte> payload;
+    put_u64(payload, operation_id != 0 ? operation_id : request_id);
     put_u64(payload, block_id);
     put_u64(payload, offset);
+    put_u64(payload, block_version);
     put_u32(payload, static_cast<uint32_t>(data.size()));
     const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data());
     payload.insert(payload.end(), data_bytes, data_bytes + data.size());
@@ -217,8 +225,10 @@ TEST_F(StorageNodeTest, WriteBlockWithMismatchedDataSizeReturnsInvalidRequest) {
     TCPConnection client = connect_client(37007);
 
     std::vector<std::byte> payload;
-    put_u64(payload, 1);
+    put_u64(payload, 999);  // operation_id
+    put_u64(payload, 1);    // block_id
     put_u64(payload, 0);    // offset
+    put_u64(payload, 0);    // block_version
     put_u32(payload, 100);  // claims 100 bytes but sends none
     ASSERT_TRUE(client.sendMessage(Message{MessageType::WRITE_BLOCK, 1, payload}));
 

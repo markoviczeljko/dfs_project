@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/errors.h"
@@ -27,9 +28,15 @@ public:
 
     Result<BlockId> allocate_block();
     ErrorCode release_block(BlockId id);
-    ErrorCode write_block(BlockId id, const std::vector<uint8_t>& data);
+    ErrorCode write_block(BlockId id, const std::vector<uint8_t>& data, uint64_t block_version = 0);
     Result<std::vector<uint8_t>> read_block(BlockId id);
-    ErrorCode write_block_at(BlockId id, uint64_t offset, const std::vector<uint8_t>& data);
+    ErrorCode write_block_at(BlockId id, uint64_t offset, const std::vector<uint8_t>& data,
+                              uint64_t block_version = 0);
+
+    // Faza 12.2: thin passthroughs to BlockStorage — see its own comments
+    // for what these expose (docs/design.md §16).
+    Result<BlockStorage::BlockInfo> get_block_info(BlockId id) const;
+    std::vector<std::pair<BlockId, BlockStorage::BlockInfo>> enumerate_blocks() const;
 
 private:
     explicit BlockManager(std::unique_ptr<BlockStorage> storage);

@@ -37,6 +37,12 @@ enum class MessageType : uint16_t {
     DELETE_BLOCK,
     REPLICATE_BLOCK,
     COPY_BLOCK,
+    // Faza 12.2: the actual node-to-node block transfer COPY_BLOCK
+    // triggers — source Storage Node -> destination Storage Node, once
+    // Master's COPY_BLOCK command tells the source who to send to (see
+    // docs/design.md §16). Two message types for the two roles, same
+    // convention as WRITE_COMMIT vs WRITE_BLOCK.
+    COPY_BLOCK_DATA,
     GET_BLOCK_INFO,
 
     // Client <-> Storage Node (data plane)

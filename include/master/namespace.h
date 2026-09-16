@@ -109,6 +109,22 @@ public:
     ErrorCode set_block_replicas(BlockId block_id, std::vector<StorageNodeId> replicas);
     Result<BlockMetadata> block_metadata(BlockId block_id) const;
 
+    // Faza 12.2: recovery support (see docs/design.md §16).
+    // All blocks whose replica list currently includes node_id — what
+    // RecoveryManager::handle_node_failure() needs to find affected blocks.
+    std::vector<BlockId> blocks_with_replica(StorageNodeId node_id) const;
+    // Marks a block UNDER_REPLICATED. A no-op (not an error) if block_id is
+    // unknown — a block can vanish (DELETE/overwrite) between being found
+    // by blocks_with_replica() and being processed.
+    void mark_under_replicated(BlockId block_id);
+    // One atomic update once a new replica is confirmed valid: replaces
+    // old_node with new_node in the block's replica list and sets state
+    // (normally COMMITTED, closing the UNDER_REPLICATED window). A no-op
+    // if block_id is unknown (same reasoning as mark_under_replicated) or
+    // old_node isn't actually in its replica list.
+    void update_block_replicas_after_recovery(BlockId block_id, StorageNodeId old_node,
+                                               StorageNodeId new_node, BlockState new_state);
+
 private:
     static Result<std::string> normalize_path(const std::string& path);
 

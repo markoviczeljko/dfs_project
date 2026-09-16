@@ -95,6 +95,8 @@ Result<std::unique_ptr<Client>> Client::create(Config config) {
 
 uint64_t Client::next_request_id() { return next_request_id_++; }
 
+OperationId Client::next_operation_id() { return operation_id_rng_(); }
+
 Result<Message> Client::call_master(const Message& request) {
     if (!master_connection_.sendMessage(request)) {
         return Result<Message>::err(ErrorCode::INTERNAL_ERROR);
@@ -229,13 +231,20 @@ Result<std::vector<Client::ReplicaLocation>> Client::parse_replica_list(
     return Result<std::vector<ReplicaLocation>>::ok(std::move(replicas));
 }
 
-ErrorCode Client::write_chunk_to_replicas(BlockId block_id, uint64_t offset, const uint8_t* data,
-                                           size_t len, const std::vector<ReplicaLocation>& replicas) {
+ErrorCode Client::write_chunk_to_replicas(BlockId block_id, uint64_t offset, uint64_t block_version,
+                                           const uint8_t* data, size_t len,
+                                           const std::vector<ReplicaLocation>& replicas) {
     // Data plane — never routed through Master, one fresh connection per
     // replica (no pooling, see docs/design.md §11). Commit requires ALL
     // replicas to ACK (strict 3/3, see docs/design.md §13), so abort
     // immediately on the first failure — no point trying the remaining
     // replicas once commit is already impossible.
+    //
+    // One operation_id per logical chunk-write, reused across all replica
+    // sends — lets a Storage Node retry-detect this exact chunk-write
+    // regardless of which replica a retry lands on (see docs/design.md
+    // §16).
+    OperationId operation_id = next_operation_id();
     for (const ReplicaLocation& location : replicas) {
         auto socket_result = Socket::create();
         if (socket_result.is_error()) {
@@ -248,8 +257,10 @@ ErrorCode Client::write_chunk_to_replicas(BlockId block_id, uint64_t offset, con
         TCPConnection node_connection(std::move(socket));
 
         std::vector<std::byte> write_payload;
+        put_u64(write_payload, operation_id);
         put_u64(write_payload, block_id);
         put_u64(write_payload, offset);
+        put_u64(write_payload, block_version);
         put_u32(write_payload, static_cast<uint32_t>(len));
         const auto* data_bytes = reinterpret_cast<const std::byte*>(data);
         write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
@@ -309,8 +320,9 @@ Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, c
 
         // Step 2: write this chunk (as a brand-new block, offset 0) to
         // every replica.
-        ErrorCode write_err = write_chunk_to_replicas(block_id, /*offset=*/0, data + chunk_offset,
-                                                       chunk_len, replicas_result.value());
+        ErrorCode write_err =
+            write_chunk_to_replicas(block_id, /*offset=*/0, /*block_version=*/0,
+                                     data + chunk_offset, chunk_len, replicas_result.value());
         if (write_err != ErrorCode::OK) {
             return Result<std::vector<BlockId>>::err(write_err);
         }
@@ -419,9 +431,9 @@ ErrorCode Client::append(const std::string& path, const std::vector<uint8_t>& da
         }
 
         if (fill_amount > 0) {
-            ErrorCode write_err = write_chunk_to_replicas(existing_block_id, expected_prior_size,
-                                                           data.data(), fill_amount,
-                                                           replicas_result.value());
+            ErrorCode write_err = write_chunk_to_replicas(
+                existing_block_id, expected_prior_size, /*block_version=*/0, data.data(),
+                fill_amount, replicas_result.value());
             if (write_err != ErrorCode::OK) {
                 return write_err;
             }

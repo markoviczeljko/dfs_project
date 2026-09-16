@@ -22,6 +22,7 @@ target_link_libraries(network PUBLIC common Threads::Threads)
 add_library(storage
     src/storage/block_storage.cpp
     src/storage/block_manager.cpp
+    src/storage/operation_log.cpp
     src/storage/storage_node.cpp
 )
 target_include_directories(storage PUBLIC include)
@@ -32,6 +33,7 @@ add_library(master
     src/master/storage_registry.cpp
     src/master/replication_manager.cpp
     src/master/failure_detector.cpp
+    src/master/recovery_manager.cpp
     src/master/master.cpp
 )
 target_include_directories(master PUBLIC include)

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "common/types.h"
@@ -35,6 +36,14 @@ public:
     ReplicationManager& operator=(const ReplicationManager&) = delete;
 
     std::vector<StorageNodeId> choose_replicas(BlockId block_id);
+
+    // Faza 12.2: picks one HEALTHY node not already in exclude (typically
+    // the block's current replica set) as a recovery destination — reuses
+    // get_alive_nodes() rather than inventing separate placement logic
+    // (see docs/design.md §16). Returns nullopt if every healthy node is
+    // already excluded.
+    std::optional<StorageNodeId> choose_recovery_destination(
+        const std::vector<StorageNodeId>& exclude);
 
 private:
     StorageRegistry& registry_;

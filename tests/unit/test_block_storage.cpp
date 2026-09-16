@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -218,4 +219,79 @@ TEST_F(BlockStorageTest, ConcurrentReadsAndWritesStayConsistent) {
         expected_used += 100;
     }
     EXPECT_EQ(storage->used_space(), expected_used);
+}
+
+// Faza 12.2: block_version / get_block_info / enumerate_blocks (see
+// docs/design.md §16).
+
+TEST_F(BlockStorageTest, WriteBlockPersistsVersionAndGetBlockInfoReturnsIt) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    std::vector<uint8_t> data = {1, 2, 3};
+    ASSERT_EQ(storage->write_block(1, data, /*block_version=*/7), ErrorCode::OK);
+
+    auto info = storage->get_block_info(1);
+    ASSERT_TRUE(info.is_ok());
+    EXPECT_EQ(info.value().size, data.size());
+    EXPECT_EQ(info.value().version, 7u);
+}
+
+TEST_F(BlockStorageTest, GetBlockInfoOnMissingBlockFails) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    EXPECT_EQ(storage->get_block_info(999).error(), ErrorCode::BLOCK_NOT_FOUND);
+}
+
+TEST_F(BlockStorageTest, WriteBlockAtPreservesPassedVersion) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, std::vector<uint8_t>{1, 2}, /*block_version=*/1),
+              ErrorCode::OK);
+    ASSERT_EQ(storage->write_block_at(1, 2, std::vector<uint8_t>{3}, /*block_version=*/2),
+              ErrorCode::OK);
+
+    auto info = storage->get_block_info(1);
+    ASSERT_TRUE(info.is_ok());
+    EXPECT_EQ(info.value().version, 2u);
+}
+
+TEST_F(BlockStorageTest, EnumerateBlocksReturnsEveryBlockWithCorrectInfo) {
+    auto result = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(result.is_ok());
+    auto storage = std::move(result.value());
+
+    ASSERT_EQ(storage->write_block(1, std::vector<uint8_t>{1, 2}, /*block_version=*/3),
+              ErrorCode::OK);
+    ASSERT_EQ(storage->write_block(2, std::vector<uint8_t>{1, 2, 3}, /*block_version=*/5),
+              ErrorCode::OK);
+
+    auto blocks = storage->enumerate_blocks();
+    ASSERT_EQ(blocks.size(), 2u);
+    std::sort(blocks.begin(), blocks.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    EXPECT_EQ(blocks[0].first, 1u);
+    EXPECT_EQ(blocks[0].second.version, 3u);
+    EXPECT_EQ(blocks[1].first, 2u);
+    EXPECT_EQ(blocks[1].second.version, 5u);
+}
+
+TEST_F(BlockStorageTest, RecoverAfterRestartReadsPersistedVersion) {
+    {
+        auto result = BlockStorage::create(dir_, 1024 * 1024);
+        ASSERT_TRUE(result.is_ok());
+        ASSERT_EQ(result.value()->write_block(1, std::vector<uint8_t>{9, 9}, /*block_version=*/42),
+                  ErrorCode::OK);
+    }
+
+    auto reopened = BlockStorage::create(dir_, 1024 * 1024);
+    ASSERT_TRUE(reopened.is_ok());
+    auto info = reopened.value()->get_block_info(1);
+    ASSERT_TRUE(info.is_ok());
+    EXPECT_EQ(info.value().version, 42u);
 }

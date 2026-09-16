@@ -14,6 +14,7 @@
 #include "network/network_server.h"
 #include "network/protocol.h"
 #include "storage/block_manager.h"
+#include "storage/operation_log.h"
 
 // The Storage Node process: owns a BlockManager (local block persistence)
 // and a NetworkServer (accept-loop), and wires WRITE_BLOCK/READ_BLOCK/
@@ -50,6 +51,13 @@ private:
     Message handle_write_block(const Message& request);
     Message handle_read_block(const Message& request);
     Message handle_delete_block(const Message& request);
+    // Faza 12.2: source role — relays this node's copy of a block to
+    // another node, on Master's instruction (see docs/design.md §16).
+    Message handle_copy_block(const Message& request);
+    // Faza 12.2: destination role — receives a block pushed by
+    // handle_copy_block() on another node, verifies its checksum before
+    // ever writing to disk.
+    Message handle_copy_block_data(const Message& request);
     ErrorCode register_with_master();
     static Message make_error(uint64_t request_id, ErrorCode error);
 
@@ -63,6 +71,10 @@ private:
     Config config_;
     std::unique_ptr<BlockManager> block_manager_;
     std::unique_ptr<NetworkServer> network_server_;
+    // Faza 12.2: shared by WRITE_BLOCK and COPY_BLOCK_DATA — see
+    // operation_log.h for why one shared log is safe (see docs/design.md
+    // §16).
+    OperationLog operation_log_;
 
     std::thread heartbeat_thread_;
     std::mutex heartbeat_cv_mutex_;

@@ -1079,3 +1079,77 @@ thread-ovima, čisto gašenje preko `SIGINT` (bez zaglavljivanja `stop()`-a
 oko novih thread-ova).
 
 165/165 testova prolazi (152 stari + 13 nov), čisto pod ASan/UBSan.
+
+### 16.2 — Recovery / re-replikacija + WRITE_BLOCK idempotency retrofit
+
+**Novi tipovi**: `OperationId` (alias za `uint64_t`, `common/types.h`).
+`OperationLog` (`storage/operation_log.h`) — per-StorageNode bounded FIFO
+ledger `{OperationId → OperationRecord{state, result, response_payload}}`,
+dijeljen između `WRITE_BLOCK`- i `COPY_BLOCK_DATA`-handler-a (kolizija
+namespace-a je zanemarljiva jer su ID-jevi nasumični 64-bitni brojevi, ne
+monotoni brojači po procesu — dva različita `Client`/`RecoveryManager`
+procesa koji oba počinju od 1 bi kolidirala).
+
+**`BlockHeader` dobija `block_version`** — `BLOCK_HEADER_SIZE` 22→30,
+`BLOCK_HEADER_VERSION` 1→2 (bezbjedno mijenjati on-disk format, `data/` je
+gitignored). `BlockStorage`/`BlockManager` dobijaju `get_block_info()`,
+`enumerate_blocks()`, i `write_block()`/`write_block_at()` sad primaju
+`block_version` (default 0 za sve pre-12.2 pozivaoce). CRC32 promovisan iz
+`block_storage.cpp`-ove anonimne oblasti u `compute_block_checksum()`
+(`storage/block_header.h`), dijeljen sa novim `handle_copy_block_data()`-om
+za in-transit verifikaciju (§8.14 — checksum se provjerava PRIJE upisa na
+disk).
+
+**Wire protokol**: nov `COPY_BLOCK_DATA` tip (source→destination stvarni
+transfer podataka, `COPY_BLOCK` ostaje samo Master→source komanda — isti
+obrazac kao `WRITE_COMMIT`/`WRITE_BLOCK`). `WRITE_BLOCK` prošireno sa
+`operation_id` (prefiks) i `block_version` (prije `data_size`) —
+bezbjedno mijenjati jer svi pozivaoci idu isključivo preko `Client`-ovog
+javnog API-ja, ne preko hardkodovanog wire layout-a.
+
+**`RecoveryManager`** (nova klasa, `include/master/recovery_manager.h`) —
+NAMJERNO odvojena od `ReplicationManager`-a (koji ostaje potpuno netaknut,
+`choose_replicas()` nedirnut). Pool od tačno
+`MAX_CONCURRENT_RECOVERY_OPERATIONS`(=4) worker thread-ova nad dijeljenim
+thread-safe redom. `handle_node_failure()` (kačeno kao
+`FailureDetector`-ov `on_node_dead` callback) pronalazi pogođene blokove
+preko nove `NamespaceManager::blocks_with_replica()`, markira ih
+`UNDER_REPLICATED`, stavlja u red. `recover_block()` retry-uje IN-PLACE
+(ne re-queue) do `MAX_RECOVERY_ATTEMPTS_PER_BLOCK`(=5) puta: bira zdrav
+source (bilo koja preostala replika sa `NodeState::HEALTHY`) i zdravu
+destinaciju (`ReplicationManager::choose_recovery_destination()`, isključuje
+trenutne replike), šalje `COPY_BLOCK` na source, koji sam relay-uje stvarne
+bajtove ka destinaciji (`COPY_BLOCK_DATA`) — Master nikad ne prenosi
+payload (§8.8/§7.13). Na uspjeh, `NamespaceManager::update_block_replicas_after_recovery()`
+atomski zamjenjuje stari node novim i markira `COMMITTED`.
+
+**KRITIČNA lekcija iz Faze 11 primijenjena eksplicitno**: `send_copy_block()`
+(Master→source) I `StorageNode::handle_copy_block()` (source→destination)
+OBJE koriste `Socket::set_timeout(COPY_BLOCK_TIMEOUT_MS)` — recovery ima
+DVIJE odlazne noge, ne jednu kao Faza 11-ov `send_delete_block`, i obje
+moraju biti ograničene.
+
+**Nasumičan `OperationId` umjesto monotonog brojača** — `Client` i
+`RecoveryManager` oboje generišu `OperationId` preko `std::mt19937_64`
+(prva i druga upotreba `<random>`-a u projektu), ne preko postojećeg
+`next_request_id_`-obrasca, jer bi dva različita procesa koja oba počinju
+brojanje od 1 mogla kolidirati na potpuno različitim operacijama nad istim
+blokom na istom node-u.
+
+**Ručna verifikacija**: automatizovani `RecoveryIntegrationTest.KilledNodeTriggersRecoveryAndReadKeepsSucceeding`
+(pravi `Master` + 4 prava `StorageNode` objekta, RF=3) već predstavlja
+punu end-to-end provjeru definicije gotovog iz `IMPLEMENTATION_PLAN.md`-a:
+ubij node usred klastera → potvrdi READ i dalje uspijeva tokom cijelog
+procesa → potvrdi 3 replike ponovo na disku (4. node preuzima ulogu) →
+sadržaj identičan originalu. Traje ~12s (stvarni `SUSPECTED_TIMEOUT_SECONDS`+
+`DEAD_TIMEOUT_SECONDS`), namjerno bez skraćenih test-only timeout-a jer
+testira Master-ov CIJELI stvaran failure-detection put, ne izolovanu klasu.
+Posebna ručna multi-process (`scripts/start_*.sh`) provjera preskočena ovaj
+put — ova automatizovana provjera već koristi prave `StorageNode` objekte
+sa pravim diskom/checksumovima/mrežom, samo u jednom test procesu umjesto
+više OS procesa; puna multi-process validacija ostaje za Fazu 16
+(§16.3-§16.5, koja eksplicitno postoji baš za ovu razliku).
+
+177/177 testova prolazi (165 stari + 12 nov: 5 u `test_block_storage.cpp`,
+6 u novom `test_operation_log.cpp`, 1 nov integration `test_recovery.cpp`),
+čisto pod ASan/UBSan.

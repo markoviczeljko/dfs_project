@@ -71,7 +71,9 @@ uint64_t get_u64(const std::byte* src) {
 Master::Master(Config config)
     : config_(std::move(config)),
       replication_manager_(storage_registry_),
-      failure_detector_(storage_registry_) {}
+      recovery_manager_(namespace_manager_, storage_registry_, replication_manager_),
+      failure_detector_(storage_registry_,
+                         [this](StorageNodeId node_id) { recovery_manager_.handle_node_failure(node_id); }) {}
 
 Result<std::unique_ptr<Master>> Master::create(Config config) {
     auto master = std::unique_ptr<Master>(new Master(std::move(config)));
@@ -89,12 +91,14 @@ ErrorCode Master::start() {
     if (result != ErrorCode::OK) {
         return result;
     }
+    recovery_manager_.start();
     failure_detector_.start();
     return ErrorCode::OK;
 }
 
 void Master::stop() {
     failure_detector_.stop();
+    recovery_manager_.stop();
     if (network_server_) {
         network_server_->stop();
     }

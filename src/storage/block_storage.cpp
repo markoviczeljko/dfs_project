@@ -48,27 +48,6 @@ uint64_t get_u64(const std::byte* src) {
     return be64toh(be);
 }
 
-// Standard CRC-32 (IEEE 802.3 polynomial 0xEDB88320), table-based.
-uint32_t crc32(const std::vector<uint8_t>& data) {
-    static const auto table = [] {
-        std::array<uint32_t, 256> t{};
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) {
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            }
-            t[i] = c;
-        }
-        return t;
-    }();
-
-    uint32_t crc = 0xFFFFFFFFu;
-    for (uint8_t byte : data) {
-        crc = table[(crc ^ byte) & 0xFFu] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
-
 bool full_pwrite(int fd, const void* data, size_t size, off_t offset) {
     const char* cursor = static_cast<const char*>(data);
     size_t remaining = size;
@@ -97,6 +76,26 @@ bool full_pread(int fd, void* buffer, size_t size, off_t offset) {
 
 }  // namespace
 
+uint32_t compute_block_checksum(const std::vector<uint8_t>& data) {
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint8_t byte : data) {
+        crc = table[(crc ^ byte) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 std::array<std::byte, BLOCK_HEADER_SIZE> serialize_block_header(const BlockHeader& header) {
     std::array<std::byte, BLOCK_HEADER_SIZE> bytes{};
     put_u32(bytes.data(), header.magic);
@@ -104,6 +103,7 @@ std::array<std::byte, BLOCK_HEADER_SIZE> serialize_block_header(const BlockHeade
     put_u64(bytes.data() + 6, header.block_id);
     put_u32(bytes.data() + 14, header.data_size);
     put_u32(bytes.data() + 18, header.checksum);
+    put_u64(bytes.data() + 22, header.block_version);
     return bytes;
 }
 
@@ -114,6 +114,7 @@ Result<BlockHeader> deserialize_block_header(std::span<const std::byte, BLOCK_HE
     header.block_id = get_u64(bytes.data() + 6);
     header.data_size = get_u32(bytes.data() + 14);
     header.checksum = get_u32(bytes.data() + 18);
+    header.block_version = get_u64(bytes.data() + 22);
 
     if (header.magic != BLOCK_MAGIC || header.version != BLOCK_HEADER_VERSION) {
         return Result<BlockHeader>::err(ErrorCode::BLOCK_CORRUPTED);
@@ -188,21 +189,24 @@ ErrorCode BlockStorage::recover() {
         ::close(fd);
         if (!data_ok) continue;
 
-        if (crc32(data) != header.checksum) continue;  // corrupted, exclude from index
+        if (compute_block_checksum(data) != header.checksum) continue;  // corrupted, exclude from index
 
-        local_blocks_[header.block_id] = LocalBlockInfo{header.data_size, header.checksum};
+        local_blocks_[header.block_id] =
+            LocalBlockInfo{header.data_size, header.checksum, header.block_version};
         used_space_ += header.data_size;
     }
 
     return ErrorCode::OK;
 }
 
-ErrorCode BlockStorage::write_block(BlockId id, const std::vector<uint8_t>& data) {
+ErrorCode BlockStorage::write_block(BlockId id, const std::vector<uint8_t>& data,
+                                     uint64_t block_version) {
     std::unique_lock lock(mutex_);
-    return write_block_locked(id, data);
+    return write_block_locked(id, data, block_version);
 }
 
-ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t>& data) {
+ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t>& data,
+                                            uint64_t block_version) {
     uint64_t existing_size = 0;
     if (auto it = local_blocks_.find(id); it != local_blocks_.end()) {
         existing_size = it->second.size;
@@ -212,8 +216,12 @@ ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t
         return ErrorCode::STORAGE_FULL;
     }
 
-    BlockHeader header{BLOCK_MAGIC, BLOCK_HEADER_VERSION, id, static_cast<uint32_t>(data.size()),
-                        crc32(data)};
+    BlockHeader header{BLOCK_MAGIC,
+                        BLOCK_HEADER_VERSION,
+                        id,
+                        static_cast<uint32_t>(data.size()),
+                        compute_block_checksum(data),
+                        block_version};
     auto header_bytes = serialize_block_header(header);
 
     std::filesystem::path tmp = temp_path(id);
@@ -250,7 +258,7 @@ ErrorCode BlockStorage::write_block_locked(BlockId id, const std::vector<uint8_t
         ::close(dir_fd);
     }
 
-    local_blocks_[id] = LocalBlockInfo{data.size(), header.checksum};
+    local_blocks_[id] = LocalBlockInfo{data.size(), header.checksum, block_version};
     used_space_ = prospective_used;
 
     return ErrorCode::OK;
@@ -289,7 +297,7 @@ Result<std::vector<uint8_t>> BlockStorage::read_block_locked(BlockId id) const {
     bool data_ok = full_pread(fd, data.data(), data.size(), static_cast<off_t>(BLOCK_HEADER_SIZE));
     ::close(fd);
 
-    if (!data_ok || header.block_id != id || crc32(data) != header.checksum) {
+    if (!data_ok || header.block_id != id || compute_block_checksum(data) != header.checksum) {
         return Result<std::vector<uint8_t>>::err(ErrorCode::BLOCK_CORRUPTED);
     }
 
@@ -297,7 +305,7 @@ Result<std::vector<uint8_t>> BlockStorage::read_block_locked(BlockId id) const {
 }
 
 ErrorCode BlockStorage::write_block_at(BlockId id, uint64_t offset,
-                                        const std::vector<uint8_t>& data) {
+                                        const std::vector<uint8_t>& data, uint64_t block_version) {
     std::unique_lock lock(mutex_);
 
     if (local_blocks_.find(id) == local_blocks_.end()) {
@@ -317,7 +325,7 @@ ErrorCode BlockStorage::write_block_at(BlockId id, uint64_t offset,
     }
     std::copy(data.begin(), data.end(), merged.begin() + static_cast<ptrdiff_t>(offset));
 
-    return write_block_locked(id, merged);
+    return write_block_locked(id, merged, block_version);
 }
 
 ErrorCode BlockStorage::delete_block(BlockId id) {
@@ -340,6 +348,25 @@ ErrorCode BlockStorage::delete_block(BlockId id) {
 bool BlockStorage::block_exists(BlockId id) const {
     std::shared_lock lock(mutex_);
     return local_blocks_.contains(id);
+}
+
+Result<BlockStorage::BlockInfo> BlockStorage::get_block_info(BlockId id) const {
+    std::shared_lock lock(mutex_);
+    auto it = local_blocks_.find(id);
+    if (it == local_blocks_.end()) {
+        return Result<BlockInfo>::err(ErrorCode::BLOCK_NOT_FOUND);
+    }
+    return Result<BlockInfo>::ok(BlockInfo{it->second.size, it->second.checksum, it->second.version});
+}
+
+std::vector<std::pair<BlockId, BlockStorage::BlockInfo>> BlockStorage::enumerate_blocks() const {
+    std::shared_lock lock(mutex_);
+    std::vector<std::pair<BlockId, BlockInfo>> blocks;
+    blocks.reserve(local_blocks_.size());
+    for (const auto& [id, info] : local_blocks_) {
+        blocks.emplace_back(id, BlockInfo{info.size, info.checksum, info.version});
+    }
+    return blocks;
 }
 
 uint64_t BlockStorage::used_space() const {

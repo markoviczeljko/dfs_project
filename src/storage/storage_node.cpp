@@ -9,6 +9,7 @@
 #include "common/config.h"
 #include "network/connection.h"
 #include "network/socket.h"
+#include "storage/block_header.h"
 
 namespace {
 
@@ -61,6 +62,11 @@ uint64_t get_u64(const std::byte* src) {
 constexpr size_t kBlockIdSize = sizeof(uint64_t);
 constexpr size_t kOffsetSize = sizeof(uint64_t);
 constexpr size_t kDataSizeFieldSize = sizeof(uint32_t);
+constexpr size_t kOperationIdSize = sizeof(uint64_t);
+constexpr size_t kBlockVersionSize = sizeof(uint64_t);
+constexpr size_t kChecksumSize = sizeof(uint32_t);
+constexpr size_t kNodeIdSize = sizeof(uint64_t);
+constexpr size_t kPortSize = sizeof(uint16_t);
 
 }  // namespace
 
@@ -192,32 +198,62 @@ Message StorageNode::handle_message(const Message& request) {
             return handle_read_block(request);
         case MessageType::DELETE_BLOCK:
             return handle_delete_block(request);
+        case MessageType::COPY_BLOCK:
+            return handle_copy_block(request);
+        case MessageType::COPY_BLOCK_DATA:
+            return handle_copy_block_data(request);
         default:
             return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 }
 
 Message StorageNode::handle_write_block(const Message& request) {
-    // Faza 10 wire format: [u64 block_id][u64 offset][u32 data_size][data]
-    // (see docs/design.md §14). offset == 0 keeps write_block()'s existing
-    // full-overwrite behavior unchanged; offset > 0 is the new
-    // append-at-offset path.
-    if (request.payload.size() < kBlockIdSize + kOffsetSize + kDataSizeFieldSize) {
+    // Faza 12.2 wire format: [u64 operation_id][u64 block_id][u64 offset]
+    // [u64 block_version][u32 data_size][data] (see docs/design.md §16;
+    // extends Faza 10's format with operation_id/block_version, prepended/
+    // inserted respectively). offset == 0 keeps write_block()'s existing
+    // full-overwrite behavior unchanged; offset > 0 is the append-at-offset
+    // path (see docs/design.md §14).
+    size_t header_size =
+        kOperationIdSize + kBlockIdSize + kOffsetSize + kBlockVersionSize + kDataSizeFieldSize;
+    if (request.payload.size() < header_size) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 
-    BlockId block_id = get_u64(request.payload.data());
-    uint64_t offset = get_u64(request.payload.data() + kBlockIdSize);
-    uint32_t data_size = get_u32(request.payload.data() + kBlockIdSize + kOffsetSize);
-    size_t expected_size = kBlockIdSize + kOffsetSize + kDataSizeFieldSize + data_size;
-    if (request.payload.size() != expected_size) {
+    size_t cursor = 0;
+    OperationId operation_id = get_u64(request.payload.data() + cursor);
+    cursor += kOperationIdSize;
+    BlockId block_id = get_u64(request.payload.data() + cursor);
+    cursor += kBlockIdSize;
+    uint64_t offset = get_u64(request.payload.data() + cursor);
+    cursor += kOffsetSize;
+    uint64_t block_version = get_u64(request.payload.data() + cursor);
+    cursor += kBlockVersionSize;
+    uint32_t data_size = get_u32(request.payload.data() + cursor);
+    cursor += kDataSizeFieldSize;
+    if (request.payload.size() != cursor + data_size) {
         return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    // Idempotency: a retried WRITE_BLOCK (lost ACK) must not double-apply —
+    // see docs/design.md §16, §8.13/§8.18-§8.20.
+    auto existing = operation_log_.begin_or_get(operation_id);
+    if (existing.has_value()) {
+        if (existing->state == OperationState::IN_PROGRESS) {
+            // A genuinely concurrent duplicate (not the common lost-ACK
+            // case, which would already be COMPLETED/FAILED by the time a
+            // retry arrives) — reject rather than block; the caller's own
+            // bounded retry policy will try again (see docs/design.md §16).
+            return make_error(request.request_id, ErrorCode::TIMEOUT);
+        }
+        MessageType type =
+            (existing->result == ErrorCode::OK) ? MessageType::ACK : MessageType::ERROR;
+        return Message{type, request.request_id, existing->response_payload};
     }
 
     std::vector<uint8_t> data(data_size);
     if (data_size > 0) {
-        std::memcpy(data.data(), request.payload.data() + kBlockIdSize + kOffsetSize + kDataSizeFieldSize,
-                    data_size);
+        std::memcpy(data.data(), request.payload.data() + cursor, data_size);
     }
 
     // offset == 0 always means "this is the block's complete, definitive
@@ -229,14 +265,21 @@ Message StorageNode::handle_write_block(const Message& request) {
     // first thing to ever write to it beyond allocate_block() (see
     // docs/design.md §14). If that invariant ever changes, this branch
     // needs a real is_new_block flag instead of overloading offset==0.
-    ErrorCode result = (offset == 0) ? block_manager_->write_block(block_id, data)
-                                      : block_manager_->write_block_at(block_id, offset, data);
-    if (result != ErrorCode::OK) {
-        return make_error(request.request_id, result);
-    }
+    ErrorCode result = (offset == 0)
+                            ? block_manager_->write_block(block_id, data, block_version)
+                            : block_manager_->write_block_at(block_id, offset, data, block_version);
 
     std::vector<std::byte> response_payload;
-    put_u64(response_payload, block_id);
+    if (result == ErrorCode::OK) {
+        put_u64(response_payload, block_id);
+    } else {
+        put_u16(response_payload, static_cast<uint16_t>(result));
+    }
+    operation_log_.complete(operation_id, result, response_payload);
+
+    if (result != ErrorCode::OK) {
+        return Message{MessageType::ERROR, request.request_id, std::move(response_payload)};
+    }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
 
@@ -271,5 +314,159 @@ Message StorageNode::handle_delete_block(const Message& request) {
 
     std::vector<std::byte> response_payload;
     put_u64(response_payload, block_id);
+    return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
+}
+
+Message StorageNode::handle_copy_block(const Message& request) {
+    // Source role. Wire format: [u64 operation_id][u64 block_id]
+    // [u64 expected_version][u32 dest_host_len][dest_host][u16 dest_port]
+    // [u64 dest_node_id] (dest_node_id is carried for logging/error context
+    // only — the connection itself is addressed by host/port) (see
+    // docs/design.md §16).
+    //
+    // No operation_log_ dedup here: a retried COPY_BLOCK just re-sends the
+    // same COPY_BLOCK_DATA, which IS deduped (shared log) on the
+    // destination — end-to-end idempotency doesn't need this leg to be
+    // idempotent on its own too.
+    size_t header_size = kOperationIdSize + kBlockIdSize + kBlockVersionSize + sizeof(uint32_t);
+    if (request.payload.size() < header_size) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    size_t cursor = 0;
+    OperationId operation_id = get_u64(request.payload.data() + cursor);
+    cursor += kOperationIdSize;
+    BlockId block_id = get_u64(request.payload.data() + cursor);
+    cursor += kBlockIdSize;
+    uint64_t expected_version = get_u64(request.payload.data() + cursor);
+    cursor += kBlockVersionSize;
+    uint32_t dest_host_len = get_u32(request.payload.data() + cursor);
+    cursor += sizeof(uint32_t);
+    if (request.payload.size() != cursor + dest_host_len + kPortSize + kNodeIdSize) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    std::string dest_host(reinterpret_cast<const char*>(request.payload.data() + cursor),
+                           dest_host_len);
+    cursor += dest_host_len;
+    uint16_t dest_port = get_u16(request.payload.data() + cursor);
+    cursor += kPortSize;
+    // dest_node_id trailing field intentionally unread — see comment above.
+
+    auto info = block_manager_->get_block_info(block_id);
+    if (info.is_error()) {
+        return make_error(request.request_id, info.error());
+    }
+    // Defensive: Master picked this node as a known-healthy source, so a
+    // mismatch here means something already went wrong locally — refuse
+    // rather than propagate bad data to a third node.
+    if (info.value().version != expected_version) {
+        return make_error(request.request_id, ErrorCode::BLOCK_CORRUPTED);
+    }
+    auto data_result = block_manager_->read_block(block_id);
+    if (data_result.is_error()) {
+        return make_error(request.request_id, data_result.error());
+    }
+    const std::vector<uint8_t>& data = data_result.value();
+
+    auto socket_result = Socket::create();
+    if (socket_result.is_error()) {
+        return make_error(request.request_id, socket_result.error());
+    }
+    Socket socket = std::move(socket_result.value());
+    if (ErrorCode err = socket.set_timeout(COPY_BLOCK_TIMEOUT_MS); err != ErrorCode::OK) {
+        return make_error(request.request_id, err);
+    }
+    if (ErrorCode err = socket.connect(dest_host, dest_port); err != ErrorCode::OK) {
+        return make_error(request.request_id, err);
+    }
+    TCPConnection dest_connection(std::move(socket));
+
+    std::vector<std::byte> copy_payload;
+    put_u64(copy_payload, operation_id);
+    put_u64(copy_payload, block_id);
+    put_u64(copy_payload, expected_version);
+    put_u32(copy_payload, static_cast<uint32_t>(data.size()));
+    const auto* data_bytes = reinterpret_cast<const std::byte*>(data.data());
+    copy_payload.insert(copy_payload.end(), data_bytes, data_bytes + data.size());
+    put_u32(copy_payload, compute_block_checksum(data));
+
+    if (!dest_connection.sendMessage(
+            Message{MessageType::COPY_BLOCK_DATA, operation_id, std::move(copy_payload)})) {
+        return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
+    }
+    auto dest_response = dest_connection.receiveMessage();
+    if (!dest_response.has_value()) {
+        return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
+    }
+    if (dest_response->type != MessageType::ACK) {
+        if (dest_response->payload.size() < sizeof(uint16_t)) {
+            return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
+        }
+        return make_error(request.request_id,
+                           static_cast<ErrorCode>(get_u16(dest_response->payload.data())));
+    }
+    return Message{MessageType::ACK, request.request_id, {}};
+}
+
+Message StorageNode::handle_copy_block_data(const Message& request) {
+    // Destination role. Wire format: [u64 operation_id][u64 block_id]
+    // [u64 block_version][u32 data_size][data][u32 source_checksum] (see
+    // docs/design.md §16, §8.14 — verify before ever writing to disk).
+    size_t fixed_size = kOperationIdSize + kBlockIdSize + kBlockVersionSize + kDataSizeFieldSize;
+    if (request.payload.size() < fixed_size + kChecksumSize) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    size_t cursor = 0;
+    OperationId operation_id = get_u64(request.payload.data() + cursor);
+    cursor += kOperationIdSize;
+    BlockId block_id = get_u64(request.payload.data() + cursor);
+    cursor += kBlockIdSize;
+    uint64_t block_version = get_u64(request.payload.data() + cursor);
+    cursor += kBlockVersionSize;
+    uint32_t data_size = get_u32(request.payload.data() + cursor);
+    cursor += kDataSizeFieldSize;
+    if (request.payload.size() != cursor + data_size + kChecksumSize) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    // Shared with WRITE_BLOCK's dedup — see operation_log.h.
+    auto existing = operation_log_.begin_or_get(operation_id);
+    if (existing.has_value()) {
+        if (existing->state == OperationState::IN_PROGRESS) {
+            return make_error(request.request_id, ErrorCode::TIMEOUT);
+        }
+        MessageType type =
+            (existing->result == ErrorCode::OK) ? MessageType::ACK : MessageType::ERROR;
+        return Message{type, request.request_id, existing->response_payload};
+    }
+
+    std::vector<uint8_t> data(data_size);
+    if (data_size > 0) {
+        std::memcpy(data.data(), request.payload.data() + cursor, data_size);
+    }
+    cursor += data_size;
+    uint32_t source_checksum = get_u32(request.payload.data() + cursor);
+
+    ErrorCode result;
+    if (compute_block_checksum(data) != source_checksum) {
+        // In-transit corruption — never write it, even provisionally (see
+        // docs/design.md §16, §8.14).
+        result = ErrorCode::BLOCK_CORRUPTED;
+    } else {
+        result = block_manager_->write_block(block_id, data, block_version);
+    }
+
+    std::vector<std::byte> response_payload;
+    if (result == ErrorCode::OK) {
+        put_u64(response_payload, block_id);
+    } else {
+        put_u16(response_payload, static_cast<uint16_t>(result));
+    }
+    operation_log_.complete(operation_id, result, response_payload);
+
+    if (result != ErrorCode::OK) {
+        return Message{MessageType::ERROR, request.request_id, std::move(response_payload)};
+    }
     return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }

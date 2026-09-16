@@ -9,6 +9,7 @@
 #include "common/errors.h"
 #include "master/failure_detector.h"
 #include "master/namespace.h"
+#include "master/recovery_manager.h"
 #include "master/replication_manager.h"
 #include "master/storage_registry.h"
 #include "network/network_server.h"
@@ -69,8 +70,10 @@ private:
     NamespaceManager namespace_manager_;
     StorageRegistry storage_registry_;
     ReplicationManager replication_manager_;
-    // No-op on_node_dead callback in 12.1 — wired to RecoveryManager in
-    // 12.2 (see docs/design.md §16).
+    // Constructed before failure_detector_ so its callback can reference
+    // it; on_metadata_changed stays the default no-op until Faza 12.4
+    // wires it to Master's persistence hook.
+    RecoveryManager recovery_manager_;
     FailureDetector failure_detector_;
     std::unique_ptr<NetworkServer> network_server_;
     // Atomic: unlike Client (single-threaded/CLI use), Master's NetworkServer

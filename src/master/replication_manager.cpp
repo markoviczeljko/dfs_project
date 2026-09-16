@@ -24,3 +24,17 @@ std::vector<StorageNodeId> ReplicationManager::choose_replicas(BlockId /*block_i
     cursor_ += DEFAULT_REPLICATION_FACTOR;
     return chosen;
 }
+
+std::optional<StorageNodeId> ReplicationManager::choose_recovery_destination(
+    const std::vector<StorageNodeId>& exclude) {
+    std::vector<StorageNodeInfo> alive = registry_.get_alive_nodes();
+    std::sort(alive.begin(), alive.end(),
+              [](const StorageNodeInfo& a, const StorageNodeInfo& b) { return a.id < b.id; });
+
+    for (const StorageNodeInfo& node : alive) {
+        if (std::find(exclude.begin(), exclude.end(), node.id) == exclude.end()) {
+            return node.id;
+        }
+    }
+    return std::nullopt;
+}

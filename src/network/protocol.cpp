@@ -51,6 +51,7 @@ bool is_data_message(MessageType type) {
         case MessageType::WRITE_COMMIT:
         case MessageType::APPEND_COMMIT:
         case MessageType::COPY_BLOCK:
+        case MessageType::COPY_BLOCK_DATA:
         // ACK/ERROR carry the reply to whatever request triggered them —
         // in particular a READ_BLOCK's ACK response carries up to one
         // block's worth of data (see docs/design.md §12). The receiver has

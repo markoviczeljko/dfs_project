@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,12 @@ private:
 
     Result<Message> call_master(const Message& request);
     uint64_t next_request_id();
+    // Faza 12.2: idempotency token for WRITE_BLOCK, distinct from
+    // next_request_id() — a fresh per-Client monotonic counter is NOT
+    // safe for this purpose (two different Client processes could both
+    // start at 1 and collide on the same Storage Node), so this uses a
+    // random 64-bit value instead (see docs/design.md §16).
+    OperationId next_operation_id();
 
     // Parses the [u32 host_len][host][u16 port] x count replica list shared
     // by ALLOCATE_BLOCK's and APPEND_FILE's responses, starting at *offset*
@@ -79,8 +86,12 @@ private:
     // Sends one chunk to every listed replica at the given block+offset,
     // one fresh connection per replica; strict fail-fast on the first
     // non-ACK (same 3/3 semantics as the original write() loop).
-    ErrorCode write_chunk_to_replicas(BlockId block_id, uint64_t offset, const uint8_t* data,
-                                       size_t len, const std::vector<ReplicaLocation>& replicas);
+    // block_version is 0 from every Faza 12.2 call site (real values wired
+    // in Faza 12.3, once Master starts handing them out) — see
+    // docs/design.md §16.
+    ErrorCode write_chunk_to_replicas(BlockId block_id, uint64_t offset, uint64_t block_version,
+                                       const uint8_t* data, size_t len,
+                                       const std::vector<ReplicaLocation>& replicas);
 
     // Chunks [data, data+len) into config_.block_size pieces, each a
     // brand-new block: ALLOCATE_BLOCK then write_chunk_to_replicas(offset=0)
@@ -93,6 +104,7 @@ private:
     Config config_;
     TCPConnection master_connection_;
     uint64_t next_request_id_ = 1;
+    std::mt19937_64 operation_id_rng_{std::random_device{}()};
 };
 
 #endif  // DFS_CLIENT_CLIENT_H_
