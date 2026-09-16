@@ -2,6 +2,7 @@
 
 #include <endian.h>
 
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -68,7 +69,9 @@ uint64_t get_u64(const std::byte* src) {
 }  // namespace
 
 Master::Master(Config config)
-    : config_(std::move(config)), replication_manager_(storage_registry_) {}
+    : config_(std::move(config)),
+      replication_manager_(storage_registry_),
+      failure_detector_(storage_registry_) {}
 
 Result<std::unique_ptr<Master>> Master::create(Config config) {
     auto master = std::unique_ptr<Master>(new Master(std::move(config)));
@@ -82,10 +85,16 @@ ErrorCode Master::start() {
         return server_result.error();
     }
     network_server_ = std::move(server_result.value());
-    return network_server_->start();
+    ErrorCode result = network_server_->start();
+    if (result != ErrorCode::OK) {
+        return result;
+    }
+    failure_detector_.start();
+    return ErrorCode::OK;
 }
 
 void Master::stop() {
+    failure_detector_.stop();
     if (network_server_) {
         network_server_->stop();
     }
@@ -123,13 +132,14 @@ Message Master::handle_message(const Message& request) {
             return handle_append_file(request);
         case MessageType::APPEND_COMMIT:
             return handle_append_commit(request);
+        case MessageType::HEARTBEAT:
+            return handle_heartbeat(request);
         default:
-            // HEARTBEAT stays unhandled in this phase — heartbeat
-            // sending/timeout detection is Faza 12's job (see
-            // docs/design.md §13).
             // Includes WRITE_FILE — never given a defined wire flow
             // anywhere in the design notes, out of scope for this phase
-            // (see docs/design.md §10/§11).
+            // (see docs/design.md §10/§11) — and REPLICATE_BLOCK/
+            // GET_BLOCK_INFO, still-unused reserved enum values (see
+            // docs/design.md §16).
             return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
     }
 }
@@ -332,9 +342,33 @@ Message Master::handle_register_node(const Message& request) {
     offset += sizeof(uint16_t);
     uint64_t capacity_bytes = get_u64(request.payload.data() + offset);
 
-    storage_registry_.register_node(
-        StorageNodeInfo{node_id, std::move(host), port, /*alive=*/true, capacity_bytes, capacity_bytes});
+    // A fresh REGISTER_NODE round-trip is itself live proof of
+    // reachability, so the node starts HEALTHY immediately — unlike
+    // restoring a persisted snapshot after a Master restart (Faza 12.4),
+    // which has no such live proof and starts nodes JOINING instead (see
+    // docs/design.md §16).
+    storage_registry_.register_node(StorageNodeInfo{node_id, std::move(host), port,
+                                                      NodeState::HEALTHY, capacity_bytes,
+                                                      capacity_bytes,
+                                                      std::chrono::steady_clock::now()});
     return Message{MessageType::ACK, request.request_id, {}};
+}
+
+Message Master::handle_heartbeat(const Message& request) {
+    // Wire format: [u64 node_id]. Response: ACK{[u8 needs_inventory]} or
+    // ERROR(NODE_NOT_FOUND). needs_inventory is always 0 in this sub-phase
+    // — real semantics land in Faza 12.3/12.4 (see docs/design.md §16).
+    if (request.payload.size() != sizeof(uint64_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    StorageNodeId node_id = get_u64(request.payload.data());
+    ErrorCode result = storage_registry_.record_heartbeat(node_id);
+    if (result != ErrorCode::OK) {
+        return make_error(request.request_id, result);
+    }
+    std::vector<std::byte> response_payload;
+    response_payload.push_back(std::byte{0});  // needs_inventory
+    return Message{MessageType::ACK, request.request_id, std::move(response_payload)};
 }
 
 Message Master::handle_append_file(const Message& request) {

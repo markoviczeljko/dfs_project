@@ -31,6 +31,7 @@ add_library(master
     src/master/namespace.cpp
     src/master/storage_registry.cpp
     src/master/replication_manager.cpp
+    src/master/failure_detector.cpp
     src/master/master.cpp
 )
 target_include_directories(master PUBLIC include)

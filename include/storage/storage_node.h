@@ -1,9 +1,13 @@
 #ifndef DFS_STORAGE_STORAGE_NODE_H_
 #define DFS_STORAGE_STORAGE_NODE_H_
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #include "common/errors.h"
 #include "common/types.h"
@@ -16,7 +20,9 @@
 // DELETE_BLOCK requests to it. Block ids are supplied directly by whatever
 // client connects (see docs/design.md §9). Faza 9: registers itself with
 // Master at startup (advertise_host/master_host/master_port) so Master can
-// choose it as a replica target — see docs/design.md §13.
+// choose it as a replica target — see docs/design.md §13. Faza 12.1: sends
+// a periodic HEARTBEAT to Master so it can be told apart from a dead node
+// — see docs/design.md §16.
 class StorageNode {
 public:
     struct Config {
@@ -47,9 +53,21 @@ private:
     ErrorCode register_with_master();
     static Message make_error(uint64_t request_id, ErrorCode error);
 
+    // Faza 12.1: sends HEARTBEAT{node_id} to Master every
+    // HEARTBEAT_INTERVAL_SECONDS on a fresh connection bounded by
+    // HEARTBEAT_SEND_TIMEOUT_MS, until stop() fires. A single failed send
+    // is logged/ignored, not retried within the same tick — the next tick
+    // will simply try again (see docs/design.md §16).
+    void heartbeat_loop();
+
     Config config_;
     std::unique_ptr<BlockManager> block_manager_;
     std::unique_ptr<NetworkServer> network_server_;
+
+    std::thread heartbeat_thread_;
+    std::mutex heartbeat_cv_mutex_;
+    std::condition_variable heartbeat_cv_;
+    std::atomic<bool> heartbeat_running_{false};
 };
 
 #endif  // DFS_STORAGE_STORAGE_NODE_H_

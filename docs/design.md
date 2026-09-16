@@ -996,3 +996,86 @@ identično.
 `DeleteFileWithHangingReplicaCompletesWithinBoundedTime`, regresioni test za
 cpp-reviewer-ov CRITICAL nalaz), 6 u novom `tests/integration/test_delete.cpp`,
 5 u novom `tests/integration/test_list_stat.cpp`), čisto pod ASan/UBSan.
+
+## 16. Faza 12 — Heartbeat, Failure Detection, Recovery (§8 u potpunosti)
+
+Najveća pojedinačna faza dosad — implementirana u 4 sekvencijalna
+pod-koraka (12.1-12.4), svaki sa punim zelenim test suite-om + ASan/UBSan
+prije sljedećeg, svaki svoj commit, sve pod ovim jednim naslovom.
+
+**Poprečne odluke** (važe za cijelu Fazu 12, ne samo 12.1): §7.22-ov
+`NodeManager` je spojen direktno u postojeći `StorageRegistry` (umjesto
+paralelne node mape) — isti presedan kao Faza 11-ova odluka da ne pravi
+zaseban `gc.h` za nešto bez stvarno nezavisnog stanja. `FailureDetector`,
+`RecoveryManager` (12.2) i `MetadataStore` (12.4) JESU prave nove klase
+(imaju stvarno nezavisno stanje/thread-ove/disk I/O). `ReplicationManager`
+ostaje potpuno netaknut kroz cijelu fazu — sva recovery orkestracija ide u
+novu `RecoveryManager` klasu. §8.34-tip "pravi orphan" (Master uopšte ne zna
+za blok) ostaje strukturno odvojen od Faza 11-ovog `OrphanedBlock`
+mehanizma (Master-known superseded blok) — različiti koncepti, iako oba
+dijele "ne briši odmah" filozofiju.
+
+### 16.1 — Heartbeat + Failure Detection
+
+Dodaje node liveness state machine: `NodeState{JOINING, HEALTHY, SUSPECTED,
+DEAD, RECOVERING}` na `StorageRegistry::StorageNodeInfo`, zamjenjujući stari
+`bool alive` (koji se od Faze 9 nikad nije mijenjao van registracije — sad
+ga stvarno pokreće failure detection). `mark_dead()`/`mark_alive()` ostaju
+kao tanki wrapper-i oko `set_state()` radi izvorne kompatibilnosti.
+
+**Ključna odluka o inicijalnom stanju**: svježa `REGISTER_NODE` runda je
+SAMA PO SEBI živi dokaz dostupnosti, pa čvor odmah kreće kao `HEALTHY` — ne
+`JOINING`, kako bi doslovno čitanje §8.4-ovog "JOINING → HEALTHY" dijagrama
+moglo sugerisati. `JOINING` je rezervisano za 12.4-ov slučaj: Master koji se
+upravo oporavio od restarta nema nikakav živi dokaz da je bilo koji ranije
+poznat čvor i dalje zdrav, pa restauracija iz snapshot-a eksplicitno postavlja
+`JOINING`. Ova distinkcija čuva SVE postojeće Faza 7-11 testove nepromijenjenim
+(svi pretpostavljaju da je čvor odmah upotrebljiv nakon `REGISTER_NODE`-a).
+
+**`FailureDetector`** (nova klasa, `include/master/failure_detector.h`):
+sopstveni `std::thread` + `condition_variable`-bazirani sweep loop (isti
+idiom kao `NetworkServer`-ov accept-thread — `stop()` vraća odmah preko
+`notify_all()`, ne čeka pun sweep interval). `SUSPECTED_TIMEOUT_SECONDS`
+(=6, isto kao postojeći `FAILURE_TIMEOUT_SECONDS`) i `DEAD_TIMEOUT_SECONDS`
+(=12, duplo) daju čvoru jedan pun dodatni failure-timeout prozor kao
+"možda je samo spor" grace period prije potpunog otpisivanja. Konstruktor
+prima opcione `Duration` parametre za timeout-e (podrazumijevano iz
+`config.h`) — testovi ih smanjuju na desetine milisekundi umjesto čekanja
+stvarnih 6s/12s.
+
+**Bez zajedničke `PeriodicTask` apstrakcije** — samo dva pozivaoca ikad
+postoje (ovaj sweep loop i StorageNode-ov heartbeat sender ispod), što ne
+prelazi projektov "bez apstrakcije dok se ne dokaže potreba" prag.
+
+**`record_heartbeat()` promoviše SAMO `SUSPECTED → HEALTHY`**, nikad iz
+`DEAD`/`RECOVERING` — promocija odatle ide isključivo kroz 12.3-ovu inventory
+rekonsilijaciju. Ovo je namjeran dizajn, ne propust: goli heartbeat sam po
+sebi ne dokazuje da čvor još uvijek posjeduje ispravne, neoštećene blokove.
+
+**Poznat gap ostavljen za 12.3**: `notified_dead_` set (garantuje
+single-fire `on_node_dead_` callback po DEAD prelazu) se nikad ne čisti —
+ako 12.3 kasnije promoviše čvor nazad u HEALTHY pa on OPET umre, callback se
+neće ponovo okinuti dok se ne doda eksplicitan "obriši notifikaciju"
+hook prilikom promocije. Dokumentovano komentarom u kodu, ne popravljeno
+sada jer put za promociju iz DEAD-a još ne postoji.
+
+**Wire protokol**: `HEARTBEAT` (već rezervisan enum vrijednost od Faze 1)
+prvi put dobija stvarno rukovanje. Zahtjev: `[u64 node_id]`. Odgovor:
+`ACK{[u8 needs_inventory]}` (uvijek 0 u ovom pod-koraku — prava semantika
+dolazi u 12.3/12.4) ili `ERROR(NODE_NOT_FOUND)`.
+
+**Testovi**: 6 novih u `test_storage_registry.cpp` (NodeState prelazi,
+`record_heartbeat` semantika), 5 novih u novom `test_failure_detector.cpp`
+(brzi test-only timeout-i — HEALTHY→SUSPECTED→DEAD, single-fire callback,
+`stop()` vraća odmah bez čekanja sweep interval), 2 nova u `test_master.cpp`
+(`RegisterThenHeartbeatReturnsAck`, `HeartbeatFromUnknownNodeReturnsNodeNotFound`).
+`UnknownMessageTypeReturnsInvalidRequest` prebačen sa `HEARTBEAT` (sad
+obrađen) na i dalje neiskorišten `REPLICATE_BLOCK`.
+
+**Ručna E2E verifikacija**: Master + 3 prava `dfs_storage` procesa, čekanje
+kroz nekoliko heartbeat intervala (8s) bez pada procesa, normalne
+`create`/`write`/`read` operacije rade ispravno paralelno sa heartbeat
+thread-ovima, čisto gašenje preko `SIGINT` (bez zaglavljivanja `stop()`-a
+oko novih thread-ova).
+
+165/165 testova prolazi (152 stari + 13 nov), čisto pod ASan/UBSan.

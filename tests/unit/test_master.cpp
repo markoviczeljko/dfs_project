@@ -104,6 +104,13 @@ Message make_register_node_request(uint64_t request_id, StorageNodeId node_id,
     return Message{MessageType::REGISTER_NODE, request_id, std::move(payload)};
 }
 
+// Faza 12.1 wire format: [u64 node_id] (see docs/design.md §16).
+Message make_heartbeat_request(uint64_t request_id, StorageNodeId node_id) {
+    std::vector<std::byte> payload;
+    put_u64(payload, node_id);
+    return Message{MessageType::HEARTBEAT, request_id, std::move(payload)};
+}
+
 ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
     return static_cast<ErrorCode>(get_u16(payload.data()));
 }
@@ -354,12 +361,13 @@ TEST_F(MasterTest, ListRootReturnsTopLevelEntries) {
 }
 
 TEST_F(MasterTest, UnknownMessageTypeReturnsInvalidRequest) {
-    // HEARTBEAT stays unhandled in this phase — heartbeat sending/timeout
-    // detection is Faza 12's job (see docs/design.md §13).
+    // REPLICATE_BLOCK stays a reserved-but-unhandled enum value (see
+    // docs/design.md §16) — HEARTBEAT is handled as of Faza 12.1, see the
+    // dedicated tests below.
     start_master(38008);
     TCPConnection client = connect_client(38008);
 
-    ASSERT_TRUE(client.sendMessage(Message{MessageType::HEARTBEAT, 1, {}}));
+    ASSERT_TRUE(client.sendMessage(Message{MessageType::REPLICATE_BLOCK, 1, {}}));
     auto resp = client.receiveMessage();
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->type, MessageType::ERROR);
@@ -682,8 +690,14 @@ TEST_F(MasterTest, WriteCommitAcceptsAnyPreviouslyAllocatedIdForThisPath) {
     // §12). This replaces the old WriteCommitWithStaleBlockIdFails test,
     // whose property (newer allocation supersedes older one) is
     // deliberately dropped.
-    start_master(38024);
-    TCPConnection client = connect_client(38024);
+    //
+    // Port 38024 is durably occupied for the rest of this sandbox session
+    // by a long-lived outbound ESTABLISHED connection (confirmed via
+    // /proc/net/tcp — a real, diagnosed cause, not a superstition; same
+    // category as port 38028's avoidance below, but with a confirmed root
+    // cause this time) — avoid it.
+    start_master(38040);
+    TCPConnection client = connect_client(38040);
     register_three_nodes(client);
 
     ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
@@ -1061,4 +1075,33 @@ TEST_F(MasterTest, DeleteFileWithHangingReplicaCompletesWithinBoundedTime) {
     // Bounded by ~DELETE_BLOCK_TIMEOUT_MS for the one hanging replica, plus
     // slack for the two fast replicas — nowhere near "forever".
     EXPECT_LT(elapsed, std::chrono::milliseconds(DELETE_BLOCK_TIMEOUT_MS * 2));
+}
+
+// Faza 12.1: HEARTBEAT (see docs/design.md §16).
+
+TEST_F(MasterTest, RegisterThenHeartbeatReturnsAck) {
+    start_master(38038);
+    TCPConnection client = connect_client(38038);
+
+    ASSERT_TRUE(client.sendMessage(
+        make_register_node_request(1, /*node_id=*/1, "127.0.0.1", 9101, /*capacity_bytes=*/1024)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_heartbeat_request(2, /*node_id=*/1)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+    ASSERT_EQ(resp->payload.size(), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(resp->payload[0]), 0u);  // needs_inventory always 0 in 12.1
+}
+
+TEST_F(MasterTest, HeartbeatFromUnknownNodeReturnsNodeNotFound) {
+    start_master(38039);
+    TCPConnection client = connect_client(38039);
+
+    ASSERT_TRUE(client.sendMessage(make_heartbeat_request(1, /*node_id=*/99)));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::NODE_NOT_FOUND);
 }

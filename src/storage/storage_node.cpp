@@ -2,9 +2,11 @@
 
 #include <endian.h>
 
+#include <chrono>
 #include <cstring>
 #include <utility>
 
+#include "common/config.h"
 #include "network/connection.h"
 #include "network/socket.h"
 
@@ -89,7 +91,13 @@ ErrorCode StorageNode::start() {
     // Register with Master only after this node is actually reachable, so
     // it can never be picked as a replica target before it's ready to
     // serve WRITE_BLOCK/READ_BLOCK requests (see docs/design.md §13).
-    return register_with_master();
+    if (ErrorCode err = register_with_master(); err != ErrorCode::OK) {
+        return err;
+    }
+
+    heartbeat_running_ = true;
+    heartbeat_thread_ = std::thread(&StorageNode::heartbeat_loop, this);
+    return ErrorCode::OK;
 }
 
 ErrorCode StorageNode::register_with_master() {
@@ -128,8 +136,45 @@ ErrorCode StorageNode::register_with_master() {
 }
 
 void StorageNode::stop() {
+    if (heartbeat_running_.exchange(false)) {
+        heartbeat_cv_.notify_all();
+        if (heartbeat_thread_.joinable()) {
+            heartbeat_thread_.join();
+        }
+    }
     if (network_server_) {
         network_server_->stop();
+    }
+}
+
+void StorageNode::heartbeat_loop() {
+    std::unique_lock lock(heartbeat_cv_mutex_);
+    while (heartbeat_running_.load()) {
+        // Matches FailureDetector::sweep_loop()'s idiom: wait_for returns
+        // immediately on stop()'s notify_all() rather than blocking out a
+        // full HEARTBEAT_INTERVAL_SECONDS.
+        heartbeat_cv_.wait_for(lock, std::chrono::seconds(HEARTBEAT_INTERVAL_SECONDS),
+                                [this] { return !heartbeat_running_.load(); });
+        if (!heartbeat_running_.load()) break;
+        lock.unlock();
+
+        auto socket_result = Socket::create();
+        if (socket_result.is_ok()) {
+            Socket socket = std::move(socket_result.value());
+            if (socket.set_timeout(HEARTBEAT_SEND_TIMEOUT_MS) == ErrorCode::OK &&
+                socket.connect(config_.master_host, config_.master_port) == ErrorCode::OK) {
+                TCPConnection master_connection(std::move(socket));
+                std::vector<std::byte> payload;
+                put_u64(payload, config_.node_id);
+                master_connection.sendMessage(Message{MessageType::HEARTBEAT, 1, std::move(payload)});
+                master_connection.receiveMessage();  // response ignored in 12.1
+            }
+            // Any failure here (create/timeout/connect/send/recv) is
+            // silently ignored — the next tick simply tries again. See
+            // docs/design.md §16.
+        }
+
+        lock.lock();
     }
 }
 

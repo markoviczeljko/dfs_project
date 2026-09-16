@@ -7,31 +7,54 @@ void StorageRegistry::register_node(StorageNodeInfo node) {
     nodes_[node.id] = std::move(node);
 }
 
-void StorageRegistry::mark_dead(StorageNodeId id) {
+void StorageRegistry::mark_dead(StorageNodeId id) { set_state(id, NodeState::DEAD); }
+
+void StorageRegistry::mark_alive(StorageNodeId id) { set_state(id, NodeState::HEALTHY); }
+
+void StorageRegistry::set_state(StorageNodeId id, NodeState state) {
     std::unique_lock lock(mutex_);
     auto it = nodes_.find(id);
     if (it != nodes_.end()) {
-        it->second.alive = false;
+        it->second.state = state;
     }
 }
 
-void StorageRegistry::mark_alive(StorageNodeId id) {
+ErrorCode StorageRegistry::record_heartbeat(StorageNodeId id) {
     std::unique_lock lock(mutex_);
     auto it = nodes_.find(id);
-    if (it != nodes_.end()) {
-        it->second.alive = true;
+    if (it == nodes_.end()) {
+        return ErrorCode::NODE_NOT_FOUND;
     }
+    it->second.last_heartbeat = std::chrono::steady_clock::now();
+    if (it->second.state == NodeState::SUSPECTED) {
+        it->second.state = NodeState::HEALTHY;
+    }
+    return ErrorCode::OK;
 }
 
 std::vector<StorageNodeInfo> StorageRegistry::get_alive_nodes() const {
+    return get_nodes_in_state(NodeState::HEALTHY);
+}
+
+std::vector<StorageNodeInfo> StorageRegistry::get_nodes_in_state(NodeState state) const {
     std::shared_lock lock(mutex_);
-    std::vector<StorageNodeInfo> alive;
+    std::vector<StorageNodeInfo> matching;
     for (const auto& [id, node] : nodes_) {
-        if (node.alive) {
-            alive.push_back(node);
+        if (node.state == state) {
+            matching.push_back(node);
         }
     }
-    return alive;
+    return matching;
+}
+
+std::vector<StorageNodeInfo> StorageRegistry::get_all_nodes() const {
+    std::shared_lock lock(mutex_);
+    std::vector<StorageNodeInfo> all;
+    all.reserve(nodes_.size());
+    for (const auto& [id, node] : nodes_) {
+        all.push_back(node);
+    }
+    return all;
 }
 
 std::optional<StorageNodeInfo> StorageRegistry::get_node(StorageNodeId id) const {

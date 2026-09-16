@@ -16,4 +16,24 @@ constexpr int APPEND_COMMIT_WAIT_TIMEOUT_MS = 3000;
 // I/O timeout.
 constexpr int DELETE_BLOCK_TIMEOUT_MS = 2000;
 
+// Faza 12.1: node liveness state machine (see docs/design.md §16).
+// HEARTBEAT_INTERVAL_SECONDS/FAILURE_TIMEOUT_SECONDS above were already
+// reserved since Faza 9 — FAILURE_TIMEOUT_SECONDS becomes the
+// HEALTHY->SUSPECTED threshold, and DEAD_TIMEOUT_SECONDS (double it) the
+// SUSPECTED->DEAD threshold, so a node gets one full extra failure-timeout
+// window as a "maybe just slow" grace period before being written off.
+constexpr int SUSPECTED_TIMEOUT_SECONDS = FAILURE_TIMEOUT_SECONDS;
+constexpr int DEAD_TIMEOUT_SECONDS = FAILURE_TIMEOUT_SECONDS * 2;
+// How often FailureDetector's background thread re-checks every node's
+// last-heartbeat age. Independent of the interval a Storage Node actually
+// sends heartbeats at — just needs to be comfortably finer-grained than
+// SUSPECTED_TIMEOUT_SECONDS so a transition isn't detected many seconds
+// late.
+constexpr int FAILURE_SWEEP_INTERVAL_MS = 500;
+// Bounds a single outbound HEARTBEAT send/recv on the Storage Node side —
+// same rationale as DELETE_BLOCK_TIMEOUT_MS (Faza 11): a Master that
+// accepts the connection but never replies must not hang the heartbeat
+// thread forever.
+constexpr int HEARTBEAT_SEND_TIMEOUT_MS = 1000;
+
 #endif  // DFS_COMMON_CONFIG_H_

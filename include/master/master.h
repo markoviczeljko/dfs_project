@@ -7,6 +7,7 @@
 #include <string>
 
 #include "common/errors.h"
+#include "master/failure_detector.h"
 #include "master/namespace.h"
 #include "master/replication_manager.h"
 #include "master/storage_registry.h"
@@ -15,11 +16,12 @@
 
 // The Master process: owns the namespace (NamespaceManager), the Storage
 // Node inventory (StorageRegistry) and replica placement
-// (ReplicationManager), and a NetworkServer (accept-loop, reused verbatim
-// from Faza 5), and wires CREATE_FILE/DELETE_FILE/LIST_FILES/STAT_FILE/
-// ALLOCATE_BLOCK/WRITE_COMMIT/READ_FILE/REGISTER_NODE/APPEND_FILE/
-// APPEND_COMMIT requests to them.
-// See docs/design.md §13, §14.
+// (ReplicationManager), node liveness (FailureDetector, Faza 12.1), and a
+// NetworkServer (accept-loop, reused verbatim from Faza 5), and wires
+// CREATE_FILE/DELETE_FILE/LIST_FILES/STAT_FILE/ALLOCATE_BLOCK/WRITE_COMMIT/
+// READ_FILE/REGISTER_NODE/APPEND_FILE/APPEND_COMMIT/HEARTBEAT requests to
+// them.
+// See docs/design.md §13, §14, §16.
 class Master {
 public:
     struct Config {
@@ -48,6 +50,7 @@ private:
     Message handle_register_node(const Message& request);
     Message handle_append_file(const Message& request);
     Message handle_append_commit(const Message& request);
+    Message handle_heartbeat(const Message& request);
     static Message make_error(uint64_t request_id, ErrorCode error);
 
     // Faza 11: best-effort physical cleanup of blocks DELETE_FILE/WRITE
@@ -66,6 +69,9 @@ private:
     NamespaceManager namespace_manager_;
     StorageRegistry storage_registry_;
     ReplicationManager replication_manager_;
+    // No-op on_node_dead callback in 12.1 — wired to RecoveryManager in
+    // 12.2 (see docs/design.md §16).
+    FailureDetector failure_detector_;
     std::unique_ptr<NetworkServer> network_server_;
     // Atomic: unlike Client (single-threaded/CLI use), Master's NetworkServer
     // is thread-per-connection, so concurrent DELETE_FILE/WRITE_COMMIT

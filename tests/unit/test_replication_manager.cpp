@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <thread>
 #include <vector>
@@ -10,7 +11,11 @@
 namespace {
 
 StorageNodeInfo make_node(StorageNodeId id) {
-    return StorageNodeInfo{id, "127.0.0.1", static_cast<uint16_t>(9100 + id), true, 1024, 1024};
+    return StorageNodeInfo{id,   "127.0.0.1",
+                            static_cast<uint16_t>(9100 + id),
+                            NodeState::HEALTHY,
+                            1024, 1024,
+                            std::chrono::steady_clock::now()};
 }
 
 }  // namespace
