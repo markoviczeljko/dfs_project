@@ -132,6 +132,15 @@ TEST_F(RecoveryIntegrationTest, KilledNodeTriggersRecoveryAndReadKeepsSucceeding
     auto final_read = client.read("/r.txt");
     ASSERT_TRUE(final_read.is_ok());
     EXPECT_EQ(final_read.value(), data);
+
+    // Faza 14: the full failure-handling lifecycle is reflected in
+    // Master's own statistics — detected_failures (FailureDetector's
+    // on_node_dead_ firing) and a successful recovery_operations entry
+    // (RecoveryManager's record_recovery, see docs/design.md §18).
+    StatisticsSnapshot snap = master_->statistics_snapshot();
+    EXPECT_GE(snap.detected_failures, 1u);
+    EXPECT_GE(snap.recovery_operations, 1u);
+    EXPECT_GE(snap.successful_recoveries, 1u);
 }
 
 TEST_F(RecoveryIntegrationTest, RestartWithValidBlocksSendsInventoryWithoutRecopying) {

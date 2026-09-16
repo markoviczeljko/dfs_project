@@ -16,6 +16,7 @@
 #include "master/storage_registry.h"
 #include "network/network_server.h"
 #include "network/protocol.h"
+#include "statistics/statistics.h"
 
 // The Master process: owns the namespace (NamespaceManager), the Storage
 // Node inventory (StorageRegistry) and replica placement
@@ -42,10 +43,17 @@ public:
     ErrorCode start();
     void stop();
 
+    // Faza 14: see docs/design.md §18.
+    StatisticsSnapshot statistics_snapshot() const;
+
 private:
     Master(Config config, std::unique_ptr<MetadataStore> metadata_store);
 
+    // Faza 14: thin wrapper around route_message() — same pattern as
+    // StorageNode's handle_message()/route_message() split (see
+    // docs/design.md §18).
     Message handle_message(const Message& request);
+    Message route_message(const Message& request);
     Message handle_create_file(const Message& request);
     Message handle_delete_file(const Message& request);
     Message handle_list_files(const Message& request);
@@ -58,6 +66,7 @@ private:
     Message handle_append_commit(const Message& request);
     Message handle_heartbeat(const Message& request);
     Message handle_node_inventory(const Message& request);
+    Message handle_get_stats(const Message& request);
     static Message make_error(uint64_t request_id, ErrorCode error);
 
     // Faza 11: best-effort physical cleanup of blocks DELETE_FILE/WRITE
@@ -85,6 +94,12 @@ private:
     std::unique_ptr<MetadataStore> metadata_store_;
     NamespaceManager namespace_manager_;
     StorageRegistry storage_registry_;
+    // Faza 14: declared before replication_manager_/recovery_manager_ —
+    // RecoveryManager takes a StatisticsManager& in its constructor, and
+    // C++ initializes members in declaration order regardless of the
+    // initializer list's order, so this must come first (see
+    // docs/design.md §18).
+    StatisticsManager statistics_;
     ReplicationManager replication_manager_;
     // Constructed before failure_detector_ so its callback can reference
     // it; on_metadata_changed stays the default no-op until Faza 12.4

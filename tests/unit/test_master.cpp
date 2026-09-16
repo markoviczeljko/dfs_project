@@ -1373,3 +1373,57 @@ TEST_F(MasterTest, HeartbeatFromJoiningNodeSetsNeedsInventoryBit) {
     ASSERT_EQ(resp->payload.size(), 1u);
     EXPECT_EQ(static_cast<uint8_t>(resp->payload[0]), 1u);  // needs_inventory — node is JOINING
 }
+
+// Faza 14: see docs/design.md §18.
+TEST_F(MasterTest, GetStatsReturnsTextSnapshotReflectingPriorOperations) {
+    constexpr uint16_t port = 38200;
+    start_master(port);
+    TCPConnection client = connect_client(port);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::STAT_FILE, 2, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(Message{MessageType::GET_STATS, 3, {}}));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::STATS_RESPONSE);
+
+    std::string text(reinterpret_cast<const char*>(resp->payload.data()), resp->payload.size());
+    EXPECT_NE(text.find("DFS Statistics"), std::string::npos);
+    EXPECT_NE(text.find("CREATE: total=1"), std::string::npos);
+    EXPECT_NE(text.find("STAT: total=1"), std::string::npos);
+
+    StatisticsSnapshot snap = master_->statistics_snapshot();
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::CREATE)].successful, 1u);
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::STAT)].successful, 1u);
+}
+
+TEST_F(MasterTest, WriteCommitRecordsReplicationStats) {
+    constexpr uint16_t port = 38201;
+    start_master(port);
+    TCPConnection client = connect_client(port);
+    register_three_nodes(client);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    ASSERT_EQ(alloc_resp->type, MessageType::ACK);
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+
+    constexpr uint64_t kSize = 42;
+    ASSERT_TRUE(client.sendMessage(
+        make_write_commit_request(3, "/a.txt", {block_id}, kSize)));
+    auto commit_resp = client.receiveMessage();
+    ASSERT_TRUE(commit_resp.has_value());
+    ASSERT_EQ(commit_resp->type, MessageType::ACK);
+
+    StatisticsSnapshot snap = master_->statistics_snapshot();
+    EXPECT_EQ(snap.replication_operations, 1u);
+    EXPECT_EQ(snap.bytes_replicated, kSize);
+    EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].successful, 1u);
+}

@@ -33,10 +33,12 @@ void put_u64(std::vector<std::byte>& buf, uint64_t value) {
 
 RecoveryManager::RecoveryManager(NamespaceManager& namespace_manager, StorageRegistry& registry,
                                   ReplicationManager& replication_manager,
+                                  StatisticsManager& statistics,
                                   std::function<void()> on_metadata_changed)
     : namespace_manager_(namespace_manager),
       registry_(registry),
       replication_manager_(replication_manager),
+      statistics_(statistics),
       on_metadata_changed_(std::move(on_metadata_changed)) {}
 
 RecoveryManager::~RecoveryManager() { stop(); }
@@ -112,6 +114,7 @@ void RecoveryManager::recover_block(RecoveryJob job) {
             namespace_manager_.update_block_replicas_after_recovery(
                 job.block_id, job.failed_node_id, *destination, BlockState::COMMITTED);
             on_metadata_changed_();
+            statistics_.record_recovery(metadata.value().size, /*success=*/true);
             return;
         }
         // Failed (source/destination died mid-transfer, checksum mismatch,
@@ -120,6 +123,7 @@ void RecoveryManager::recover_block(RecoveryJob job) {
     }
     // Gave up — block stays UNDER_REPLICATED; a later heartbeat/inventory
     // event may re-trigger recovery (see docs/design.md §16).
+    statistics_.record_recovery(0, /*success=*/false);
 }
 
 bool RecoveryManager::send_copy_block(StorageNodeId source, BlockId block_id,

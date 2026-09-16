@@ -46,7 +46,7 @@ add_library(master
     src/master/master.cpp
 )
 target_include_directories(master PUBLIC include)
-target_link_libraries(master PUBLIC common network Threads::Threads)
+target_link_libraries(master PUBLIC common network statistics Threads::Threads)
 
 add_library(client
     src/client/client.cpp
@@ -63,6 +63,9 @@ target_link_libraries(dfs_master PRIVATE master)
 
 add_executable(dfs_client src/client/main_client.cpp)
 target_link_libraries(dfs_client PRIVATE client)
+
+add_executable(dfs_statsctl src/statistics/main_statsctl.cpp)
+target_link_libraries(dfs_statsctl PRIVATE network)
 
 enable_testing()
 add_subdirectory(tests)

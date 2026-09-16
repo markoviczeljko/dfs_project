@@ -14,6 +14,7 @@
 #include "master/namespace.h"
 #include "master/replication_manager.h"
 #include "master/storage_registry.h"
+#include "statistics/statistics.h"
 
 // Faza 12.2: re-replication after a Storage Node is declared DEAD (see
 // docs/design.md §16, §8.6-§8.16, §8.42, §8.46). A small worker pool
@@ -29,8 +30,12 @@
 // docs/design.md §16) rather than folding recovery orchestration into it.
 class RecoveryManager {
 public:
+    // Faza 14: statistics is a required reference (not defaulted, unlike
+    // on_metadata_changed) — same reference-injection pattern as the other
+    // collaborators, since RecoveryManager is the only place that knows
+    // recovered bytes at the point of success (see docs/design.md §18).
     RecoveryManager(NamespaceManager& namespace_manager, StorageRegistry& registry,
-                     ReplicationManager& replication_manager,
+                     ReplicationManager& replication_manager, StatisticsManager& statistics,
                      std::function<void()> on_metadata_changed = [] {});
 
     RecoveryManager(const RecoveryManager&) = delete;
@@ -84,6 +89,7 @@ private:
     NamespaceManager& namespace_manager_;
     StorageRegistry& registry_;
     ReplicationManager& replication_manager_;
+    StatisticsManager& statistics_;
     std::function<void()> on_metadata_changed_;
 
     std::vector<std::thread> workers_;

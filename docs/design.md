@@ -1701,3 +1701,68 @@ build-om i pod ASan/UBSan-om kad se ovaj isključi.
 
 231/231 (232 sa novim testom, 1 isključen zbog environment flake-a)
 testova prolazi, čisto pod ASan/UBSan.
+
+### 18.4 — Master retrofit + dfs_statsctl CLI
+
+Isti `handle_message`/`route_message` split kao 14.3, sa mapiranjem
+`CREATE_FILE→CREATE`, `DELETE_FILE→DELETE`, `LIST_FILES→LIST`,
+`STAT_FILE→STAT`, `READ_FILE→READ`, `WRITE_COMMIT→WRITE`,
+`APPEND_COMMIT→APPEND` (`ALLOCATE_BLOCK`/`REGISTER_NODE`/`HEARTBEAT`/
+`NODE_INVENTORY`/`GET_STATS` namjerno nemapirani — cluster-membership/
+recovery/dijagnostički saobraćaj).
+
+**`RecoveryManager` dobija `StatisticsManager&`** kao novi obavezan
+konstruktorski parametar (isti obrazac referenc-injekcije kao ostali
+saradnici) — ono je jedino mjesto koje zna stvarno oporavljene bajtove u
+trenutku uspjeha. `Master::statistics_` MORA biti deklarisan PRIJE
+`replication_manager_`/`recovery_manager_` u `master.h` (C++ inicijalizuje
+članove po redoslijedu deklaracije, ne po redoslijedu u initializer
+listi) — dokumentovano eksplicitno komentarom da se izbjegne buduća
+zabuna, isti stil kao postojeći komentar o `recovery_manager_`/
+`failure_detector_`-a redoslijedu.
+
+**`record_replication`/`record_recovery` razgraničenje** (vidi poprečnu
+odluku #7 gore) — implementaciono pojednostavljenje u odnosu na plan:
+jedan `record_replication(size)` poziv PO COMMIT-u (ne po bloku), koristeći
+već poznatu ukupnu veličinu iz `WRITE_COMMIT`/`APPEND_COMMIT` wire
+payload-a, umjesto po-blok lookup-a — jednostavnije, i "koliko bajtova je
+upravo replicirano ovim pisanjem" je jednako smisleno mjereno na nivou
+cijelog commit-a.
+
+**Logger retrofit**: dva postojeća `std::cerr` `NODE_INVENTORY` anomaly
+loga prepravljena da koriste `logger::log(WARNING, ...)`; nova
+`INFO`/`ERROR` mjesta dodata tačno na §10.32-ove imenovane primjere
+(`"Storage Node X registered"`, `"Storage Node X declared DEAD"`).
+`<iostream>` include uklonjen iz `master.cpp` — više se nigdje ne koristi
+direktno.
+
+**Novi `dfs_statsctl` executable** (`src/statistics/main_statsctl.cpp`):
+sirovi `TCPConnection`/`Socket` (ne pun `Client` — ne treba namespace
+logika), `--host <h> --port <p> stats`, šalje `GET_STATS`, ispisuje
+`STATS_RESPONSE` payload direktno na stdout. Radi identično protiv
+Master-a ili bilo kog StorageNode-a — potvrđeno ručno preko pravog
+4-procesnog klastera (`scripts/start_*.sh`): CREATE→WRITE→READ pa
+`dfs_statsctl stats` protiv oba porta, brojevi plauzibilni i međusobno
+konzistentni (Master-ova `Replication: bytes=33` odgovara stvarnoj
+veličini upisanog fajla; StorageNode-ova `Storage: used_bytes=33
+block_count=1` isto tako).
+
+**Testovi**: `tests/unit/test_master.cpp` proširen sa
+`GetStatsReturnsTextSnapshotReflectingPriorOperations` i
+`WriteCommitRecordsReplicationStats`; `tests/integration/test_recovery.cpp`-ov
+postojeći `KilledNodeTriggersRecoveryAndReadKeepsSucceeding` proširen sa
+`detected_failures`/`recovery_operations`/`successful_recoveries`
+provjerom na kraju (end-to-end kroz pravi failure+recovery ciklus, ne
+izolovan unit test).
+
+**Poznat environment flake, treći put**: `WriteIntegrationTest.CreateThenWriteSucceeds`
+je jednom pukao (segfault) zbog istog sandbox efemernog-porta fenomena —
+prošao čisto na ponovnom pokretanju, nepovezano sa ovim diff-om.
+
+232/232 testova prolazi, čisto pod ASan/UBSan.
+
+---
+
+**Faza 14 u cjelini**: 4 pod-faze, sve gore. Nezavisan `cpp-reviewer` pass
+na cijeloj Fazi 14 (sve 4 pod-faze kao jedna cjelina) slijedi prije
+push-a — isti obrazac kao Faze 12/13.

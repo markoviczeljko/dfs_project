@@ -5,10 +5,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <iostream>
+#include <optional>
 #include <utility>
 
 #include "common/config.h"
+#include "common/logger.h"
 #include "network/connection.h"
 #include "network/socket.h"
 
@@ -74,10 +75,16 @@ Master::Master(Config config, std::unique_ptr<MetadataStore> metadata_store)
     : config_(std::move(config)),
       metadata_store_(std::move(metadata_store)),
       replication_manager_(storage_registry_),
-      recovery_manager_(namespace_manager_, storage_registry_, replication_manager_,
+      recovery_manager_(namespace_manager_, storage_registry_, replication_manager_, statistics_,
                          [this] { persist_metadata(); }),
       failure_detector_(storage_registry_,
-                         [this](StorageNodeId node_id) { recovery_manager_.handle_node_failure(node_id); }) {}
+                         [this](StorageNodeId node_id) {
+                             statistics_.record_node_dead();
+                             logger::log(logger::LogLevel::ERROR, "Master",
+                                         "Storage Node " + std::to_string(node_id) +
+                                             " declared DEAD");
+                             recovery_manager_.handle_node_failure(node_id);
+                         }) {}
 
 Result<std::unique_ptr<Master>> Master::create(Config config) {
     // Faza 12.4: fallible construction, same pattern as
@@ -149,7 +156,54 @@ Message Master::make_error(uint64_t request_id, ErrorCode error) {
     return Message{MessageType::ERROR, request_id, std::move(payload)};
 }
 
+namespace {
+
+// Faza 14: only message types with a natural file-level "operation"
+// meaning get one — ALLOCATE_BLOCK/REGISTER_NODE/HEARTBEAT/
+// NODE_INVENTORY/GET_STATS are block-control/cluster-membership/
+// diagnostic traffic, not user-facing operations (see docs/design.md
+// §18). READ_FILE maps to READ since Faza 7 repurposed it as "get file
+// metadata for read".
+std::optional<OperationType> to_operation_type(MessageType type) {
+    switch (type) {
+        case MessageType::CREATE_FILE:
+            return OperationType::CREATE;
+        case MessageType::DELETE_FILE:
+            return OperationType::DELETE;
+        case MessageType::LIST_FILES:
+            return OperationType::LIST;
+        case MessageType::STAT_FILE:
+            return OperationType::STAT;
+        case MessageType::READ_FILE:
+            return OperationType::READ;
+        case MessageType::WRITE_COMMIT:
+            return OperationType::WRITE;
+        case MessageType::APPEND_COMMIT:
+            return OperationType::APPEND;
+        default:
+            return std::nullopt;
+    }
+}
+
+}  // namespace
+
 Message Master::handle_message(const Message& request) {
+    auto start = std::chrono::steady_clock::now();
+    Message response = route_message(request);
+    auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    bool success = response.type != MessageType::ERROR;
+    if (!success) {
+        statistics_.record_error(static_cast<ErrorCode>(get_u16(response.payload.data())));
+    }
+    if (auto op = to_operation_type(request.type); op.has_value()) {
+        statistics_.record_operation(*op, 0, latency, success);
+    }
+    return response;
+}
+
+Message Master::route_message(const Message& request) {
     switch (request.type) {
         case MessageType::CREATE_FILE:
             return handle_create_file(request);
@@ -179,6 +233,8 @@ Message Master::handle_message(const Message& request) {
             return handle_heartbeat(request);
         case MessageType::NODE_INVENTORY:
             return handle_node_inventory(request);
+        case MessageType::GET_STATS:
+            return handle_get_stats(request);
         default:
             // Includes WRITE_FILE — never given a defined wire flow
             // anywhere in the design notes, out of scope for this phase
@@ -330,6 +386,11 @@ Message Master::handle_write_commit(const Message& request) {
     }
     gc_dispatch(result.value());
     persist_metadata();
+    // Faza 14: this write's blocks just landed on all RF replicas — one
+    // replication event per commit, using the total committed bytes (not
+    // per-block; see docs/design.md §18 for why this is recorded here,
+    // once the real size is known, rather than at ALLOCATE_BLOCK time).
+    statistics_.record_replication(size);
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -404,6 +465,8 @@ Message Master::handle_register_node(const Message& request) {
                                                       capacity_bytes,
                                                       std::chrono::steady_clock::now()});
     persist_metadata();
+    logger::log(logger::LogLevel::INFO, "Master",
+                "Storage Node " + std::to_string(node_id) + " registered");
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -425,6 +488,7 @@ Message Master::handle_heartbeat(const Message& request) {
     if (result != ErrorCode::OK) {
         return make_error(request.request_id, result);
     }
+    statistics_.record_heartbeat_received();
     auto node = storage_registry_.get_node(node_id);
     bool needs_inventory = node.has_value() && node->state == NodeState::JOINING;
     std::vector<std::byte> response_payload;
@@ -469,9 +533,10 @@ Message Master::handle_node_inventory(const Message& request) {
             // replicas. Log only, never merged with Faza 11's
             // OrphanedBlock/gc_dispatch mechanism — a structurally separate
             // concept (see docs/design.md §16).
-            std::cerr << "NODE_INVENTORY: node " << node_id
-                      << " reports unknown/unaffiliated block " << block_id
-                      << " (orphan, log only)\n";
+            logger::log(logger::LogLevel::WARNING, "Master",
+                        "NODE_INVENTORY: node " + std::to_string(node_id) +
+                            " reports unknown/unaffiliated block " + std::to_string(block_id) +
+                            " (orphan, log only)");
             continue;
         }
 
@@ -502,10 +567,12 @@ Message Master::handle_node_inventory(const Message& request) {
             // offset calculation), so this is logged as an anomaly rather
             // than silently ignored or auto-corrected (see docs/design.md
             // §16).
-            std::cerr << "NODE_INVENTORY: node " << node_id << " reports block " << block_id
-                       << " at version " << reported_version
-                       << ", ahead of Master's known version " << known_version
-                       << " (anomaly, no automatic action taken)\n";
+            logger::log(logger::LogLevel::WARNING, "Master",
+                        "NODE_INVENTORY: node " + std::to_string(node_id) + " reports block " +
+                            std::to_string(block_id) + " at version " +
+                            std::to_string(reported_version) +
+                            ", ahead of Master's known version " + std::to_string(known_version) +
+                            " (anomaly, no automatic action taken)");
         }
     }
 
@@ -637,6 +704,8 @@ Message Master::handle_append_commit(const Message& request) {
         return make_error(request.request_id, result);
     }
     persist_metadata();
+    // Faza 14: see the matching comment in handle_write_commit above.
+    statistics_.record_replication(total_appended_bytes);
     return Message{MessageType::ACK, request.request_id, {}};
 }
 
@@ -686,3 +755,13 @@ void Master::gc_dispatch(const std::vector<OrphanedBlock>& orphans) {
         }
     }
 }
+
+Message Master::handle_get_stats(const Message& request) {
+    std::string text = statistics_.format_snapshot();
+    std::vector<std::byte> response_payload(reinterpret_cast<const std::byte*>(text.data()),
+                                             reinterpret_cast<const std::byte*>(text.data()) +
+                                                 text.size());
+    return Message{MessageType::STATS_RESPONSE, request.request_id, std::move(response_payload)};
+}
+
+StatisticsSnapshot Master::statistics_snapshot() const { return statistics_.snapshot(); }
