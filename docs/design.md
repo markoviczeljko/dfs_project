@@ -2195,3 +2195,99 @@ network/disk aproksimacije), sa transparentnom napomenom metodologije u
 finalnom dokumentu, ne tiho sakrivenom pretpostavkom. Nema koda za
 testirati u ovoj pod-fazi — 249/249 testova iz Faze 17.1 ostaje
 nepromijenjeno tačno.
+
+---
+
+## 23. Faza 17.3 — bench/ harness + Eksperiment 1 (Sequential READ) i Eksperiment 2 (Random READ)
+
+Treća pod-faza Faze 17, prva koja stvarno piše `bench/` kod. Novi CMake
+target-ovi: `bench_common` (statička biblioteka, deljeni helperi),
+`bench_sequential_read`, `bench_random_read`. Dodato u root
+`CMakeLists.txt` kao `add_subdirectory(bench)` odmah poslije
+`add_subdirectory(tests)` (redoslijed bitan — `bench/`-ovi target-ovi
+linkuju `failure_test_support`, koji mora već postojati).
+
+**Proces-harness reuse potvrđen** — Faza 17.1-ova odluka da se
+`tests/failure/process_cluster.h/.cpp` ne premješta nego samo proširi
+sad ima stvarnog potrošača. Jedina potrebna CMake izmjena:
+`target_include_directories(failure_test_support PRIVATE ...)` (samo za
+generisani `binary_paths.h`) dopunjeno sa `PUBLIC
+${CMAKE_CURRENT_SOURCE_DIR}/failure` da `bench/`-ovi fajlovi (druga
+direktorija od `tests/failure/`) mogu `#include "process_cluster.h"` bez
+dodatne include-path gimnastike po target-u. Nezavisni cpp-review
+potvrdio: čisto aditivno, ne mijenja include-path nijednog postojećeg
+target-a.
+
+**In-process `Client`, ne `dfs_client` subprocess** (Faza 17.2-ova
+odluka, sad primijenjena): svaki benchmark thread pravi svoju `Client`
+instancu (klasa dokumentovano nije thread-safe) preko `client` CMake
+biblioteke direktno — ClientCache stanje preživljava kroz sve pozive tog
+thread-a, za razliku od jednokratnog `dfs_client` procesa.
+
+**Latencija se mjeri u benchmark kodu, ne čita iz `Client`-ovog internog
+Histogram-a**: `bench_common.h`-ov `compute_latency_stats()` sortira
+tačne mikrosekundne uzorke koje benchmark sam izmjeri oko svakog poziva,
+umjesto da čita `Client::statistics_snapshot()`-ove p50/p95/p99 —
+`Histogram` (Faza 14) daje samo grubu bucket-aproksimaciju i nema javni
+način spajanja uzoraka preko više paralelnih `Client` instanci koje
+scenario sa N klijenata zahtijeva.
+
+**Eksperiment 2 operacionalizacija**: `Client`-ov javni API ima samo
+`read()` cijelog fajla, nema partial/range READ u wire protokolu. "Random
+block reads" iz §10.37 je zato implementirano kao: `kNumFiles` (20)
+zasebnih single-block fajlova, svaki klijent thread ponavlja READ
+uniformno-nasumično odabranog fajla iz tog skupa — blok koji se sljedeći
+dohvata jeste nasumičan, iako je svaki pojedinačni poziv whole-file
+`read()`. Mali `cache_max_bytes` (4 MiB, ~4 bloka) naspram radnog skupa
+od 20 fajlova čini hit ratio mjerenje smislenim (default 512 MB cache bi
+dao trivijalnih ~100% hit posle prvog prolaza).
+
+**Nezavisni cpp-review prije commit-a otkrio jedan HIGH bag**:
+`bench_common.cpp`-ov `fail()` je zvao `std::_Exit(1)` direktno na svaku
+grešku (spawn/CREATE/WRITE/READ) — `_Exit` preskače SVE destruktore
+(za razliku od `std::exit`, koji bar pokreće `atexit` handlere), pa
+`SpawnedCluster cluster`-ov RAII lanac (→ `ProcessHandle`-ov SIGKILL
+safety-net destruktor) nikad nije stigao da se izvrši. Efekat: svaka
+greška tokom benchmark-a je ostavljala prave `dfs_master`+3×`dfs_storage`
+procese kao siročad, i dalje vezane za hardkodirane bench portove —
+sljedeći pokušaj pokretanja benchmarka bi pukao na "port already in use"
+umjesto na jasnu grešku. Popravljeno: `register_cluster_for_cleanup()`
+registruje živi klaster odmah posle uspješnog `spawn_cluster()`-a,
+`fail()` sad zove `cluster->stop_all()` PRIJE `_Exit`-a — zaštićeno
+`std::atomic_flag`-om da dva paralelna thread-a koja istovremeno pozovu
+`fail()` ne trkaju se na `ProcessHandle::reaped_` unutar
+`SpawnedCluster::stop_all()`. Ručno potvrđeno: privremeni forsirani
+`fail()` poziv odmah posle spawn-a, zatim `pgrep -x dfs_master`/
+`dfs_storage` posle izlaska iz programa — nula rezultata, i
+"shutting down" poruke oba procesa vidljive u izlazu prije fatalne
+poruke, dokazujući da je `stop_all()` stvarno pozvan.
+
+**Manje kozmetičke ispravke iz istog review-a**: dodat `format_millis()`
+u `bench_common` za dosljedan decimalni format latencije preko svih
+kolona (prije: throughput je koristio `setprecision(2)`, latencija
+`std::to_string`-ov default 6-decimalni format); komentar dodat uz
+`compute_latency_stats()`-ovu percentile formulu objašnjavajući zašto
+p95≈p99 kolaps pri malom broju uzoraka nije bag.
+
+**Poznat, razumljen artefakt (nije bag)**: kod `client_count=1` sa
+velikim fajlovima u Eksperimentu 1, prvi READ svježe kreiranog fajla je
+pravi cache-miss (mrežni fetch), a preostalih 19 ponovljenih poziva ISTE
+`Client` instance su cache-hit — jedan spori outlier vuče prosjek iznad
+P95 (lower-nearest-rank formula na n=20 uzoraka nikad ne bira posljednji/
+najsporiji uzorak ni za p95 ni za p99). Ovo je stvaran, očekivan
+cache-warmup efekat koji se mjeri, ne greška u računu — potvrđeno
+nezavisnim review-om.
+
+**§16.8-ov skup broja klijenata (1/5/10/25/50/100) svjesno smanjen** na
+`{1, 5, 10}` za ovaj sandboxed dev-environment validacioni run — pun
+15-ćelijski `bench_sequential_read` run na 100 klijenata × 64 MB fajl bi
+značio više GB loopback saobraćaja po ćeliji; korisno na pravom
+thesis-defense hardveru, rasipnički za ponovljeno pokretanje ovdje.
+Nizovi `kClientCounts` su trivijalni za proširiti na pun spisak.
+
+Oba alata ručno pokrenuta (uklj. pod ASan/UBSan) i proizvode fizički
+smislene brojeve: throughput raste sa brojem klijenata, latencija
+degradira pod kontencijom, cache hit ratio (~13-16%) je u očekivanom
+opsegu za 4-slot cache preko 20 fajlova. 249/249 testova iz prethodnih
+pod-faza ostaje nepromijenjeno tačno (bench/ ne dira postojeći kod), čisto
+pod ASan/UBSan.

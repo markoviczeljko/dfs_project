@@ -107,6 +107,13 @@ inline constexpr const char* kDfsStatsctlPath = \"$<TARGET_FILE:dfs_statsctl>\";
 add_library(failure_test_support failure/process_cluster.cpp)
 target_link_libraries(failure_test_support PUBLIC network)
 target_include_directories(failure_test_support PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+# PUBLIC (not just usable from this same directory via quote-include):
+# Faza 17.3's bench/ targets link this library from a sibling directory
+# and need to #include "process_cluster.h" too (see docs/design.md §21 —
+# this harness was extended for benchmark reuse in Faza 17.1, not
+# relocated to a separate module, since a CMake target is reusable from
+# anywhere regardless of which directory its sources physically live in).
+target_include_directories(failure_test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/failure)
 add_dependencies(failure_test_support dfs_master dfs_storage dfs_client dfs_statsctl)
 
 add_executable(test_restart failure/test_restart.cpp)

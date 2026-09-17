@@ -69,3 +69,9 @@ target_link_libraries(dfs_statsctl PRIVATE network)
 
 enable_testing()
 add_subdirectory(tests)
+
+# Faza 17: benchmark executables (see docs/design.md §23) — added after
+# tests/ so bench/'s targets can link tests/failure/'s already-defined
+# failure_test_support (Faza 16 real-process harness, reused rather than
+# relocated per Faza 17.1's docs/design.md §21).
+add_subdirectory(bench)
