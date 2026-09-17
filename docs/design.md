@@ -2140,3 +2140,58 @@ svježeg opsega (41730-41737).
 3 nova unit testa (`ReplicationManagerTest`, RF=1/RF=2/"manje node-ova od
 konfigurisanog RF-a") + 2 nova end-to-end testa = **249/249 testova
 prolazi**, čisto pod ASan/UBSan.
+
+---
+
+## 22. Faza 17.2 — Analiza mjernih rupa naspram §10.36 (bez izmjene koda)
+
+Druga pod-faza Faze 17. Cilj: provjeriti da li `StatisticsManager`
+(`include/statistics/statistics.h`) već pokriva svih 6 kategorija metrika
+iz §10.36 (Performance/Cache/Storage/Network/Replication/Recovery) prije
+nego se počne pisati `bench/` kod u Fazi 17.3, i odlučiti kako zatvoriti
+svaku rupu — bez ijedne izmjene u produkcionom statistics kodu ove
+pod-faze (potvrđeno grep-om: nema `disk_read`/`disk_write`/network-byte
+brojača nigdje u `include/storage/`, `src/storage/`, `include/network/`
+van onoga što je već poznato iz Faze 14).
+
+**Cache hit ratio / misses / bytes served from cache — rupa je u pozivnom
+mjestu, ne u API-ju.** `ClientCache::CacheStats{hits, misses}`
+(`include/client/cache.h`) i `Client::cache_stats()`
+(`include/client/client.h`) već postoje otkad je Faza 13 završena, ali
+`src/client/main_client.cpp` ih nigdje ne poziva — pošto je `dfs_client`
+jednokratan proces (jedan `main()` po pozivu), cache umire sa svakim
+pozivom bez obzira da li se `cache_stats()` ispiše na kraju. Rešenje za
+Fazu 17.3: benchmark kod NE smije pozivati `dfs_client` binarni kao
+subprocess po operaciji (to bi ubilo cache između svakog READ-a) — mora
+linkovati `client/client.h` direktno i raditi više operacija unutar
+jedne `Client` instance u istom procesu, tačno onako kako
+`tests/integration/test_read.cpp` i svi ostali in-process integration
+testovi već rade. Nema potrebe za izmjenom u `client/` kodu.
+
+**Network bytes sent/received, network request count — namjerno van
+scope-a još od Faze 14** (eksplicitan komentar u `statistics.h` retci
+22-28: "per-MessageType network byte/message counters... would need a
+hook in every TCPConnection call site project-wide for a stat the plan's
+own committed method list never named"). Otvaranje tog scope-a sada bi
+značilo hook na svaki `TCPConnection` poziv u projektu — veliki refaktor
+van cilja Faze 17. Umjesto toga, benchmarci će **aproksimirati** network
+saobraćaj preko već postojećih `OperationStats.bytes` (klijent-vidljiv
+payload po operaciji) i `StatisticsSnapshot::bytes_replicated`
+(replikacioni saobraćaj) — dovoljno precizno za relativna poređenja
+(RF=1 vs RF=3, cache ON vs OFF), uz eksplicitnu napomenu metodologije u
+`docs/benchmark_results.md` (Faza 17.5).
+
+**Disk read/write throughput — ista situacija, ista aproksimacija.**
+Nema posebnog brojača za fizičke disk I/O bajtove (potvrđeno: `BlockStorage`
+nema `disk_read`/`disk_write` polja). `BlockStorage::write_block()`/
+`read_block()` rade pravi `fsync`-ovan file I/O po operaciji (vidi Faza 15
+dokumentaciju), pa je `OperationStats.bytes` za READ/WRITE razuman
+zamjenski signal — isto dokumentovano kao aproksimacija.
+
+**Odluka**: nijedna od tri rupe ne opravdava širenje `StatisticsManager`-a
+sada — sve tri se rješavaju na benchmark strani (in-process `Client`
+pozivi za cache, postojeći `OperationStats.bytes`/`bytes_replicated` za
+network/disk aproksimacije), sa transparentnom napomenom metodologije u
+finalnom dokumentu, ne tiho sakrivenom pretpostavkom. Nema koda za
+testirati u ovoj pod-fazi — 249/249 testova iz Faze 17.1 ostaje
+nepromijenjeno tačno.
