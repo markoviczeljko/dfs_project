@@ -295,7 +295,7 @@ Message StorageNode::make_error(uint64_t request_id, ErrorCode error) {
 }
 
 Message StorageNode::handle_message(const Message& request) {
-    // cpp-reviewer fix: captured BEFORE route_message() runs — WRITE_BLOCK's
+    // Fix: captured BEFORE route_message() runs — WRITE_BLOCK's
     // handler calls operation_log_.begin_or_get(), which INSERTS a fresh
     // IN_PROGRESS entry as a side effect when the id is genuinely new, so
     // checking "is this a known id" after route_message() would always see
@@ -428,7 +428,7 @@ Message StorageNode::handle_read_block(const Message& request) {
     BlockId block_id = get_u64(request.payload.data());
     uint64_t known_version = get_u64(request.payload.data() + kBlockIdSize);
 
-    // Faza 13 (cpp-reviewer fix): version-check and data-read must happen
+    // Faza 13 fix: version-check and data-read must happen
     // under one lock acquisition, or a concurrent write between two
     // separate calls (get_block_info() then read_block()) could produce a
     // READ_OK whose version and data don't correspond to the same on-disk

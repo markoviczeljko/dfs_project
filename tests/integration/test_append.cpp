@@ -97,7 +97,7 @@ TEST_F(AppendIntegrationTest, AppendToEmptyFileIsEquivalentToWrite) {
     EXPECT_EQ(append_stats.successful, 1u);
     EXPECT_EQ(append_stats.bytes, data.size());
 
-    // cpp-reviewer regression: Master::handle_message()'s generic wrapper
+    // Regression test: Master::handle_message()'s generic wrapper
     // used to hardcode bytes=0 for every operation type, including
     // APPEND_COMMIT, even though the real total is in the wire payload
     // (see docs/design.md §18).

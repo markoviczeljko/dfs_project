@@ -90,8 +90,8 @@ ErrorCode error_from_payload(const std::vector<std::byte>& payload) {
 
 // A fake Master that accepts the connection but never replies — regression
 // coverage for register_with_master()/send_inventory()'s missing
-// Socket::set_timeout() (bugfix: see docs/design.md §16, cpp-reviewer
-// finding — same pattern as MasterTest's HangingNode in test_master.cpp).
+// Socket::set_timeout() (bugfix: see docs/design.md §16 — same pattern
+// as MasterTest's HangingNode in test_master.cpp).
 struct HangingMaster {
     std::unique_ptr<NetworkServer> server;
 
@@ -164,7 +164,7 @@ protected:
 TEST_F(StorageNodeTest, StartTimesOutRatherThanHangingWhenMasterNeverReplies) {
     // Bugfix regression: register_with_master() had no Socket::set_timeout()
     // — before the fix, this test would hang forever instead of returning
-    // (see docs/design.md §16, cpp-reviewer finding).
+    // (see docs/design.md §16).
     auto hanging_master = HangingMaster::start(38170, MASTER_RPC_TIMEOUT_MS + 1500);
 
     StorageNode::Config config{1, 38171, dir_, 1024 * 1024, "127.0.0.1", "127.0.0.1", 38170};
@@ -332,7 +332,7 @@ TEST_F(StorageNodeTest, GetStatsReturnsTextSnapshotReflectingPriorOperations) {
     EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].bytes, data.size());
 }
 
-// cpp-reviewer regression: a WRITE_BLOCK retry (same operation_id, lost
+// Regression test: a WRITE_BLOCK retry (same operation_id, lost
 // original ACK) replays the cached response without re-executing the
 // write — it must not be double-counted in StatisticsManager either (see
 // docs/design.md §18).

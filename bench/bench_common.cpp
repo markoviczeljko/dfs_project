@@ -73,8 +73,8 @@ LatencyStats compute_latency_stats(std::vector<uint64_t> samples_us) {
     // Lower-nearest-rank: index = floor(fraction * (count-1)). At low
     // sample counts (e.g. count=20) this maps both p95 and p99 to the
     // same index and never selects the single worst sample for any
-    // fraction < 1.0 — expected, not a bug (independent cpp-review
-    // confirmed this during Faza 17.3's review). It's exactly why a lone
+    // fraction < 1.0 — expected, not a bug (confirmed during
+    // Faza 17.3's review). It's exactly why a lone
     // cold-cache-miss outlier among many warm cache-hit reads can pull
     // the mean above p95 for bench_sequential_read.cpp's client_count=1
     // rows — see docs/design.md §23.

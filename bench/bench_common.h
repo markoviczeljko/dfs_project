@@ -19,8 +19,8 @@ namespace dfs_bench {
 // without this the spawned dfs_master/dfs_storage processes would leak
 // as orphans still bound to the hardcoded bench ports on any post-spawn
 // CREATE/WRITE/READ failure, breaking the *next* bench run with a
-// confusing "port already in use" error instead of a clean one (found by
-// independent cpp-review before this shipped — see docs/design.md §23).
+// confusing "port already in use" error instead of a clean one (found
+// during review before this shipped — see docs/design.md §23).
 void register_cluster_for_cleanup(dfs_test::SpawnedCluster* cluster);
 
 // Prints an error to stderr, tears down the registered cluster (if any —
@@ -70,7 +70,7 @@ std::string format_throughput_mb_s(double bytes, double seconds);
 
 // Formats a microsecond value as "<N.NNN> ms" — shared so every latency
 // column across every bench table uses the same precision (found as a
-// cosmetic inconsistency by independent cpp-review: some columns used to
+// cosmetic inconsistency during review: some columns used to
 // go through std::to_string's default 6-decimal formatting instead).
 std::string format_millis(double microseconds);
 
@@ -82,7 +82,7 @@ std::string format_percent(double fraction);
 std::string format_mb(double bytes);
 
 // Formats a seconds value as "<N.NN> s" — shared for the same reason as
-// format_millis (independent cpp-review caught one column that had
+// format_millis (review caught one column that had
 // slipped through using std::to_string's raw 6-decimal formatting).
 std::string format_seconds(double seconds);
 

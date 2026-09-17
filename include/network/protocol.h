@@ -80,7 +80,7 @@ enum class MessageType : uint16_t {
     // snapshot — dfs_statsctl just prints the bytes back, no client-side
     // parsing needed for this diagnostic tool.
     //
-    // cpp-reviewer note: appended at the very end (not grouped near
+    // Note: appended at the very end (not grouped near
     // REGISTER_NODE/HEARTBEAT/NODE_INVENTORY like earlier phases did),
     // specifically so the numeric wire values of every pre-existing
     // MessageType — ACK/ERROR included — stay stable. Mid-sequence

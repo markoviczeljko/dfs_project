@@ -317,7 +317,7 @@ TEST_F(BlockStorageTest, ReadBlockIfChangedOnMissingBlockFails) {
     EXPECT_EQ(storage->read_block_if_changed(999, 0).error(), ErrorCode::BLOCK_NOT_FOUND);
 }
 
-// cpp-reviewer regression (see docs/design.md §17): the version and data
+// Regression test (see docs/design.md §17): the version and data
 // returned together must always describe the SAME on-disk state, even
 // under concurrent writers. Before the fix, handle_read_block() checked
 // the version and read the data as two separate lock acquisitions, so a

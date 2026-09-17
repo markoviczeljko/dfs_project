@@ -1938,7 +1938,7 @@ TSAN_OPTIONS="halt_on_error=0" setarch "$(uname -m)" -R ctest --test-dir build-t
 **Poznat environment flake, ne Faza 15 bag**: `ReadIntegrationTest.
 ReadAfterOverwriteWithFewerBlocksReturnsNewContentOnly` je konzistentno
 pukao (segfault na `master_->start()` sa `INTERNAL_ERROR`) tokom cijele
-ove sesije — `fuser 40250/tcp` je potvrdio da OVA claude sesija sama
+ove sesije — `fuser 40250/tcp` je potvrdio da OVA razvojna sesija sama
 ima trajnu izlaznu konekciju na baš tom efemernom portu (isti fenomen
 dokumentovan od Faze 9, samo ovog puta uzročnik je sesija sama, ne
 Firefox), pa je test isključivan iz svih run-ova (`-E` filter). Dva

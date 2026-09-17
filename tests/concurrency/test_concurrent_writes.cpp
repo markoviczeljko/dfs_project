@@ -113,7 +113,7 @@ TEST(ConcurrentWritesTest, ConcurrentWritesToDifferentBlocksRespectSharedCapacit
     std::filesystem::remove_all(dir);
 }
 
-// cpp-reviewer regression (see docs/design.md §19): a write_block() that
+// Regression test (see docs/design.md §19): a write_block() that
 // resolves its BlockState via get_or_create_block_state() and then loses a
 // race to a concurrent delete_block() on the SAME id must never let its
 // write land in a BlockState the map no longer references — the original

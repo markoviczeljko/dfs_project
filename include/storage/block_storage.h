@@ -78,7 +78,7 @@ public:
 
     // Faza 13: version-check-then-read, atomic under a single lock
     // acquisition on this block's own BlockState::mutex (see docs/design.md
-    // §17 — cpp-reviewer finding, still preserved under Faza 15's per-block
+    // §17, still preserved under Faza 15's per-block
     // scheme). not_modified is true (data left empty) when known_version
     // matches the current version; known_version == 0 never matches (real
     // versions start at 1, see docs/design.md §16).

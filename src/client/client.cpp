@@ -524,7 +524,7 @@ ErrorCode Client::append_impl(const std::string& path, const std::vector<uint8_t
             if (write_err != ErrorCode::OK) {
                 return write_err;
             }
-            // Faza 13 (cpp-reviewer fix): invalidate right after the fill
+            // Faza 13 fix: invalidate right after the fill
             // physically lands, not after APPEND_COMMIT succeeds. The
             // Storage Node's on-disk bytes for this block are already
             // stale-for-the-cache at this point regardless of whether the

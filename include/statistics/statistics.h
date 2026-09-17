@@ -100,7 +100,7 @@ public:
     std::string format_snapshot() const;
 
 private:
-    // cpp-reviewer note: total/successful/failed/bytes/latency are each
+    // Note: total/successful/failed/bytes/latency are each
     // updated via independent atomic ops in record_operation() (see
     // statistics.cpp), not under one shared lock — a concurrent snapshot()
     // can observe them torn relative to each other (e.g. total already

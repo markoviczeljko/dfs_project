@@ -118,8 +118,8 @@ WriteStorageResult run_write_storage_phase(uint32_t rf) {
     // bench_common.h's parse_stat_u64 doc comment) would otherwise wrap
     // this unsigned subtraction to a huge value and silently report a
     // wildly wrong "Storage izmjereno" figure instead of failing loudly
-    // — independent cpp-review flagged this as the one real gap in an
-    // otherwise-approved review.
+    // — flagged during review as the one real gap in an
+    // otherwise-clean pass.
     if (used_after < used_before) fail("storage usage decreased unexpectedly — flaky GET_STATS?");
     LatencyStats stats = compute_latency_stats(std::move(latencies));
     double total_logical_bytes = static_cast<double>(kFileSize) * static_cast<double>(kNumFiles);
@@ -132,8 +132,8 @@ WriteStorageResult run_write_storage_phase(uint32_t rf) {
     // next call's setup, and a spawn_cluster() failure there (before its
     // own register_cluster_for_cleanup() runs) would make fail() call
     // stop_all() through a use-after-free pointer instead of just
-    // skipping cleanup (found while reviewing this file's own design,
-    // not by cpp-review — see docs/design.md §24).
+    // skipping cleanup (found while reviewing this file's own design
+    // — see docs/design.md §24).
     register_cluster_for_cleanup(nullptr);
 
     return WriteStorageResult{

@@ -195,7 +195,7 @@ std::optional<OperationType> to_operation_type(MessageType type) {
     }
 }
 
-// cpp-reviewer fix: WRITE_COMMIT/APPEND_COMMIT both start with
+// Note: WRITE_COMMIT/APPEND_COMMIT both start with
 // [u32 path_len][path][u64 <total bytes>] on the wire (see
 // handle_write_commit/handle_append_commit) — extracted here so the
 // generic wrapper can report real bytes instead of a hardcoded 0 (which
