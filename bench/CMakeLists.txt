@@ -22,3 +22,6 @@ target_link_libraries(bench_cache_on_off PRIVATE bench_common)
 
 add_executable(bench_replication_factor bench_replication_factor.cpp)
 target_link_libraries(bench_replication_factor PRIVATE bench_common)
+
+add_executable(bench_node_failure bench_node_failure.cpp)
+target_link_libraries(bench_node_failure PRIVATE bench_common)

@@ -2379,3 +2379,133 @@ Eksperimenta 3 i 4 ispunjavaju "Gotovo kad" kriterijum iz
 cache-OFF; viši RF pokazuje višu write latenciju i storage potrošnju
 (plus recovery ponašanje kao bonus dimenzija, jasno demonstrirajući
 RF=1-ov nedostatak fault tolerance-a).
+
+---
+
+## 25. Faza 17.5 — Eksperiment 5 (Node Failure) + orkestracija + finalni dokument
+
+Peta i posljednja pod-faza Faze 17. Novi CMake target `bench_node_failure`,
+nova skripta `scripts/run_benchmarks.sh`, i generisan `docs/benchmark_results.md`
+— zatvara "eksperimentalna evaluacija" zahtjev iz §1.2/§10.1 diplomskog
+rada.
+
+**Eksperiment 5**: za dvije veličine fajla (1MB, 10MB), 4-node klaster
+(RF=3, default — ovaj eksperiment testira SAM mehanizam otkaza/oporavka,
+ne RF poređenje, to je već bio posao Eksperimenta 4), real `SIGKILL` na
+node-u koji drži jednu od 3 replike, poll preko `dfs_statsctl` GET_STATS
+svakih 500ms do 40s budžeta (isti kao `test_storage_failure.cpp` i Faza
+17.4-ova RF=1 grana).
+
+**"Recovery start time" (jedna od §10.37-ovih pet stavki) nije zasebno
+mjerena** — `RecoveryManager::handle_node_failure()`
+(`src/master/recovery_manager.cpp`) postavlja recovery posao u red
+SINHRONO unutar istog `FailureDetector` callback-a koji uvećava
+`detected_failures`; ovaj dizajn ne proizvodi mjerljiv razmak između
+"detektovano" i "recovery počeo" da bi se posebno mjerio. Umjesto toga
+izvještava se: failure detection vrijeme (kill → `detected_failures`
+prvi put ≥1) i recovery trajanje (detekcija → `successful_recoveries`
+prvi put ≥1) — zajedno pokrivaju istu kill-do-oporavljeno vremensku
+liniju koju §10.37 traži, samo bez izmišljene "start" prekretnice koju
+ovaj sistem strukturno ne proizvodi.
+
+Ručno potvrđeno: ~12.1s detekcija (poklapa se sa
+`SUSPECTED_TIMEOUT_SECONDS(6)+DEAD_TIMEOUT_SECONDS(12)`), ~0.00s recovery
+trajanje nativno (COPY_BLOCK za MB-veličine blokova preko loopback-a
+završi unutar istog 500ms poll prozora u kom se recovery prvi put
+primijeti — potvrđeno da mjerenje stvarno radi, ne da je nula-bag, jer
+pod ASan/UBSan (sporiji I/O) isto mjerenje pokazuje 0.5-1.0s), `bytes_recovered`
+tačno prati veličinu fajla, finalno stanje 3/3 u oba slučaja. Stvaran
+nalaz za diplomski: dominantni trošak recovery-ja je isključivo
+failure-detection timeout (dizajnerski trade-off iz Faze 12.1), ne sâmo
+kopiranje podataka (sub-sekunda za MB-skale blokove na loopback-u).
+
+**`scripts/run_benchmarks.sh`**: pokreće svih 5 `bench/` executable-a
+redom, hvata `stdout` svakog preko `raw_output="$(...)"`, filtrira preko
+`sed -n '/^### /,$p'` prije upisa u `docs/benchmark_results.md`. Filter
+postoji jer spawn-ovana `dfs_master`/`dfs_storage` djeca nasljeđuju isti
+stdout fd (vidi `tests/failure/process_cluster.cpp`) i ispisuju svoje
+"listening on port"/"shutting down" linije direktno na njega, dok
+benchmark izvršni fajl vlastiti `std::cout` (potpuno bufferovan, ne
+linijski, pošto je preusmjeren u fajl a ne TTY) flush-uje tek na izlasku
+iz procesa — bez filtera, sav dječiji šum jednog run-a bi završio u
+fajlu PRIJE sopstvene markdown tabele tog run-a, iako je tabela logički
+ispisana ranije u programskom redoslijedu. Nema trap-based cluster
+cleanup logike kao `scripts/test_cluster.sh` (Faza 16) — svaki bench
+executable već vlasnički upravlja i gasi sopstveni klaster preko
+`bench_common`-ovog `register_cluster_for_cleanup()`/`fail()`, a
+spawn-ovana `dfs_master`/`dfs_storage` djeca već imaju sopstveni graceful
+SIGINT/SIGTERM handler (`src/master/main_master.cpp`,
+`src/storage/main_storage.cpp`) — Ctrl-C tokom skripte ih direktno gasi,
+nezavisno od toga da li prekinuti bench executable-ov sopstveni
+`stop_all()` ikad stigne da se izvrši.
+
+**Nezavisni cpp-review: APPROVE, bez CRITICAL/HIGH.** Potvrđeno: ista
+`register_cluster_for_cleanup(nullptr)` zaštita od use-after-free-a
+(otkriven i popravljen u Fazi 17.4) ispravno primijenjena i u ovom
+fajlu; `sed` filter ne može nikad odsjeći dio legitimne tabele
+(`print_markdown_table()` uvijek počinje sa `"### "`, redovi počinju sa
+`"|"`, provjereno da ne kolidira sa child-procesa linijama); `set -euo
+pipefail` + `raw_output="$(...)"` ispravno propagira neuspjeh
+benchmark-a (`fail()`-ov `_Exit(1)`) u neuspjeh skripte. Jedan
+zanemarljiv, ne-blokirajući nalaz: `kill_time` se hvata poslije
+`wait_for_exit(2s)`-a umjesto odmah poslije `send_signal(SIGKILL)`-a
+(do ~50ms kašnjenja naspram ~12s mjerenog prozora) — nije popravljeno,
+zanemarljivo u odnosu na mjerenu veličinu.
+
+249/249 testova nepromijenjeno tačno, čisto pod ASan/UBSan.
+
+---
+
+## 26. Faza 17 — Sažetak (Benchmarking, §16.6-§16.8, §10.36-§10.37)
+
+Faza 17 je završena u 5 pod-faza (17.1-17.5), svaka sa nezavisnim
+cpp-review prolazom prije commit-a:
+
+| Pod-faza | Šta | Nezavisni review nalaz |
+|---|---|---|
+| 17.1 | `replication_factor` kao runtime `master.conf` ključ (§21) | 1 MEDIUM (port kolizija u novom testu) — popravljeno |
+| 17.2 | Analiza mjernih rupa naspram §10.36, bez koda (§22) | n/a (nema diff-a za review) |
+| 17.3 | `bench/` harness + Eksperiment 1 (Sequential READ) i 2 (Random READ) (§23) | 1 HIGH (resource leak na error path-u) — popravljeno |
+| 17.4 | Eksperiment 3 (Cache ON/OFF) i 4 (Replication Factor) (§24) | APPROVE — 2 MEDIUM/LOW (format, underflow guard) popravljena; use-after-free samostalno pronađen i popravljen prije slanja na review |
+| 17.5 | Eksperiment 5 (Node Failure) + orkestracija + finalni dokument (§25) | APPROVE — 1 zanemarljiv nalaz, ne popravljen |
+
+**Ključni proizvodi**: `bench/` direktorija sa 5 executable-a
+(`bench_sequential_read`, `bench_random_read`, `bench_cache_on_off`,
+`bench_replication_factor`, `bench_node_failure`) + dijeljena
+`bench_common` biblioteka; `scripts/run_benchmarks.sh`; popunjen
+`docs/benchmark_results.md` sa svih 5 tabela i eksplicitnom
+metodološkom napomenom na vrhu (aproksimacije, smanjeni klijent-opseg,
+neinstrumentirana "recovery start time").
+
+**Arhitekturne odluke koje su preživjele cijelu fazu**: proces-harness iz
+Faze 16 (`tests/failure/process_cluster.h/.cpp`) proširen, ne premješten
+(17.1) — ispravnost te YAGNI odluke potvrđena kad su 17.3-17.5 stvarno
+počeli da ga koriste bez ijedne dodatne izmjene osim jednog novog
+`PUBLIC` include-dir exporta. In-process `Client` umjesto `dfs_client`
+subprocess-a (17.2 odluka) omogućio je i cache-svjesna mjerenja (17.3
+Eksperiment 2, 17.4 Eksperiment 3) i precizno tempiranje pojedinačnih
+poziva bez procesnog overhead-a.
+
+**Nalazi vrijedni eksperimentalnog poglavlja diplomskog rada** (ne samo
+brojevi, već arhitekturni uvidi otkriveni MJERENJEM, ne čitanjem koda):
+cache ubrzava READ 7-10x i mjerljivo smanjuje network/disk saobraćaj
+(90% hit ratio protiv 0%); viši replication factor linearno poskupljuje
+write latenciju i storage potrošnju (RF=3 troši tačno 3x više od RF=1);
+**RF=1 nema fault tolerance** — gubitak jedine replike je trajan i
+nepovratan dok se taj konkretan node ne vrati (jer `RecoveryManager`
+zahtijeva zdrav izvor za kopiranje), dok RF=3 oporavlja automatski za
+~12s; dominantni trošak recovery-ja u cijelom sistemu je
+failure-detection timeout (dizajnerski trade-off), ne sâmo kopiranje
+podataka.
+
+**Transparentno dokumentovana ograničenja** (za odbranu diplomskog rada,
+ne sakriveno): broj konkurentnih klijenata smanjen sa punog §16.8 spiska
+(1/5/10/25/50/100) na {1,5,10} za sandboxed dev-environment validacione
+run-ove — nizovi trivijalni za proširiti na ciljnom hardveru; network/disk
+saobraćaj je aproksimacija/analitički izračun, ne pravi packet/syscall
+brojač (opravdano po eksperimentu u §22/§24); "recovery start time" nije
+zasebno instrumentiran u sistemu.
+
+Ovim je Faza 17 (Benchmarking) u potpunosti zatvorena. Faza 17 je
+POSLJEDNJA faza u `IMPLEMENTATION_PLAN.md`-u (0-17, 18 faza ukupno) —
+svih 18 faza implementacionog plana su sada završene.
