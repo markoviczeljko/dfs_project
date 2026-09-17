@@ -2,9 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <iomanip>
 #include <random>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,12 +43,6 @@ constexpr int kReadsPerClient = 30;
 // §16.8, reduced for this sandboxed validation run — see
 // bench_sequential_read.cpp's identical note (docs/design.md §23).
 constexpr std::array<int, 3> kClientCounts = {1, 5, 10};
-
-std::string format_percent(double fraction) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(1) << (fraction * 100.0) << "%";
-    return out.str();
-}
 
 }  // namespace
 

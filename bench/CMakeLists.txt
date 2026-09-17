@@ -16,3 +16,9 @@ target_link_libraries(bench_sequential_read PRIVATE bench_common)
 
 add_executable(bench_random_read bench_random_read.cpp)
 target_link_libraries(bench_random_read PRIVATE bench_common)
+
+add_executable(bench_cache_on_off bench_cache_on_off.cpp)
+target_link_libraries(bench_cache_on_off PRIVATE bench_common)
+
+add_executable(bench_replication_factor bench_replication_factor.cpp)
+target_link_libraries(bench_replication_factor PRIVATE bench_common)

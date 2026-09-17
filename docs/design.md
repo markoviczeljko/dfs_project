@@ -2291,3 +2291,91 @@ degradira pod kontencijom, cache hit ratio (~13-16%) je u očekivanom
 opsegu za 4-slot cache preko 20 fajlova. 249/249 testova iz prethodnih
 pod-faza ostaje nepromijenjeno tačno (bench/ ne dira postojeći kod), čisto
 pod ASan/UBSan.
+
+---
+
+## 24. Faza 17.4 — Eksperiment 3 (Cache ON/OFF) i Eksperiment 4 (Replication Factor)
+
+Četvrta pod-faza Faze 17. Novi CMake target-ovi `bench_cache_on_off` i
+`bench_replication_factor`, plus tri nova dijeljena helpera u
+`bench_common` (`format_percent`, `format_mb`, `format_seconds`,
+`parse_stat_u64`).
+
+**Eksperiment 3 — otkriven `ClientCache` eviction quirk prije nego je
+postao bag.** Prvobitni plan (jedan fajl, ponovljeni READ-ovi) bi bio
+tiho pogrešan: `ClientCache::evict_locked()` (`src/client/cache.cpp`)
+evikuje postojeće entry-je SAMO kad se ubacuje NOV, različit blok dok je
+cache već preko kapaciteta — sa jednim ponovljeno čitanim fajlom, taj
+jedini entry se ubaci jednom (nema šta da se evikuje protiv sebe samog) i
+onda nikad više ne biva evikovan, pa bi `cache_max_bytes=0` slučajno
+davao ~100% hit ratio čak i sa "isključenim" kešom. Otkriveno čitanjem
+`cache.cpp`-a PRIJE pisanja benchmark koda, ne kroz padajući test.
+Rešenje: dva različita fajla (A, B) se čitaju naizmjenično — svaki `put()`
+za drugi fajl tada UVIJEK evikuje trenutnog stanara prije ubacivanja, pa
+`cache_max_bytes=0` genuinski primorava miss na svaki READ. Ručno
+potvrđeno: OFF = tačno 0.0% hit ratio, ON = tačno 90.0% (2 miss-a od 20
+READ-ova — prvi READ svakog od 2 fajla), ON prosječna latencija 7-10x
+niža od OFF-a.
+
+**Network/disk aproksimacija za READ ispravljena naspram Faze 17.2-ove
+generičke odluke**: `OperationStats[READ].bytes` bilježi LOGIČKE bajtove
+vraćene pozivaocu (`src/client/client.cpp`-ov `read()`), identično bez
+obzira da li je blok došao iz keša ili mreže — beskorisno za ON/OFF
+poređenje (davalo bi identičan broj u oba slučaja). Umjesto toga:
+`cache_stats().misses * kFileSize` se koristi kao dijeljena network/disk
+procjena za oba dimenzije, pošto svaki cache MISS znači tačno jedan pravi
+mrežni fetch + tačno jedan pravi Storage-side disk read istog bloka.
+
+**Eksperiment 4 — write latencija + storage potrošnja (Phase A)**:
+network saobraćaj za WRITE se računa ANALITIČKI, ne aproksimira —
+`Client::write_chunk_to_replicas()` (`src/client/client.cpp`) šalje pun
+chunk SVAKOJ replici sa liste, pa je odlazni network = logički_bajtovi ×
+replication_factor TAČNO, za ovaj deterministički single-writer
+workload, bez potrebe za instrumentacijom. Storage potrošnja se MJERI
+direktno: svaki Storage Node-ov sopstveni `Storage: ... used_bytes=`
+GET_STATS red (`src/storage/storage_node.cpp`-ov `handle_get_stats()`
+sinhrono održava running counter preko `BlockStorage::used_space()` —
+ažuriran unutar `write_block_locked()` prije nego WRITE_COMMIT vrati ACK,
+pa nema staleness za čekati, potvrđeno nezavisnim review-om čitanjem
+cijelog lanca) se sabira preko sva 4 node-a, prije/poslije write faze.
+Ručno potvrđeno: RF=1 troši tačno 20MB (logički), RF=3 troši tačno 60MB —
+poklapa se sa analitičkom network procjenom, oba skaliraju sa RF-om.
+
+**Eksperiment 4 — recovery ponašanje (Phase B), pravi nalaz vrijedan
+diplomskog rada**: real `SIGKILL` na jedinog/prvog nosioca bloka, poll do
+40s (isti budžet kao `tests/failure/test_storage_failure.cpp`).
+`RecoveryManager::recover_block()` (`src/master/recovery_manager.cpp`)
+zahtijeva ZDRAVU IZVORNU repliku da bi kopirao bajtove — sa RF=1, ubijeni
+node je bio JEDINA replika, `found_source` je uvijek `false`, svaki retry
+odmah odustaje, `record_recovery(success=false)`. Recovery za RF=1 je
+STRUKTURNO nemoguć, ne bag u benchmark alatu — ovo JESTE poenta
+poređenja. Ručno potvrđeno: RF=3 oporavlja se za ~12.0s (unutar
+SUSPECTED_TIMEOUT_SECONDS+DEAD_TIMEOUT_SECONDS prozora),
+RF=1 timeout-uje na tačno 40s, `detected_failures=1`/
+`successful_recoveries=0` za RF=1 nasuprot `=1`/`=1` za RF=3 (potvrđeno
+preko `dfs_statsctl` GET_STATS, isti `parse_stat_u64()` helper reuse-ovan
+i za "Storage:"/"Failures:"/"Recovery:" redove).
+
+**Nezavisni cpp-review: APPROVE, bez CRITICAL/HIGH.** Prije slanja na
+review, sam sam pronašao i popravio use-after-free bag u
+`bench_replication_factor.cpp`: `register_cluster_for_cleanup()`-ov
+globalni pokazivač nije bio čišćen između Phase A-inog i Phase B-inog
+klastera (dvije sekvencijalne `SpawnedCluster` lokalne varijable na istim
+portovima) — da je Phase B-ov `spawn_cluster()` pukao PRIJE sopstvene
+registracije, `fail()` bi dereferencirao već uništen Phase A-ov klaster.
+Popravljeno pozivanjem `register_cluster_for_cleanup(nullptr)` na kraju
+oba `run_write_storage_phase()`/`run_recovery_phase()`. Review je
+nezavisno potvrdio da je popravka ispravna i potpuna (nema preostalog
+prozora), i naveo dva MEDIUM/LOW polish nalaza koji su takođe popravljeni:
+`format_seconds()` dodat za dosljedan format (jedna kolona je koristila
+`std::to_string`-ov 6-decimalni default), i guard protiv unsigned
+underflow-a u `used_after - used_before` ako `run_statsctl`/
+`parse_stat_u64` ikad "meko" vrati 0 (obje funkcije namjerno ne bacaju
+grešku na nedostajući red/ključ).
+
+249/249 testova nepromijenjeno tačno, čisto pod ASan/UBSan. Oba
+Eksperimenta 3 i 4 ispunjavaju "Gotovo kad" kriterijum iz
+`IMPLEMENTATION_PLAN.md`: cache-ON READ latencija mjerljivo niža od
+cache-OFF; viši RF pokazuje višu write latenciju i storage potrošnju
+(plus recovery ponašanje kao bonus dimenzija, jasno demonstrirajući
+RF=1-ov nedostatak fault tolerance-a).

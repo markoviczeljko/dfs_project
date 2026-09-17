@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -119,6 +120,49 @@ std::string format_millis(double microseconds) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(3) << (microseconds / 1000.0) << " ms";
     return out.str();
+}
+
+std::string format_percent(double fraction) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << (fraction * 100.0) << "%";
+    return out.str();
+}
+
+std::string format_mb(double bytes) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << (bytes / (1024.0 * 1024.0)) << " MB";
+    return out.str();
+}
+
+std::string format_seconds(double seconds) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << seconds << " s";
+    return out.str();
+}
+
+uint64_t parse_stat_u64(const std::string& stats_text, const std::string& line_prefix,
+                         const std::string& key) {
+    size_t line_start = stats_text.find(line_prefix);
+    if (line_start == std::string::npos) {
+        return 0;
+    }
+    size_t line_end = stats_text.find('\n', line_start);
+    std::string line = stats_text.substr(
+        line_start, line_end == std::string::npos ? std::string::npos : line_end - line_start);
+
+    size_t key_pos = line.find(key);
+    if (key_pos == std::string::npos) {
+        return 0;
+    }
+    size_t value_start = key_pos + key.size();
+    size_t value_end = value_start;
+    while (value_end < line.size() && std::isdigit(static_cast<unsigned char>(line[value_end]))) {
+        ++value_end;
+    }
+    if (value_end == value_start) {
+        return 0;
+    }
+    return std::stoull(line.substr(value_start, value_end - value_start));
 }
 
 }  // namespace dfs_bench

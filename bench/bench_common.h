@@ -74,6 +74,29 @@ std::string format_throughput_mb_s(double bytes, double seconds);
 // go through std::to_string's default 6-decimal formatting instead).
 std::string format_millis(double microseconds);
 
+// Formats a [0,1] fraction as "<N.N>%".
+std::string format_percent(double fraction);
+
+// Formats a byte count as "<N.NN> MB" (not a rate — see
+// format_throughput_mb_s for that).
+std::string format_mb(double bytes);
+
+// Formats a seconds value as "<N.NN> s" — shared for the same reason as
+// format_millis (independent cpp-review caught one column that had
+// slipped through using std::to_string's raw 6-decimal formatting).
+std::string format_seconds(double seconds);
+
+// Extracts the unsigned integer value of `key=<value>` from the line in
+// `stats_text` (a dfs_statsctl GET_STATS response, see
+// StatisticsManager::format_snapshot()) that contains `line_prefix` —
+// scoped to that one line, NOT a global substring search, since several
+// keys ("successful=", "bytes=") repeat verbatim across multiple
+// sections/per-operation lines (see docs/design.md §20's Faza 16
+// test_recovery.cpp bug for why a naive global search silently reads the
+// wrong occurrence). Returns 0 if the prefix or key isn't found.
+uint64_t parse_stat_u64(const std::string& stats_text, const std::string& line_prefix,
+                         const std::string& key);
+
 }  // namespace dfs_bench
 
 #endif  // DFS_BENCH_BENCH_COMMON_H_
