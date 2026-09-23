@@ -49,11 +49,25 @@ public:
     // theft (committing under path A a block_id allocated for path B) stays
     // fully rejected either way, since that id never enters A's pending set.
     // On any successful commit_write(), the path's *entire* pending set is
-    // cleared (not just the ids that were committed) — this discards any
-    // leftover ids from an earlier abandoned write attempt on the same path,
-    // which would otherwise accumulate forever with no way to ever be
-    // committed (see docs/design.md §12).
+    // cleared (not just the ids that were committed) — leftover ids from an
+    // earlier failed write attempt on the same path can never be committed
+    // after that, so commit_write() also returns them as orphans for GC
+    // (Faza 18) instead of leaving their blocks_ entries and on-disk
+    // replicas behind (see docs/design.md §12).
     Result<BlockId> allocate_block(const std::string& path);
+
+    // Faza 18: undoes allocate_block() for ids a failed WRITE/APPEND attempt
+    // gave up on (ABANDON_BLOCKS). Only ids still in the path's pending set
+    // are touched — an id that was already committed, or already dropped by
+    // a later commit_write()/delete_file()/abandon, is silently skipped, so
+    // the call is idempotent and safe against racing commits (block ids are
+    // never reused: next_block_id_ only grows). Returns OrphanedBlock
+    // snapshots for the dropped ids that had replicas assigned, so Master
+    // can GC them with the same gc_dispatch() DELETE_FILE uses. Unknown
+    // path is a no-op, not an error: the file may have been deleted
+    // meanwhile.
+    Result<std::vector<OrphanedBlock>> abandon_blocks(const std::string& path,
+                                                      const std::vector<BlockId>& block_ids);
 
     // Faza 11: WRITE overwrites the file's whole block list; the blocks it
     // replaces are returned as orphans (see delete_file()'s comment above

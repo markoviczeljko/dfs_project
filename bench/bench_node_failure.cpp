@@ -45,6 +45,10 @@ constexpr auto kPollInterval = std::chrono::milliseconds(500);
 // detection plus real recovery, not shortened (see docs/design.md §20).
 constexpr auto kDeadline = std::chrono::seconds(40);
 
+// Each file size is run this many times independently so results show
+// run-to-run variance (min/mean/max), not a single run's numbers.
+constexpr int kRepeats = 3;
+
 struct NodeFailureResult {
     uint64_t file_size;
     bool detected;
@@ -141,20 +145,46 @@ int main() {
 
     std::vector<TableRow> rows;
     for (uint64_t file_size : kFileSizes) {
-        NodeFailureResult result = run_node_failure_experiment(file_size);
+        std::vector<double> detection_reps, recovery_reps, bytes_reps;
+        int detected_count = 0;
+        int recovered_count = 0;
+        int final_replica_count_last = 0;
+        for (int rep = 0; rep < kRepeats; ++rep) {
+            NodeFailureResult result = run_node_failure_experiment(file_size);
+            if (result.detected) {
+                ++detected_count;
+                detection_reps.push_back(result.detection_seconds);
+            }
+            if (result.recovered) {
+                ++recovered_count;
+                recovery_reps.push_back(result.recovery_duration_seconds);
+            }
+            bytes_reps.push_back(static_cast<double>(result.bytes_recovered));
+            final_replica_count_last = result.final_replica_count;
+        }
+        Aggregate detection_agg = aggregate_values(detection_reps);
+        Aggregate recovery_agg = aggregate_values(recovery_reps);
+        Aggregate bytes_agg = aggregate_values(bytes_reps);
+
         rows.push_back({
-            format_mb(static_cast<double>(result.file_size)),
-            result.detected ? format_seconds(result.detection_seconds) : "N/A (nije detektovano)",
-            result.recovered ? format_seconds(result.recovery_duration_seconds) : "N/A (nije oporavljeno)",
-            format_mb(static_cast<double>(result.bytes_recovered)),
-            std::to_string(result.final_replica_count) + "/3",
+            format_mb(static_cast<double>(file_size)),
+            detected_count > 0
+                ? format_min_mean_max_seconds(detection_agg) + " (" + std::to_string(detected_count) +
+                      "/" + std::to_string(kRepeats) + ")"
+                : "N/A (nije detektovano)",
+            recovered_count > 0
+                ? format_min_mean_max_seconds(recovery_agg) + " (" + std::to_string(recovered_count) +
+                      "/" + std::to_string(kRepeats) + ")"
+                : "N/A (nije oporavljeno)",
+            format_mb(bytes_agg.mean),
+            std::to_string(final_replica_count_last) + "/3 (posljednje ponavljanje)",
         });
     }
 
     print_markdown_table(
-        "Eksperiment 5 — Storage Node Failure",
-        {"Veličina fajla", "Failure detection vrijeme", "Recovery trajanje", "Bytes recovered",
-         "Finalno replication stanje"},
+        "Eksperiment 5 — Storage Node Failure (3 ponavljanja po veličini fajla, min / mean / max)",
+        {"Veličina fajla", "Failure detection vrijeme", "Recovery trajanje",
+         "Bytes recovered (mean)", "Finalno replication stanje"},
         rows);
 
     return 0;

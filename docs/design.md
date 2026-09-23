@@ -2509,3 +2509,107 @@ zasebno instrumentiran u sistemu.
 Ovim je Faza 17 (Benchmarking) u potpunosti zatvorena. Faza 17 je
 POSLJEDNJA faza u `IMPLEMENTATION_PLAN.md`-u (0-17, 18 faza ukupno) —
 svih 18 faza implementacionog plana su sada završene.
+
+## 27. Faza 18 — ABANDON_BLOCKS, čišćenje zaostalih pending blokova i paralelni fan-out (IMPLEMENTIRANO)
+
+Mentorski komentar na diplomski rad (2026-09-20/21) tražio je provjeru
+curenja skladišnog prostora nakon djelimično neuspjelog WRITE-a — potvrđen
+kao stvaran bug (blokovi uspješno upisani na dio replika prije otkaza
+ostaju siročad, ni Master ni postojeći `NODE_INVENTORY` orphan-detection
+put ih ne pokrivaju). Izvorni dizajn: 
+[`design_faza18_abandon_blocks.md`](design_faza18_abandon_blocks.md);
+implementacija ga proširuje u četiri tačke:
+
+1. **`ABANDON_BLOCKS` (nova poruka, na kraju `MessageType` enuma)** —
+   `[u32 path_len][path][u32 block_count][block_count x u64 block_id]`,
+   odgovor uvijek `ACK` (osim za neispravan payload → `INVALID_REQUEST`).
+   `NamespaceManager::abandon_blocks()` dira samo id-jeve koji su još u
+   `pending_blocks_[path]` (idempotentno, bezbjedno u trci sa commit-om,
+   nepoznata putanja = no-op), briše ih iz `blocks_` i vraća
+   `OrphanedBlock`-ove koje `Master::handle_abandon_blocks()` predaje
+   postojećem `gc_dispatch()`-u (isti best-effort `DELETE_BLOCK` kao
+   `DELETE_FILE`, §15). Bez `persist_metadata()` — pending blokovi se
+   nikad ne perzistuju.
+2. **Client šalje `ABANDON_BLOCKS` na svakoj tački otkaza** (ne samo
+   neuspjelom `WRITE_BLOCK`-u): svaka greška u `write_new_blocks()` nakon
+   što je id bloka poznat (uključujući id bloka čiji upis nije uspio),
+   neuspio `WRITE_COMMIT` u `write()`, neuspio `APPEND_COMMIT` u
+   `append()` (za nove blokove; fill u postojeći posljednji blok se ne
+   može poništiti — pripada fajlu). Ishod poziva se ignoriše — originalna
+   greška operacije se nikad ne mijenja.
+3. **Master sam čisti id koji klijent nikad ne sazna**: kad
+   `ALLOCATE_BLOCK` ne uspije poslije `allocate_block()`-a
+   (`NODE_NOT_FOUND` — premalo živih čvorova, ili `INTERNAL_ERROR`),
+   `handle_allocate_block()` sam zove `abandon_blocks()` — ranije je taj
+   id ostajao u pending skupu (§13 ispod opisuje staro ponašanje).
+4. **`commit_write()` zaostale pending id-jeve vraća kao orphan-e**:
+   uspješan commit i dalje briše cijeli pending skup putanje (§12), ali
+   id-jeve koji nisu dio tog commit-a sada i briše iz `blocks_` i vraća
+   za GC — poslije brisanja iz pending skupa oni se ionako nikad ne mogu
+   komitovati. `commit_append()` se ne mijenja (namjerno skida samo svoje
+   id-jeve, zbog konkurentnih append-ova, §14).
+
+**Paralelni fan-out**: `Client::write_chunk_to_replicas()` je do ove faze
+pisao replike *sekvencijalno* (connect+send+recv jedna po jedna, sa
+prekidom na prvoj grešci), iako su §13 i teza opisivali fan-out. Sada se
+svaka replika piše u zasebnoj niti (`std::async`), a poziv čeka SVE niti
+(nijedna ne smije nadživjeti `request`/`replicas`, a abandon mora doći tek
+kad su sve replike koje će prihvatiti blok to i uradile). Poruka
+`WRITE_BLOCK` (sa payload-om) gradi se jednom u pozivajućoj niti
+(`next_request_id()`/`next_operation_id()` nisu thread-safe) i sve niti je
+samo čitaju; isti `request_id` na različitim konekcijama je bezopasan
+jer ga Storage Node samo vraća u odgovoru. Semantika ostaje strogo 3/3.
+Posljedica: latencija upisa pri RF=3 se mijenja → Eksperiment 4
+(loopback i VM) treba ponovo izmjeriti.
+
+**Poznata preostala ograničenja (nalazi pregleda koda, svjesno prihvaćena)**:
+- *Dva pisca istovremeno na ISTOJ putanji*: kad B komituje dok je A-ov
+  `WRITE_BLOCK` još u letu, B-ov `commit_write()` A-ove id-jeve tretira kao
+  zaostale i šalje `DELETE_BLOCK`. Ako A-ov `WRITE_BLOCK` stigne na čvor
+  POSLIJE tog brisanja, fajl ostaje na disku bez vlasnika (A-ov commit
+  ionako pada sa `INVALID_REQUEST`, a A-ov abandon je no-op jer id više nije
+  pending). Ovo nije novo curenje: prije Faze 18 isti scenario je ostavljao
+  i `blocks_` zapis i fajl zauvijek; sada ostaje samo fajl, i samo u uskom
+  prozoru trke. Pun popravak traži zakup (lease) nad putanjom — van obima.
+- *Nema I/O timeout-a na client→replica konekcijama*: bilo je i prije
+  (sekvencijalna petlja isto bi visila na repliki koja prihvati konekciju
+  a nikad ne odgovori), ali sada se čeka na SVE replike, pa takav čvor
+  blokira upis i kad je neka druga replika već javila grešku. Otkaz
+  procesa čvora (zatvorena konekcija) i dalje se odmah detektuje.
+- *Klijent se sruši prije slanja `ABANDON_BLOCKS`*: blokovi ostaju
+  siročad, kao i ranije.
+
+**Testovi**: `test_namespace.cpp` (abandon: pending/orphan/idempotencija/
+nepoznata putanja/neispravna putanja/drugi pending id-jevi netaknuti;
+commit_write leftover-i), `test_master.cpp` (dispatch `DELETE_BLOCK`-a,
+komitovani blokovi netaknuti, nepoznata putanja, nedostupna replika,
+5 varijanti neispravnog payload-a, `ALLOCATE_BLOCK` bez živih čvorova,
+`WRITE_COMMIT` leftover dispatch), `test_write.cpp` (neuspio upis ne
+ostavlja `.block` fajlove; prethodni sadržaj ostaje čitljiv; neuspio
+višeblokovski upis sa 4 čvora; paralelni fan-out — 3 lažna čvora broje
+koliko je `WRITE_BLOCK`-ova istovremeno u toku, mora biti 3),
+`test_protocol.cpp` (`ABANDON_BLOCKS` dobija data-message ograničenje
+veličine, kao `NODE_INVENTORY` — inače bi neuspio upis sa hiljadama
+blokova premašio 64KB control limit i desinhronizovao konekciju),
+`test_append.cpp` (neuspio append ne ostavlja nove blokove).
+Integracioni testovi su prije izmjena padali (blokovi ostajali na
+disku, upis ~900 ms).
+
+## 28. Faza 19 — Revalidacija keša na pogotku (DIZAJN, NIJE IMPLEMENTIRANO)
+
+Mentorski komentar (#4) pitao je šta se dešava ako klijent A keš-uje blok
+koji klijent B naknadno izmijeni — A trenutno o tome ne dobija nikakvo
+obavještenje. Protokol već ima sav potreban mehanizam za jeftinu
+(conditional) reviziju na pogotku (`READ_BLOCK` sa poznatom verzijom →
+`NOT_MODIFIED`/`READ_OK`, implementirano i testirano na `Storage` strani
+još od Faze 13) — jedina nedostajuća komponenta je na `Client` strani, koja
+trenutno pogodak vraća bez ijednog mrežnog poziva. Pun dizajn — izmjena
+`Client::read()`, odluka o fail-open ponašanju kad revalidacija ne uspije,
+edge slučajevi, TDD test plan — u zasebnom dokumentu:
+[`design_faza19_cache_revalidation.md`](design_faza19_cache_revalidation.md).
+
+**Za razliku od Faze 18, ovaj fix mijenja izmjereno ponašanje već
+objavljeno u Poglavlju 4 (mean/P95 latencija pogotka, "4 do 8 puta" broj u
+apstraktu) — dokument izričito NE preporučuje da se tekst diplomskog rada
+opiše kao već-implementiran prije stvarne implementacije i ponovnog
+mjerenja Eksperimenta 3. Implementacija odložena do eksplicitnog signala.

@@ -98,11 +98,16 @@ bool has_any_block_on_disk(const std::filesystem::path& data_dir);
 // process doesn't exit within a generous internal timeout.
 int run_client(uint16_t master_port, const std::vector<std::string>& args);
 
-// Runs `dfs_statsctl --host 127.0.0.1 --port <target_port> stats` and
+// Runs `dfs_statsctl --host <host> --port <target_port> stats` and
 // returns its captured stdout (the raw STATS_RESPONSE text) — the one
 // helper that needs to capture output rather than just an exit code,
-// since callers need to inspect specific counters in it.
-std::string run_statsctl(uint16_t target_port);
+// since callers need to inspect specific counters in it. `host` defaults
+// to loopback for every existing (local-process) call site; bench/remote/
+// (real-VM benchmarks, see docs/benchmark_results_vm.md) is the only
+// caller that passes a real network address — GET_STATS is a plain TCP
+// request, so polling a remote node's stats needs no multipass/SSH
+// involvement at all, unlike starting or killing that node's process.
+std::string run_statsctl(uint16_t target_port, const std::string& host = "127.0.0.1");
 
 // A real Master + N real Storage Node processes, all rooted under `dir`.
 // Bundles the repeated spawn-then-wait-for-ready sequence every failure

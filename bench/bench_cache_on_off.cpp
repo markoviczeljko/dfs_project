@@ -15,18 +15,13 @@
 // Measures READ latency, an approximation of network/disk traffic, and
 // cache hit ratio.
 //
-// Two distinct files are read in strict alternation (A,B,A,B,...) rather
-// than hammering a single file — ClientCache::evict_locked() (see
-// src/client/cache.cpp) only evicts existing entries when inserting a
-// NEW, different block while already at/over capacity; with a single
-// repeatedly-read file, the lone cache entry is inserted once (nothing
-// to evict against itself) and then never evicted again, so
-// cache_max_bytes=0 would accidentally behave like an infinite cache and
-// show ~100% hits even with "caching off". Alternating between two files
-// makes every cache_max_bytes=0 read a genuine miss (each put() evicts
-// the other file's entry before inserting), which is what "cache OFF"
-// is supposed to mean (found while implementing this experiment — see
-// docs/design.md §24).
+// Two distinct files are read in strict alternation (A,B,A,B,...) instead
+// of hammering a single file, so the ON and OFF conditions share the exact
+// same access pattern and are directly comparable. With cache_max_bytes=0,
+// ClientCache::put() (see src/client/cache.cpp) now stores nothing at all
+// regardless of access pattern, so every OFF-condition read is a genuine
+// miss either way; alternating files simply keeps the workload identical
+// across both conditions rather than working around any cache behavior.
 //
 // Network/disk approximation refines Faza 17.2's generic decision:
 // Client::statistics_snapshot()'s OperationStats[READ].bytes records the
@@ -49,6 +44,11 @@ constexpr uint16_t kStorage3Port = 41823;
 constexpr uint64_t kFileSize = 10ULL * 1024 * 1024;
 constexpr int kReadsPerClient = 20;
 constexpr std::array<int, 3> kClientCounts = {1, 5, 10};
+
+// Each (mode, client_count) cell is run this many times independently so
+// results show run-to-run variance (min/mean/max), not a single run's
+// numbers.
+constexpr int kRepeats = 3;
 
 struct CacheMode {
     std::string label;
@@ -93,75 +93,102 @@ int main() {
 
     for (const CacheMode& mode : kCacheModes) {
         for (int client_count : kClientCounts) {
-            std::vector<std::vector<uint64_t>> per_thread_latencies(static_cast<size_t>(client_count));
-            std::vector<uint64_t> per_thread_hits(static_cast<size_t>(client_count), 0);
-            std::vector<uint64_t> per_thread_misses(static_cast<size_t>(client_count), 0);
-            std::vector<std::thread> threads;
+            std::vector<uint64_t> pooled_latencies;
+            std::vector<double> avg_us_per_rep;
+            std::vector<double> throughput_per_rep;
+            std::vector<double> hit_ratio_per_rep;
+            std::vector<double> network_disk_bytes_per_rep;
 
-            auto wall_start = std::chrono::steady_clock::now();
-            for (int t = 0; t < client_count; ++t) {
-                threads.emplace_back([&, t] {
-                    Client::Config config{"127.0.0.1", kMasterPort, BLOCK_SIZE, mode.cache_max_bytes};
-                    auto client_result = Client::create(config);
-                    if (client_result.is_error()) fail("failed to create read client");
-                    auto client = std::move(client_result.value());
+            for (int rep = 0; rep < kRepeats; ++rep) {
+                std::vector<std::vector<uint64_t>> per_thread_latencies(
+                    static_cast<size_t>(client_count));
+                std::vector<uint64_t> per_thread_hits(static_cast<size_t>(client_count), 0);
+                std::vector<uint64_t> per_thread_misses(static_cast<size_t>(client_count), 0);
+                std::vector<std::thread> threads;
 
-                    for (int r = 0; r < kReadsPerClient; ++r) {
-                        const std::string& path = kPaths[static_cast<size_t>(r) % kPaths.size()];
-                        auto start = std::chrono::steady_clock::now();
-                        auto read_result = client->read(path);
-                        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - start);
-                        if (read_result.is_error() || read_result.value().size() != kFileSize) {
-                            fail("READ returned wrong data/error during benchmark");
+                auto wall_start = std::chrono::steady_clock::now();
+                for (int t = 0; t < client_count; ++t) {
+                    threads.emplace_back([&, t] {
+                        Client::Config config{"127.0.0.1", kMasterPort, BLOCK_SIZE,
+                                               mode.cache_max_bytes};
+                        auto client_result = Client::create(config);
+                        if (client_result.is_error()) fail("failed to create read client");
+                        auto client = std::move(client_result.value());
+
+                        for (int r = 0; r < kReadsPerClient; ++r) {
+                            const std::string& path = kPaths[static_cast<size_t>(r) % kPaths.size()];
+                            auto start = std::chrono::steady_clock::now();
+                            auto read_result = client->read(path);
+                            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - start);
+                            if (read_result.is_error() || read_result.value().size() != kFileSize) {
+                                fail("READ returned wrong data/error during benchmark");
+                            }
+                            per_thread_latencies[static_cast<size_t>(t)].push_back(
+                                static_cast<uint64_t>(elapsed.count()));
                         }
-                        per_thread_latencies[static_cast<size_t>(t)].push_back(
-                            static_cast<uint64_t>(elapsed.count()));
-                    }
 
-                    CacheStats cache_stats = client->cache_stats();
-                    per_thread_hits[static_cast<size_t>(t)] = cache_stats.hits;
-                    per_thread_misses[static_cast<size_t>(t)] = cache_stats.misses;
-                });
-            }
-            for (std::thread& th : threads) th.join();
-            double wall_elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - wall_start).count();
+                        CacheStats cache_stats = client->cache_stats();
+                        per_thread_hits[static_cast<size_t>(t)] = cache_stats.hits;
+                        per_thread_misses[static_cast<size_t>(t)] = cache_stats.misses;
+                    });
+                }
+                for (std::thread& th : threads) th.join();
+                double wall_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall_start).count();
 
-            std::vector<uint64_t> all_latencies;
-            uint64_t total_hits = 0;
-            uint64_t total_misses = 0;
-            for (int t = 0; t < client_count; ++t) {
-                auto& thread_samples = per_thread_latencies[static_cast<size_t>(t)];
-                all_latencies.insert(all_latencies.end(), thread_samples.begin(), thread_samples.end());
-                total_hits += per_thread_hits[static_cast<size_t>(t)];
-                total_misses += per_thread_misses[static_cast<size_t>(t)];
+                std::vector<uint64_t> rep_latencies;
+                uint64_t total_hits = 0;
+                uint64_t total_misses = 0;
+                for (int t = 0; t < client_count; ++t) {
+                    auto& thread_samples = per_thread_latencies[static_cast<size_t>(t)];
+                    rep_latencies.insert(rep_latencies.end(), thread_samples.begin(),
+                                          thread_samples.end());
+                    total_hits += per_thread_hits[static_cast<size_t>(t)];
+                    total_misses += per_thread_misses[static_cast<size_t>(t)];
+                }
+                LatencyStats rep_stats = compute_latency_stats(rep_latencies);
+                double total_bytes = static_cast<double>(kFileSize) *
+                                      static_cast<double>(kReadsPerClient) *
+                                      static_cast<double>(client_count);
+                double hit_ratio = (total_hits + total_misses) > 0
+                                        ? static_cast<double>(total_hits) /
+                                              static_cast<double>(total_hits + total_misses)
+                                        : 0.0;
+                double network_disk_bytes =
+                    static_cast<double>(total_misses) * static_cast<double>(kFileSize);
+
+                avg_us_per_rep.push_back(rep_stats.avg_us);
+                throughput_per_rep.push_back(total_bytes / (1024.0 * 1024.0) / wall_elapsed);
+                hit_ratio_per_rep.push_back(hit_ratio);
+                network_disk_bytes_per_rep.push_back(network_disk_bytes);
+                pooled_latencies.insert(pooled_latencies.end(), rep_latencies.begin(),
+                                         rep_latencies.end());
             }
-            LatencyStats stats = compute_latency_stats(std::move(all_latencies));
-            double total_bytes = static_cast<double>(kFileSize) * static_cast<double>(kReadsPerClient) *
-                                  static_cast<double>(client_count);
-            double hit_ratio = (total_hits + total_misses) > 0
-                                    ? static_cast<double>(total_hits) /
-                                          static_cast<double>(total_hits + total_misses)
-                                    : 0.0;
-            double network_disk_bytes = static_cast<double>(total_misses) * static_cast<double>(kFileSize);
+
+            LatencyStats pooled_stats = compute_latency_stats(pooled_latencies);
+            Aggregate latency_agg = aggregate_values(avg_us_per_rep);
+            Aggregate throughput_agg = aggregate_values(throughput_per_rep);
+            Aggregate hit_ratio_agg = aggregate_values(hit_ratio_per_rep);
+            Aggregate network_disk_agg = aggregate_values(network_disk_bytes_per_rep);
 
             rows.push_back({
                 mode.label,
                 std::to_string(client_count),
-                format_throughput_mb_s(total_bytes, wall_elapsed),
-                format_millis(stats.avg_us),
-                format_millis(static_cast<double>(stats.p95_us)),
-                format_percent(hit_ratio),
-                format_mb(network_disk_bytes),
+                format_min_mean_max_mb_s(throughput_agg),
+                format_min_mean_max_millis(latency_agg),
+                format_millis(static_cast<double>(pooled_stats.p95_us)),
+                format_percent(hit_ratio_agg.min) + " / " + format_percent(hit_ratio_agg.mean) +
+                    " / " + format_percent(hit_ratio_agg.max),
+                format_mb(network_disk_agg.mean),
             });
         }
     }
 
     print_markdown_table(
-        "Eksperiment 3 — Cache ON vs OFF",
-        {"Cache", "Broj klijenata", "Throughput (MB/s)", "Prosječna latencija", "P95 latencija",
-         "Cache hit ratio", "Aproks. network/disk"},
+        "Eksperiment 3 — Cache ON vs OFF (3 ponavljanja po ćeliji, min / mean / max)",
+        {"Cache", "Broj klijenata", "Throughput min/mean/max (MB/s)", "Latencija min/mean/max",
+         "P95 latencija (pooled)", "Cache hit ratio min/mean/max", "Aproks. network/disk (mean)"},
         rows);
 
     cluster.stop_all();

@@ -54,9 +54,12 @@ public:
 
     // Inserts/replaces the entry for id, evicting least-recently-used
     // entries (from the back of the LRU list) until it fits within
-    // max_bytes_. A single entry larger than max_bytes_ is still cached
-    // alone (see docs/design.md §17 — deliberate simplification, matches
-    // no other entry existing to evict it against).
+    // max_bytes_. If max_bytes_ == 0, nothing is ever stored (every get()
+    // is a guaranteed miss, even for repeated reads of the same block) —
+    // a cache with zero capacity is fully disabled, not a one-entry cache.
+    // For max_bytes_ > 0, a single entry larger than max_bytes_ is still
+    // cached alone (see docs/design.md §17 — deliberate simplification,
+    // matches no other entry existing to evict it against).
     void put(BlockId id, uint64_t version, std::vector<uint8_t> data);
 
     void invalidate(BlockId id);

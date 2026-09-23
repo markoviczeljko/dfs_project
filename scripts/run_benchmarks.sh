@@ -47,25 +47,46 @@ done
     echo
     echo "## Metodološke napomene"
     echo
+    echo "### Hardver i okruženje"
+    echo
+    echo "- CPU: Intel Core i7-13620H (10 jezgara / 16 niti, hibridna P+E arhitektura)"
+    echo "- RAM: 32 GB"
+    echo "- Disk: NVMe SSD, ext4 fajl sistem"
+    echo "- OS/kernel: Ubuntu 24.04.3 LTS, kernel 7.0.0-28-generic"
+    echo "- Kompajler: GCC $(g++ -dumpversion 2>/dev/null || echo 'n/a'), CMake $(cmake --version 2>/dev/null | head -1 | awk '{print $3}')"
+    echo "- Build tip: Release (\`-DCMAKE_BUILD_TYPE=Release\`, optimizacija uključena)"
+    echo "- Topologija: Master i svi Storage čvorovi su odvojeni OS procesi na"
+    echo "  istoj mašini, komunikacija preko loopback interfejsa (127.0.0.1)."
+    echo "- Broj Storage čvorova po eksperimentu: 3 za Eksperimente 1-3, 4 za"
+    echo "  Eksperimente 4-5 (dodatni čvor služi kao mjesto za oporavljenu repliku)."
+    echo
+    echo "### Ponavljanja mjerenja"
+    echo
+    echo "- Svaka ćelija (kombinacija veličine fajla/broja klijenata/moda) se"
+    echo "  izvršava 3 puta nezavisno; ispod se prikazuje min / mean / max preko"
+    echo "  ta 3 ponavljanja, ne jedno izmjereno očitavanje."
+    echo "- Percentili (P95) se računaju nad objedinjenim (pooled) uzorcima iz"
+    echo "  sva 3 ponavljanja radi stabilnije procjene repa raspodjele."
+    echo
+    echo "### Ostale napomene"
+    echo
     echo "- **Network/disk traffic je aproksimacija, ne pravi packet/syscall"
     echo "  brojač** — vidi \`docs/design.md\` §22 i §24 za tačnu formulu po"
     echo "  eksperimentu (READ: \`cache_misses * block_size\`; WRITE: računato"
     echo "  analitički kao \`logicki_bajtovi * replication_factor\`, egzaktno"
     echo "  jer klijent šalje pun chunk svakoj replici)."
-    echo "- **Broj konkurentnih klijenata je smanjen na {1, 5, 10}** (§16.8 iz"
-    echo "  dizajn dokumenta traži 1/5/10/25/50/100) — vidi \`docs/design.md\`"
-    echo "  §23 za rezonovanje. Za finalne brojeve za odbranu diplomskog rada,"
-    echo "  proširiti \`kClientCounts\` nizove u \`bench/*.cpp\` i ponovo"
-    echo "  pokrenuti na ciljnom hardveru."
+    echo "- **Broj konkurentnih klijenata je {1, 5, 10}** (§16.8 iz dizajn"
+    echo "  dokumenta traži pun opseg 1/5/10/25/50/100) — proširivanje na pun"
+    echo "  opseg ostaje pravac budućeg rada, vidi Zaključak."
     echo "- **\"Recovery start time\" (§10.37) nije zasebno mjeren** —"
     echo "  \`RecoveryManager::handle_node_failure()\` postavlja recovery posao"
     echo "  u red SINHRONO unutar istog callback-a koji uvećava"
     echo "  \`detected_failures\`, pa ne postoji mjerljiv razmak između"
     echo "  \"detektovano\" i \"recovery počeo\" — vidi \`docs/design.md\` §25."
-    echo "- Brojevi ispod su iz JEDNOG razvojnog sandbox okruženja, ne"
-    echo "  produkcionog hardvera — pokazuju TRENDOVE (cache ubrzava READ,"
-    echo "  viši RF poskupljuje WRITE/storage, RF=1 nema fault tolerance), što"
-    echo "  je ono što diplomski rad argumentuje, ne apsolutne brojeve."
+    echo "- Brojevi ispod pokazuju TRENDOVE (cache ubrzava READ, viši RF"
+    echo "  poskupljuje WRITE/storage, RF=1 nema fault tolerance), što je ono"
+    echo "  što diplomski rad argumentuje, ne apsolutne brojeve prenosive na"
+    echo "  drugačiji hardver."
     echo
     for name in "${BENCHMARKS[@]}"; do
         echo "Pokrećem $name..." >&2

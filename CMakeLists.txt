@@ -5,6 +5,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Default to a Release build (optimized, NDEBUG) when the caller doesn't pick
+# one explicitly, e.g. via `-DCMAKE_BUILD_TYPE=...` — matters for bench/, whose
+# numbers are meaningless if silently compiled unoptimized.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+endif()
+
 find_package(Threads REQUIRED)
 
 add_library(common INTERFACE)

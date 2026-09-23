@@ -195,7 +195,7 @@ int run_client(uint16_t master_port, const std::vector<std::string>& args) {
     return -1;
 }
 
-std::string run_statsctl(uint16_t target_port) {
+std::string run_statsctl(uint16_t target_port, const std::string& host) {
     int pipe_fds[2] = {-1, -1};
     if (::pipe(pipe_fds) != 0) {
         return {};
@@ -207,7 +207,7 @@ std::string run_statsctl(uint16_t target_port) {
     ::posix_spawn_file_actions_addclose(&actions, pipe_fds[0]);
     ::posix_spawn_file_actions_addclose(&actions, pipe_fds[1]);
 
-    std::vector<std::string> argv_storage = {kDfsStatsctlPath, "--host", "127.0.0.1", "--port",
+    std::vector<std::string> argv_storage = {kDfsStatsctlPath, "--host", host, "--port",
                                               std::to_string(target_port), "stats"};
     std::vector<char*> argv = build_argv(argv_storage);
 

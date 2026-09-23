@@ -56,6 +56,10 @@ bool is_data_message(MessageType type) {
         // generous data-message size limit, not the small control-message
         // one (see docs/design.md §16).
         case MessageType::NODE_INVENTORY:
+        // Faza 18: same shape as NODE_INVENTORY — an unbounded list of
+        // block ids (a failed write with a small block_size can allocate
+        // thousands), so it needs the data-message size limit too.
+        case MessageType::ABANDON_BLOCKS:
         // ACK/ERROR carry the reply to whatever request triggered them —
         // in particular a READ_BLOCK's ACK response carries up to one
         // block's worth of data (see docs/design.md §12). The receiver has

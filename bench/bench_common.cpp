@@ -140,6 +140,38 @@ std::string format_seconds(double seconds) {
     return out.str();
 }
 
+Aggregate aggregate_values(const std::vector<double>& values) {
+    Aggregate agg;
+    if (values.empty()) {
+        return agg;
+    }
+    agg.min = *std::min_element(values.begin(), values.end());
+    agg.max = *std::max_element(values.begin(), values.end());
+    agg.mean = std::accumulate(values.begin(), values.end(), 0.0) /
+               static_cast<double>(values.size());
+    return agg;
+}
+
+std::string format_min_mean_max_millis(const Aggregate& microseconds) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3) << (microseconds.min / 1000.0) << " / "
+        << (microseconds.mean / 1000.0) << " / " << (microseconds.max / 1000.0) << " ms";
+    return out.str();
+}
+
+std::string format_min_mean_max_mb_s(const Aggregate& mb_s) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << mb_s.min << " / " << mb_s.mean << " / " << mb_s.max;
+    return out.str();
+}
+
+std::string format_min_mean_max_seconds(const Aggregate& seconds) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << seconds.min << " / " << seconds.mean << " / "
+        << seconds.max << " s";
+    return out.str();
+}
+
 uint64_t parse_stat_u64(const std::string& stats_text, const std::string& line_prefix,
                          const std::string& key) {
     size_t line_start = stats_text.find(line_prefix);

@@ -29,6 +29,14 @@ void ClientCache::put(BlockId id, uint64_t version, std::vector<uint8_t> data) {
         entries_.erase(existing);
     }
 
+    if (max_bytes_ == 0) {
+        // A zero-capacity cache stores nothing at all. evict_locked() alone
+        // cannot enforce this: with an empty lru_list_ it has nothing to
+        // evict against, so the entry below would otherwise be inserted and
+        // then linger until a *different* block id arrived to evict it.
+        return;
+    }
+
     evict_locked(new_size);
 
     lru_list_.push_front(id);

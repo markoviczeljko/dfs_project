@@ -128,3 +128,12 @@ TEST(TCPConnectionLoopback, RejectsOversizedPayloadWithoutAllocating) {
     EXPECT_EQ(received->type, MessageType::ERROR);
     EXPECT_EQ(received->request_id, 7u);
 }
+
+// Faza 18: ABANDON_BLOCKS carries an unbounded block-id list, same shape as
+// NODE_INVENTORY — it must get the data-message size limit, or a failed
+// write that allocated thousands of blocks would exceed the 64KB control
+// limit and be rejected mid-stream.
+TEST(ProtocolLimits, AbandonBlocksUsesDataMessageLimit) {
+    EXPECT_TRUE(is_data_message(MessageType::ABANDON_BLOCKS));
+    EXPECT_TRUE(is_data_message(MessageType::NODE_INVENTORY));
+}

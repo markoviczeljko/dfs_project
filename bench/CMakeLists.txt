@@ -10,6 +10,10 @@
 
 add_library(bench_common bench_common.cpp)
 target_link_libraries(bench_common PUBLIC client failure_test_support)
+# PUBLIC (not the default same-directory quote-include lookup) so
+# bench/remote/'s targets — in a different directory — can also
+# `#include "bench_common.h"` and reuse its formatting/latency helpers.
+target_include_directories(bench_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(bench_sequential_read bench_sequential_read.cpp)
 target_link_libraries(bench_sequential_read PRIVATE bench_common)
@@ -25,3 +29,9 @@ target_link_libraries(bench_replication_factor PRIVATE bench_common)
 
 add_executable(bench_node_failure bench_node_failure.cpp)
 target_link_libraries(bench_node_failure PRIVATE bench_common)
+
+# Real-VM variants of the 5 experiments above (see docs/design.md's
+# benchmark section and docs/benchmark_results_vm.md's methodology
+# header) — same measurement code and dfs_bench:: helpers, pointed at an
+# already-running multi-VM cluster instead of spawning one locally.
+add_subdirectory(remote)

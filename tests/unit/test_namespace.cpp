@@ -596,3 +596,144 @@ TEST(NamespaceManagerTest, ConcurrentCreateDeleteAndListStatDontRace) {
     ASSERT_TRUE(final_list.is_ok());
     EXPECT_TRUE(final_list.value().empty());
 }
+
+// Faza 18: ABANDON_BLOCKS — a failed write attempt hands back every block id
+// it allocated so Master can drop them from pending_blocks_/blocks_ and GC
+// them, instead of leaving them allocated forever (see docs/design.md §12,
+// docs/design_faza18_abandon_blocks.md).
+
+TEST(NamespaceManagerTest, AbandonBlocksRemovesIdsFromPendingSet) {
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId block_id = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(block_id, {1, 2, 3}), ErrorCode::OK);
+
+    ASSERT_TRUE(ns.abandon_blocks("/a.txt", {block_id}).is_ok());
+
+    // No longer pending: a commit naming it is rejected by the subset check.
+    auto commit_result = ns.commit_write("/a.txt", {block_id}, 10, 10);
+    ASSERT_TRUE(commit_result.is_error());
+    EXPECT_EQ(commit_result.error(), ErrorCode::INVALID_REQUEST);
+    EXPECT_TRUE(ns.block_metadata(block_id).is_error());
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksReturnsOrphanedBlocksWithCorrectReplicas) {
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId first = ns.allocate_block("/a.txt").value();
+    BlockId second = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(first, {1, 2, 3}), ErrorCode::OK);
+    ASSERT_EQ(ns.set_block_replicas(second, {4, 1, 2}), ErrorCode::OK);
+
+    auto result = ns.abandon_blocks("/a.txt", {first, second});
+    ASSERT_TRUE(result.is_ok());
+    ASSERT_EQ(result.value().size(), 2u);
+    EXPECT_EQ(result.value()[0].id, first);
+    EXPECT_EQ(result.value()[0].replicas, (std::vector<StorageNodeId>{1, 2, 3}));
+    EXPECT_EQ(result.value()[1].id, second);
+    EXPECT_EQ(result.value()[1].replicas, (std::vector<StorageNodeId>{4, 1, 2}));
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksWithoutReplicasIsDroppedButNotReturned) {
+    // ALLOCATE_BLOCK can fail after allocate_block() but before
+    // set_block_replicas() (no live nodes) — nothing was ever sent to a
+    // Storage Node, so there's nothing to GC, only the pending id to drop.
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId block_id = ns.allocate_block("/a.txt").value();
+
+    auto result = ns.abandon_blocks("/a.txt", {block_id});
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(result.value().empty());
+    EXPECT_TRUE(ns.commit_write("/a.txt", {block_id}, 1, 1).is_error());
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksOnUnknownPathIsNoOpNotError) {
+    NamespaceManager ns;
+    auto result = ns.abandon_blocks("/never-created.txt", {1, 2, 3});
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(result.value().empty());
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksRejectsInvalidPath) {
+    NamespaceManager ns;
+    auto result = ns.abandon_blocks("relative/path", {1});
+    ASSERT_TRUE(result.is_error());
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksIgnoresIdsAlreadyCommitted) {
+    NamespaceManager ns;
+    BlockId committed = create_file_with_one_block(ns, /*last_block_size=*/100);
+
+    auto result = ns.abandon_blocks("/a.txt", {committed});
+    ASSERT_TRUE(result.is_ok());
+    EXPECT_TRUE(result.value().empty());
+    EXPECT_TRUE(ns.block_metadata(committed).is_ok());
+    auto stat_result = ns.stat_file("/a.txt");
+    ASSERT_TRUE(stat_result.is_ok());
+    EXPECT_EQ(stat_result.value().blocks, (std::vector<BlockId>{committed}));
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksIsIdempotent) {
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId block_id = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(block_id, {1, 2, 3}), ErrorCode::OK);
+
+    ASSERT_EQ(ns.abandon_blocks("/a.txt", {block_id}).value().size(), 1u);
+    auto second = ns.abandon_blocks("/a.txt", {block_id});
+    ASSERT_TRUE(second.is_ok());
+    EXPECT_TRUE(second.value().empty());
+}
+
+TEST(NamespaceManagerTest, AbandonBlocksLeavesOtherPendingIdsOfSamePathUntouched) {
+    // Two concurrent appends to one file can each hold a pending new block
+    // (see docs/design.md §14) — abandoning one must not drop the other.
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId abandoned = ns.allocate_block("/a.txt").value();
+    BlockId kept = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(abandoned, {1, 2, 3}), ErrorCode::OK);
+    ASSERT_EQ(ns.set_block_replicas(kept, {1, 2, 3}), ErrorCode::OK);
+
+    ASSERT_TRUE(ns.abandon_blocks("/a.txt", {abandoned}).is_ok());
+
+    auto commit_result = ns.commit_write("/a.txt", {kept}, 10, 10);
+    ASSERT_TRUE(commit_result.is_ok());
+    EXPECT_TRUE(ns.block_metadata(kept).is_ok());
+}
+
+TEST(NamespaceManagerTest, CommitWriteReturnsLeftoverPendingIdsAsOrphans) {
+    // An earlier, abandoned attempt on the same path left `leftover`
+    // pending; the successful commit clears the pending set, so `leftover`
+    // can never be committed again and must be GC'd, not leaked.
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId leftover = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(leftover, {1, 2, 3}), ErrorCode::OK);
+    BlockId committed = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(committed, {2, 3, 4}), ErrorCode::OK);
+
+    auto commit_result = ns.commit_write("/a.txt", {committed}, 10, 10);
+    ASSERT_TRUE(commit_result.is_ok());
+    ASSERT_EQ(commit_result.value().size(), 1u);
+    EXPECT_EQ(commit_result.value()[0].id, leftover);
+    EXPECT_EQ(commit_result.value()[0].replicas, (std::vector<StorageNodeId>{1, 2, 3}));
+    EXPECT_TRUE(ns.block_metadata(leftover).is_error());
+    EXPECT_TRUE(ns.block_metadata(committed).is_ok());
+}
+
+TEST(NamespaceManagerTest, CommitWriteDoesNotOrphanTheIdsItCommits) {
+    NamespaceManager ns;
+    ASSERT_EQ(ns.create_file("/a.txt"), ErrorCode::OK);
+    BlockId first = ns.allocate_block("/a.txt").value();
+    BlockId second = ns.allocate_block("/a.txt").value();
+    ASSERT_EQ(ns.set_block_replicas(first, {1, 2, 3}), ErrorCode::OK);
+    ASSERT_EQ(ns.set_block_replicas(second, {1, 2, 3}), ErrorCode::OK);
+
+    auto commit_result = ns.commit_write("/a.txt", {first, second}, 20, 10);
+    ASSERT_TRUE(commit_result.is_ok());
+    EXPECT_TRUE(commit_result.value().empty());
+    EXPECT_TRUE(ns.block_metadata(first).is_ok());
+    EXPECT_TRUE(ns.block_metadata(second).is_ok());
+}

@@ -123,6 +123,25 @@ TEST(CacheTest, EntryLargerThanCapacityIsStillCached) {
     EXPECT_EQ(entry->data.size(), 100u);
 }
 
+// A zero-capacity cache must disable caching entirely: even repeated reads
+// of the exact same block must always miss, never degenerate into a
+// one-entry cache (evict_locked() has nothing to evict against on the very
+// first put(), so this case needs an explicit check in put() itself).
+TEST(CacheTest, ZeroCapacityCacheNeverStoresAnything) {
+    ClientCache cache(0);
+
+    cache.put(1, 1, make_data(10, 'A'));
+    EXPECT_FALSE(cache.get(1).has_value());
+
+    cache.put(1, 1, make_data(10, 'A'));
+    EXPECT_FALSE(cache.get(1).has_value());
+
+    CacheStats stats = cache.stats();
+    EXPECT_EQ(stats.hits, 0u);
+    EXPECT_EQ(stats.misses, 2u);
+    EXPECT_EQ(stats.evictions, 0u);
+}
+
 TEST(CacheTest, StatsTrackHitsMissesEvictionsInvalidationsAndBytesServed) {
     constexpr size_t kEntrySize = 10;
     ClientCache cache(kEntrySize);  // room for exactly 1 entry

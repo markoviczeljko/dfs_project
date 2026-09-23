@@ -59,6 +59,10 @@ constexpr std::array<uint32_t, 2> kReplicationFactors = {1, 3};
 // succeed (see below), so that sub-run always costs the full 40s.
 constexpr auto kRecoveryDeadline = std::chrono::seconds(40);
 
+// Both phases are run this many times per RF value so results show
+// run-to-run variance (min/mean/max), not a single run's numbers.
+constexpr int kRepeats = 3;
+
 uint64_t sum_storage_used_bytes(const std::array<uint16_t, 4>& storage_ports) {
     uint64_t total = 0;
     for (uint16_t port : storage_ports) {
@@ -238,35 +242,65 @@ int main() {
 
     std::vector<TableRow> write_rows;
     for (uint32_t rf : kReplicationFactors) {
-        WriteStorageResult result = run_write_storage_phase(rf);
+        std::vector<double> avg_us_reps, p95_us_reps, storage_reps;
+        for (int rep = 0; rep < kRepeats; ++rep) {
+            WriteStorageResult result = run_write_storage_phase(rf);
+            avg_us_reps.push_back(result.write_latency.avg_us);
+            p95_us_reps.push_back(static_cast<double>(result.write_latency.p95_us));
+            storage_reps.push_back(result.storage_measured_bytes);
+        }
+        // Logical/network-estimate bytes are exact analytical values derived
+        // from kFileSize/kNumFiles/rf (not measurements subject to
+        // run-to-run variance), so they're computed directly instead of
+        // read off any one repetition's result.
+        double total_logical_bytes = static_cast<double>(kFileSize) * static_cast<double>(kNumFiles);
+        double network_estimate_bytes = total_logical_bytes * static_cast<double>(rf);
+        Aggregate latency_agg = aggregate_values(avg_us_reps);
+        Aggregate p95_agg = aggregate_values(p95_us_reps);
+        Aggregate storage_agg = aggregate_values(storage_reps);
         write_rows.push_back({
-            std::to_string(result.replication_factor),
-            format_millis(result.write_latency.avg_us),
-            format_millis(static_cast<double>(result.write_latency.p95_us)),
-            format_mb(result.total_logical_bytes),
-            format_mb(result.network_estimate_bytes),
-            format_mb(result.storage_measured_bytes),
-        });
-    }
-    print_markdown_table("Eksperiment 4a — Replication Factor: write latencija i storage potrošnja",
-                          {"RF", "Prosječna write latencija", "P95 latencija", "Ukupno (logički)",
-                           "Network estimate (tačno)", "Storage izmjereno"},
-                          write_rows);
-
-    std::vector<TableRow> recovery_rows;
-    for (uint32_t rf : kReplicationFactors) {
-        RecoveryResult result = run_recovery_phase(rf);
-        recovery_rows.push_back({
-            std::to_string(result.replication_factor),
-            result.recovered ? "OPORAVLJENO" : "NIJE OPORAVLJENO (nema izvora)",
-            format_seconds(result.seconds_to_outcome),
-            std::to_string(result.detected_failures),
-            std::to_string(result.successful_recoveries),
+            std::to_string(rf),
+            format_min_mean_max_millis(latency_agg),
+            format_min_mean_max_millis(p95_agg),
+            format_mb(total_logical_bytes),
+            format_mb(network_estimate_bytes),
+            format_mb(storage_agg.mean),
         });
     }
     print_markdown_table(
-        "Eksperiment 4b — Replication Factor: recovery ponašanje",
-        {"RF", "Ishod", "Vrijeme do ishoda", "detected_failures (Master)", "successful_recoveries (Master)"},
+        "Eksperiment 4a — Replication Factor: write latencija i storage potrošnja "
+        "(3+1 ponavljanja po RF, min / mean / max)",
+        {"RF", "Write latencija min/mean/max", "P95 latencija min/mean/max", "Ukupno (logički)",
+         "Network estimate (tačno)", "Storage izmjereno (mean)"},
+        write_rows);
+
+    std::vector<TableRow> recovery_rows;
+    for (uint32_t rf : kReplicationFactors) {
+        std::vector<double> seconds_reps;
+        int recovered_count = 0;
+        uint64_t detected_sum = 0;
+        uint64_t successful_sum = 0;
+        for (int rep = 0; rep < kRepeats; ++rep) {
+            RecoveryResult result = run_recovery_phase(rf);
+            seconds_reps.push_back(result.seconds_to_outcome);
+            if (result.recovered) ++recovered_count;
+            detected_sum += result.detected_failures;
+            successful_sum += result.successful_recoveries;
+        }
+        Aggregate seconds_agg = aggregate_values(seconds_reps);
+        recovery_rows.push_back({
+            std::to_string(rf),
+            std::to_string(recovered_count) + "/" + std::to_string(kRepeats) + " OPORAVLJENO",
+            format_min_mean_max_seconds(seconds_agg),
+            std::to_string(detected_sum),
+            std::to_string(successful_sum),
+        });
+    }
+    print_markdown_table(
+        "Eksperiment 4b — Replication Factor: recovery ponašanje "
+        "(3 ponavljanja po RF, min / mean / max)",
+        {"RF", "Ishod (koliko od N ponavljanja oporavljeno)", "Vrijeme do ishoda min/mean/max",
+         "detected_failures (Master, zbir)", "successful_recoveries (Master, zbir)"},
         recovery_rows);
 
     return 0;

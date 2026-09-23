@@ -117,11 +117,10 @@ private:
                                                              size_t& offset, uint32_t count);
 
     // Sends one chunk to every listed replica at the given block+offset,
-    // one fresh connection per replica; strict fail-fast on the first
-    // non-ACK (same 3/3 semantics as the original write() loop).
-    // block_version is 0 from every Faza 12.2 call site (real values wired
-    // in Faza 12.3, once Master starts handing them out) — see
-    // docs/design.md §16.
+    // one fresh connection per replica. Faza 18: all replicas are written
+    // in parallel (fan-out, one thread per replica) and the call waits for
+    // every one of them; it returns OK only if all ACKed (strict 3/3),
+    // otherwise the first error in replica order.
     ErrorCode write_chunk_to_replicas(BlockId block_id, uint64_t offset, uint64_t block_version,
                                        const uint8_t* data, size_t len,
                                        const std::vector<ReplicaLocation>& replicas);
@@ -131,8 +130,18 @@ private:
     // per chunk. Shared by write() (for the whole file) and append() (for
     // whatever doesn't fit in the file's current last block). Returns the
     // new block ids in order.
+    // Faza 18: on failure, every block id this call allocated (including
+    // the one whose write failed) has already been handed back to Master
+    // via abandon_blocks() before the error is returned.
     Result<std::vector<BlockId>> write_new_blocks(const std::string& path, const uint8_t* data,
                                                    size_t len);
+
+    // Faza 18: best-effort ABANDON_BLOCKS — tells Master a failed WRITE/
+    // APPEND attempt gave up on these block ids so it can GC any replicas
+    // that were already written. Waits for Master's reply, but its outcome
+    // never changes the caller's original error (a failure here just
+    // leaves the blocks orphaned, as before this fix).
+    void abandon_blocks(const std::string& path, const std::vector<BlockId>& block_ids);
 
     Config config_;
     TCPConnection master_connection_;

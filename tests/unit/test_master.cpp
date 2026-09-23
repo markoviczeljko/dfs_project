@@ -83,6 +83,21 @@ Message make_write_commit_request(uint64_t request_id, const std::string& path,
     return Message{MessageType::WRITE_COMMIT, request_id, std::move(payload)};
 }
 
+// Faza 18 wire format: [u32 path_len][path][u32 block_count]
+// [block_count x u64 block_id] (see docs/design_faza18_abandon_blocks.md).
+Message make_abandon_blocks_request(uint64_t request_id, const std::string& path,
+                                     const std::vector<BlockId>& block_ids) {
+    std::vector<std::byte> payload;
+    put_u32(payload, static_cast<uint32_t>(path.size()));
+    const auto* path_bytes = reinterpret_cast<const std::byte*>(path.data());
+    payload.insert(payload.end(), path_bytes, path_bytes + path.size());
+    put_u32(payload, static_cast<uint32_t>(block_ids.size()));
+    for (BlockId block_id : block_ids) {
+        put_u64(payload, block_id);
+    }
+    return Message{MessageType::ABANDON_BLOCKS, request_id, std::move(payload)};
+}
+
 Message make_path_request(MessageType type, uint64_t request_id, const std::string& path) {
     std::vector<std::byte> payload;
     const auto* bytes = reinterpret_cast<const std::byte*>(path.data());
@@ -1429,4 +1444,200 @@ TEST_F(MasterTest, WriteCommitRecordsReplicationStats) {
     // Regression test: this used to be hardcoded to 0 regardless
     // of the real committed size (see docs/design.md §18).
     EXPECT_EQ(snap.operations[static_cast<size_t>(OperationType::WRITE)].bytes, kSize);
+}
+
+// Faza 18: ABANDON_BLOCKS — Client-triggered cleanup after a failed write
+// attempt (see docs/design_faza18_abandon_blocks.md).
+
+TEST_F(MasterTest, AbandonBlocksDispatchesDeleteBlockToAllReplicas) {
+    start_master(38300);
+    TCPConnection client = connect_client(38300);
+    auto nodes = register_three_recording_nodes(client, 38301, 38302, 38303);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    ASSERT_EQ(alloc_resp->type, MessageType::ACK);
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+
+    ASSERT_TRUE(client.sendMessage(make_abandon_blocks_request(3, "/a.txt", {block_id})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+    for (auto& node : nodes) {
+        EXPECT_TRUE(node->received(block_id));
+    }
+
+    // The abandoned id can no longer be committed.
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(4, "/a.txt", {block_id}, /*size=*/10, 10)));
+    auto commit_resp = client.receiveMessage();
+    ASSERT_TRUE(commit_resp.has_value());
+    EXPECT_EQ(commit_resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(commit_resp->payload), ErrorCode::INVALID_REQUEST);
+}
+
+TEST_F(MasterTest, AbandonBlocksDoesNotTouchCommittedBlocks) {
+    start_master(38304);
+    TCPConnection client = connect_client(38304);
+    auto nodes = register_three_recording_nodes(client, 38305, 38306, 38307);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(3, "/a.txt", {block_id}, /*size=*/10, 10)));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+
+    ASSERT_TRUE(client.sendMessage(make_abandon_blocks_request(4, "/a.txt", {block_id})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+    for (auto& node : nodes) {
+        EXPECT_FALSE(node->received(block_id));
+    }
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::STAT_FILE, 5, "/a.txt")));
+    auto stat_resp = client.receiveMessage();
+    ASSERT_TRUE(stat_resp.has_value());
+    ASSERT_EQ(stat_resp->type, MessageType::ACK);
+    EXPECT_EQ(get_u32(stat_resp->payload.data() + 24), 1u);  // block_count
+}
+
+TEST_F(MasterTest, AbandonBlocksOnUnknownPathReturnsAckWithoutDispatch) {
+    start_master(38308);
+    TCPConnection client = connect_client(38308);
+    auto nodes = register_three_recording_nodes(client, 38309, 38310, 38311);
+
+    ASSERT_TRUE(client.sendMessage(make_abandon_blocks_request(1, "/nope.txt", {1, 2})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+    for (auto& node : nodes) {
+        EXPECT_FALSE(node->received(1));
+        EXPECT_FALSE(node->received(2));
+    }
+}
+
+TEST_F(MasterTest, AbandonBlocksWithUnreachableReplicaStillReturnsAck) {
+    // register_three_nodes() points at ports nothing listens on — the
+    // cleanup is best-effort, same policy as DELETE_FILE (see
+    // docs/design.md §15).
+    start_master(38312);
+    TCPConnection client = connect_client(38312);
+    register_three_nodes(client);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    BlockId block_id = get_u64(alloc_resp->payload.data());
+
+    ASSERT_TRUE(client.sendMessage(make_abandon_blocks_request(3, "/a.txt", {block_id})));
+    auto resp = client.receiveMessage();
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->type, MessageType::ACK);
+}
+
+TEST_F(MasterTest, AbandonBlocksRejectsMalformedPayload) {
+    start_master(38313);
+    TCPConnection client = connect_client(38313);
+
+    auto expect_invalid = [&](std::vector<std::byte> payload, uint64_t request_id) {
+        ASSERT_TRUE(
+            client.sendMessage(Message{MessageType::ABANDON_BLOCKS, request_id, std::move(payload)}));
+        auto resp = client.receiveMessage();
+        ASSERT_TRUE(resp.has_value());
+        EXPECT_EQ(resp->type, MessageType::ERROR);
+        EXPECT_EQ(error_from_payload(resp->payload), ErrorCode::INVALID_REQUEST);
+    };
+
+    // Empty payload.
+    expect_invalid({}, 1);
+
+    // Path length claims more bytes than present.
+    {
+        std::vector<std::byte> payload;
+        put_u32(payload, 100);
+        expect_invalid(std::move(payload), 2);
+    }
+
+    // Missing block_count.
+    {
+        Message full = make_abandon_blocks_request(0, "/a.txt", {});
+        full.payload.resize(full.payload.size() - sizeof(uint32_t));
+        expect_invalid(std::move(full.payload), 3);
+    }
+
+    // block_count says 2, only one id present.
+    {
+        Message full = make_abandon_blocks_request(0, "/a.txt", {7, 8});
+        full.payload.resize(full.payload.size() - sizeof(uint64_t));
+        expect_invalid(std::move(full.payload), 4);
+    }
+
+    // Trailing garbage after the declared ids.
+    {
+        Message full = make_abandon_blocks_request(0, "/a.txt", {7});
+        full.payload.push_back(std::byte{0});
+        expect_invalid(std::move(full.payload), 5);
+    }
+}
+
+TEST_F(MasterTest, AllocateBlockWithNoLiveNodesLeavesNothingPending) {
+    // Without any registered node, ALLOCATE_BLOCK fails with NODE_NOT_FOUND
+    // after NamespaceManager already issued block id 1 (next_block_id_
+    // starts at 1). The Client never learns that id, so Master itself must
+    // drop it — a later commit naming it has to be rejected.
+    start_master(38314);
+    TCPConnection client = connect_client(38314);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto alloc_resp = client.receiveMessage();
+    ASSERT_TRUE(alloc_resp.has_value());
+    ASSERT_EQ(alloc_resp->type, MessageType::ERROR);
+    ASSERT_EQ(error_from_payload(alloc_resp->payload), ErrorCode::NODE_NOT_FOUND);
+
+    ASSERT_TRUE(client.sendMessage(
+        make_write_commit_request(3, "/a.txt", {/*block_id=*/1}, /*size=*/10, 10)));
+    auto commit_resp = client.receiveMessage();
+    ASSERT_TRUE(commit_resp.has_value());
+    EXPECT_EQ(commit_resp->type, MessageType::ERROR);
+    EXPECT_EQ(error_from_payload(commit_resp->payload), ErrorCode::INVALID_REQUEST);
+}
+
+TEST_F(MasterTest, WriteCommitDispatchesDeleteForLeftoverPendingBlocks) {
+    start_master(38315);
+    TCPConnection client = connect_client(38315);
+    auto nodes = register_three_recording_nodes(client, 38316, 38317, 38318);
+
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::CREATE_FILE, 1, "/a.txt")));
+    ASSERT_TRUE(client.receiveMessage().has_value());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 2, "/a.txt")));
+    auto leftover_alloc = client.receiveMessage();
+    ASSERT_TRUE(leftover_alloc.has_value());
+    BlockId leftover = get_u64(leftover_alloc->payload.data());
+    ASSERT_TRUE(client.sendMessage(make_path_request(MessageType::ALLOCATE_BLOCK, 3, "/a.txt")));
+    auto committed_alloc = client.receiveMessage();
+    ASSERT_TRUE(committed_alloc.has_value());
+    BlockId committed = get_u64(committed_alloc->payload.data());
+
+    ASSERT_TRUE(
+        client.sendMessage(make_write_commit_request(4, "/a.txt", {committed}, /*size=*/10, 10)));
+    auto commit_resp = client.receiveMessage();
+    ASSERT_TRUE(commit_resp.has_value());
+    ASSERT_EQ(commit_resp->type, MessageType::ACK);
+
+    for (auto& node : nodes) {
+        EXPECT_TRUE(node->received(leftover));
+        EXPECT_FALSE(node->received(committed));
+    }
 }

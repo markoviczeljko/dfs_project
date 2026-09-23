@@ -67,6 +67,7 @@ private:
     Message handle_stat_file(const Message& request);
     Message handle_allocate_block(const Message& request);
     Message handle_write_commit(const Message& request);
+    Message handle_abandon_blocks(const Message& request);
     Message handle_read_file(const Message& request);
     Message handle_register_node(const Message& request);
     Message handle_append_file(const Message& request);

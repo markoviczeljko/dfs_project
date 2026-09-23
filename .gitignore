@@ -31,6 +31,10 @@ compile_commands.json
 /dfs_design_notes.md
 /IMPLEMENTATION_PLAN.md
 /BILJESKE_FAZE.md
+/BILJESKE_THREADOVI.md
+/BILJESKE_STORAGENODE.md
+/SviFlowoviDijagram.md
+/BILJESKE_MASTER.md
 
 # Logs / runtime data
 *.log

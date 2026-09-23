@@ -230,3 +230,31 @@ TEST_F(AppendIntegrationTest, ConcurrentAppendsFromTwoClientsDoNotOverlapOrLoseD
     EXPECT_EQ(a_bytes, static_cast<size_t>(kCallSize * kCallCount));
     EXPECT_EQ(b_bytes, static_cast<size_t>(kCallSize * kCallCount));
 }
+
+// Faza 18: an append whose new blocks fail to reach every replica must not
+// leave those blocks behind — same ABANDON_BLOCKS cleanup as a failed WRITE
+// (see docs/design_faza18_abandon_blocks.md). A stopped node is still
+// "alive" to Master until the failure-detection thresholds pass, so it is
+// chosen as a replica and the append to it fails.
+TEST_F(AppendIntegrationTest, FailedAppendNewBlocksAreCleanedUp) {
+    Client& client = start_cluster(40740, 40741, 40742, 40743, /*block_size=*/1024);
+    ASSERT_EQ(client.create_file("/a.txt"), ErrorCode::OK);
+
+    storage_nodes_[2]->stop();
+    EXPECT_NE(client.append("/a.txt", std::vector<uint8_t>(1500, 4)), ErrorCode::OK);
+
+    for (size_t node = 0; node < 2; ++node) {
+        std::filesystem::path blocks_dir = dir_ / ("node" + std::to_string(node + 1)) / "blocks";
+        size_t count = 0;
+        if (std::filesystem::exists(blocks_dir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(blocks_dir)) {
+                if (entry.path().extension() == ".block") ++count;
+            }
+        }
+        EXPECT_EQ(count, 0u) << "node " << node + 1;
+    }
+
+    auto stat_result = client.stat("/a.txt");
+    ASSERT_TRUE(stat_result.is_ok());
+    EXPECT_EQ(stat_result.value().size, 0u);
+}

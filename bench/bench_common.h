@@ -54,6 +54,18 @@ struct LatencyStats {
 };
 LatencyStats compute_latency_stats(std::vector<uint64_t> samples_us);
 
+// Min/mean/max across N independent repetitions of the SAME cell (same
+// size/client-count/mode), as opposed to LatencyStats' percentiles across
+// the individual samples WITHIN one repetition. Added so every experiment
+// can show run-to-run variance, not just a single run's own numbers (see
+// docs/benchmark_results.md's methodology section).
+struct Aggregate {
+    double min = 0.0;
+    double mean = 0.0;
+    double max = 0.0;
+};
+Aggregate aggregate_values(const std::vector<double>& values);
+
 // One row of a results table — already-formatted strings, callers decide
 // units/precision per column.
 using TableRow = std::vector<std::string>;
@@ -85,6 +97,15 @@ std::string format_mb(double bytes);
 // format_millis (review caught one column that had
 // slipped through using std::to_string's raw 6-decimal formatting).
 std::string format_seconds(double seconds);
+
+// Formats an Aggregate of microsecond values as "<min> / <mean> / <max> ms".
+std::string format_min_mean_max_millis(const Aggregate& microseconds);
+
+// Formats an Aggregate of MB/s values as "<min> / <mean> / <max>".
+std::string format_min_mean_max_mb_s(const Aggregate& mb_s);
+
+// Formats an Aggregate of seconds values as "<min> / <mean> / <max> s".
+std::string format_min_mean_max_seconds(const Aggregate& seconds);
 
 // Extracts the unsigned integer value of `key=<value>` from the line in
 // `stats_text` (a dfs_statsctl GET_STATS response, see

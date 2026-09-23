@@ -163,6 +163,38 @@ Result<BlockId> NamespaceManager::allocate_block(const std::string& path) {
     return Result<BlockId>::ok(id);
 }
 
+Result<std::vector<OrphanedBlock>> NamespaceManager::abandon_blocks(
+    const std::string& path, const std::vector<BlockId>& block_ids) {
+    auto normalized_result = normalize_path(path);
+    if (normalized_result.is_error()) {
+        return Result<std::vector<OrphanedBlock>>::err(normalized_result.error());
+    }
+    const std::string& normalized = normalized_result.value();
+
+    std::unique_lock lock(mutex_);
+    std::vector<OrphanedBlock> orphans;
+    auto pending_it = pending_blocks_.find(normalized);
+    if (pending_it == pending_blocks_.end()) {
+        return Result<std::vector<OrphanedBlock>>::ok(std::move(orphans));
+    }
+    for (BlockId id : block_ids) {
+        if (pending_it->second.erase(id) == 0) {
+            continue;  // already committed or dropped elsewhere — idempotent skip
+        }
+        // No blocks_ entry means ALLOCATE_BLOCK failed before replicas were
+        // chosen: nothing was ever sent to a Storage Node, nothing to GC.
+        auto block_it = blocks_.find(id);
+        if (block_it != blocks_.end()) {
+            orphans.push_back(OrphanedBlock{id, block_it->second.replicas});
+            blocks_.erase(block_it);
+        }
+    }
+    if (pending_it->second.empty()) {
+        pending_blocks_.erase(pending_it);
+    }
+    return Result<std::vector<OrphanedBlock>>::ok(std::move(orphans));
+}
+
 Result<std::vector<OrphanedBlock>> NamespaceManager::commit_write(
     const std::string& path, const std::vector<BlockId>& block_ids, uint64_t size,
     uint64_t last_block_size) {
@@ -190,10 +222,26 @@ Result<std::vector<OrphanedBlock>> NamespaceManager::commit_write(
             return Result<std::vector<OrphanedBlock>>::err(ErrorCode::INVALID_REQUEST);
         }
     }
-    // Clear the whole pending set, not just the committed ids — any
-    // leftover ids from an earlier abandoned write attempt on this path are
-    // discarded here rather than lingering forever (see docs/design.md §12).
-    pending_blocks_.erase(normalized);
+    // Clear the whole pending set, not just the committed ids. Leftover ids
+    // from an earlier failed attempt on this path can never be committed
+    // after this, so (Faza 18) they become orphans for GC right here rather
+    // than keeping their blocks_ entries and on-disk replicas forever (see
+    // docs/design.md §12).
+    std::vector<OrphanedBlock> orphans;
+    if (pending_it != pending_blocks_.end()) {
+        const std::unordered_set<BlockId> committing(block_ids.begin(), block_ids.end());
+        for (BlockId id : pending_it->second) {
+            if (committing.count(id) != 0) {
+                continue;
+            }
+            auto leftover_it = blocks_.find(id);
+            if (leftover_it != blocks_.end()) {
+                orphans.push_back(OrphanedBlock{id, leftover_it->second.replicas});
+                blocks_.erase(leftover_it);
+            }
+        }
+        pending_blocks_.erase(pending_it);
+    }
 
     uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
@@ -207,7 +255,6 @@ Result<std::vector<OrphanedBlock>> NamespaceManager::commit_write(
     // allocate_block() strictly increments next_block_id_ (see
     // docs/design.md §15). A missing blocks_ entry is a no-op here, same
     // reasoning as delete_file() above.
-    std::vector<OrphanedBlock> orphans;
     for (BlockId id : it->second.blocks) {
         auto old_block_it = blocks_.find(id);
         if (old_block_it != blocks_.end()) {

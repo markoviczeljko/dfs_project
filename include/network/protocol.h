@@ -89,7 +89,16 @@ enum class MessageType : uint16_t {
     // deployment) but appending is strictly safer general practice for an
     // over-the-wire enum, and costs nothing here.
     GET_STATS,
-    STATS_RESPONSE
+    STATS_RESPONSE,
+
+    // Faza 18: Client -> Master cleanup signal sent right after a WRITE/
+    // APPEND attempt fails, naming every block id that attempt allocated
+    // (including the one whose write failed) so Master can drop them from
+    // pending_blocks_ and GC their already-written replicas. Payload:
+    // [u32 path_len][path][u32 block_count][block_count x u64 block_id];
+    // response is always a bare ACK unless the payload is malformed.
+    // Appended at the end for the same wire-stability reason as GET_STATS.
+    ABANDON_BLOCKS
 };
 
 // True for message types that carry block-sized payloads (§5.18 data plane).

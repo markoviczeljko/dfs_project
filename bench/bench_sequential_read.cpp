@@ -31,11 +31,19 @@ constexpr uint16_t kStorage1Port = 41801;
 constexpr uint16_t kStorage2Port = 41802;
 constexpr uint16_t kStorage3Port = 41803;
 
-// §16.7. BLOCK_SIZE (64 MB) is the largest cell — a genuine single
-// real-sized block, not a scaled-down stand-in.
-constexpr std::array<uint64_t, 5> kSizes = {
-    1ULL * 1024, 64ULL * 1024, 1ULL * 1024 * 1024, 10ULL * 1024 * 1024, BLOCK_SIZE,
+// §16.7. BLOCK_SIZE (64 MB) is a genuine single real-sized block; 2*BLOCK_SIZE
+// and 4*BLOCK_SIZE (128 MB, 256 MB) extend the sweep past one block so
+// multi-block files are exercised by an actual benchmark, not just by the
+// unit/integration test suite (Faza 8's multi-block WRITE/READ coverage).
+constexpr std::array<uint64_t, 7> kSizes = {
+    1ULL * 1024,        64ULL * 1024,       1ULL * 1024 * 1024, 10ULL * 1024 * 1024,
+    BLOCK_SIZE,         2ULL * BLOCK_SIZE,  4ULL * BLOCK_SIZE,
 };
+
+// Each (size, client_count) cell is run this many times independently
+// (fresh file, fresh client threads, fresh timing) so the results show
+// run-to-run variance (min/mean/max) instead of a single run's numbers.
+constexpr int kRepeats = 3;
 
 // §16.8 asks for 1/5/10/25/50/100 concurrent clients. Reduced to
 // {1, 5, 10} for this sandboxed dev-environment validation run — 100
@@ -90,57 +98,77 @@ int main() {
         }
 
         for (int client_count : kClientCounts) {
-            std::vector<std::vector<uint64_t>> per_thread_latencies(
-                static_cast<size_t>(client_count));
-            std::vector<std::thread> threads;
+            std::vector<uint64_t> pooled_latencies;
+            std::vector<double> avg_us_per_rep;
+            std::vector<double> throughput_per_rep;
 
-            auto wall_start = std::chrono::steady_clock::now();
-            for (int t = 0; t < client_count; ++t) {
-                threads.emplace_back([&, t] {
-                    Client::Config config{"127.0.0.1", kMasterPort};
-                    auto client_result = Client::create(config);
-                    if (client_result.is_error()) fail("failed to create read client");
-                    auto client = std::move(client_result.value());
+            for (int rep = 0; rep < kRepeats; ++rep) {
+                std::vector<std::vector<uint64_t>> per_thread_latencies(
+                    static_cast<size_t>(client_count));
+                std::vector<std::thread> threads;
 
-                    for (int r = 0; r < kReadsPerClient; ++r) {
-                        auto start = std::chrono::steady_clock::now();
-                        auto read_result = client->read(path);
-                        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - start);
-                        if (read_result.is_error() || read_result.value().size() != payload.size()) {
-                            fail("READ returned wrong data/error during benchmark");
+                auto wall_start = std::chrono::steady_clock::now();
+                for (int t = 0; t < client_count; ++t) {
+                    threads.emplace_back([&, t] {
+                        Client::Config config{"127.0.0.1", kMasterPort};
+                        auto client_result = Client::create(config);
+                        if (client_result.is_error()) fail("failed to create read client");
+                        auto client = std::move(client_result.value());
+
+                        for (int r = 0; r < kReadsPerClient; ++r) {
+                            auto start = std::chrono::steady_clock::now();
+                            auto read_result = client->read(path);
+                            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - start);
+                            if (read_result.is_error() ||
+                                read_result.value().size() != payload.size()) {
+                                fail("READ returned wrong data/error during benchmark");
+                            }
+                            per_thread_latencies[static_cast<size_t>(t)].push_back(
+                                static_cast<uint64_t>(elapsed.count()));
                         }
-                        per_thread_latencies[static_cast<size_t>(t)].push_back(
-                            static_cast<uint64_t>(elapsed.count()));
-                    }
-                });
-            }
-            for (std::thread& th : threads) th.join();
-            double wall_elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - wall_start).count();
+                    });
+                }
+                for (std::thread& th : threads) th.join();
+                double wall_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall_start).count();
 
-            std::vector<uint64_t> all_latencies;
-            for (auto& thread_samples : per_thread_latencies) {
-                all_latencies.insert(all_latencies.end(), thread_samples.begin(),
-                                      thread_samples.end());
+                std::vector<uint64_t> rep_latencies;
+                for (auto& thread_samples : per_thread_latencies) {
+                    rep_latencies.insert(rep_latencies.end(), thread_samples.begin(),
+                                          thread_samples.end());
+                }
+                LatencyStats rep_stats = compute_latency_stats(rep_latencies);
+                double total_bytes = static_cast<double>(size) *
+                                      static_cast<double>(kReadsPerClient) *
+                                      static_cast<double>(client_count);
+
+                avg_us_per_rep.push_back(rep_stats.avg_us);
+                throughput_per_rep.push_back(total_bytes / (1024.0 * 1024.0) / wall_elapsed);
+                pooled_latencies.insert(pooled_latencies.end(), rep_latencies.begin(),
+                                         rep_latencies.end());
             }
-            LatencyStats stats = compute_latency_stats(std::move(all_latencies));
-            double total_bytes = static_cast<double>(size) * static_cast<double>(kReadsPerClient) *
-                                  static_cast<double>(client_count);
+
+            LatencyStats pooled_stats = compute_latency_stats(pooled_latencies);
+            Aggregate latency_agg = aggregate_values(avg_us_per_rep);
+            // avg_us_per_rep values are already in microseconds; scale mean/min/max
+            // through format_min_mean_max_millis's own /1000 division below.
+            Aggregate throughput_agg = aggregate_values(throughput_per_rep);
 
             rows.push_back({
                 size_label(size),
                 std::to_string(client_count),
-                format_throughput_mb_s(total_bytes, wall_elapsed),
-                format_millis(stats.avg_us),
-                format_millis(static_cast<double>(stats.p95_us)),
+                format_min_mean_max_mb_s(throughput_agg),
+                format_min_mean_max_millis(latency_agg),
+                format_millis(static_cast<double>(pooled_stats.p95_us)),
             });
         }
     }
 
     print_markdown_table(
-        "Eksperiment 1 — Sequential READ",
-        {"Veličina fajla", "Broj klijenata", "Throughput (MB/s)", "Prosječna latencija", "P95 latencija"},
+        "Eksperiment 1 — Sequential READ (3 ponavljanja po ćeliji, min / mean / max)",
+        {"Veličina fajla", "Broj klijenata", "Throughput min/mean/max (MB/s)",
+         "Latencija min/mean/max", "P95 latencija (pooled)"},
         rows);
 
     cluster.stop_all();

@@ -245,6 +245,8 @@ Message Master::route_message(const Message& request) {
             return handle_allocate_block(request);
         case MessageType::WRITE_COMMIT:
             return handle_write_commit(request);
+        case MessageType::ABANDON_BLOCKS:
+            return handle_abandon_blocks(request);
         case MessageType::READ_FILE:
             // Repurposed in Faza 7 as "get file metadata for read" — the
             // design notes' GET_FILE_METADATA was never added to the real
@@ -344,10 +346,11 @@ Message Master::handle_allocate_block(const Message& request) {
     // block this phase can never repair (see docs/design.md §13).
     std::vector<StorageNodeId> replicas = replication_manager_.choose_replicas(block_id);
     if (replicas.empty()) {
-        // block_id is already sitting in NamespaceManager's pending_blocks_
-        // set for this path at this point — same orphan-until-a-later-
-        // successful-commit-or-delete fate as an abandoned write attempt
-        // (see docs/design.md §12), not a new leak this phase introduces.
+        // block_id is already in NamespaceManager's pending set, but the
+        // Client never learns it from an ERROR response, so it can't send
+        // ABANDON_BLOCKS for it — drop it here (Faza 18). No replicas were
+        // assigned yet, so there is nothing to GC.
+        (void)namespace_manager_.abandon_blocks(path, {block_id});
         return make_error(request.request_id, ErrorCode::NODE_NOT_FOUND);
     }
     namespace_manager_.set_block_replicas(block_id, replicas);
@@ -363,6 +366,13 @@ Message Master::handle_allocate_block(const Message& request) {
     for (StorageNodeId node_id : replicas) {
         auto node = storage_registry_.get_node(node_id);
         if (!node.has_value()) {
+            // Same reasoning as the NODE_NOT_FOUND branch above: the Client
+            // never learns this id. No data was sent yet, so the GC below
+            // only asks replicas to delete a block they don't have.
+            auto abandoned = namespace_manager_.abandon_blocks(path, {block_id});
+            if (abandoned.is_ok()) {
+                gc_dispatch(abandoned.value());
+            }
             return make_error(request.request_id, ErrorCode::INTERNAL_ERROR);
         }
         put_string(response_payload, node->host);
@@ -420,6 +430,47 @@ Message Master::handle_write_commit(const Message& request) {
     // per-block; see docs/design.md §18 for why this is recorded here,
     // once the real size is known, rather than at ALLOCATE_BLOCK time).
     statistics_.record_replication(size);
+    return Message{MessageType::ACK, request.request_id, {}};
+}
+
+Message Master::handle_abandon_blocks(const Message& request) {
+    // Faza 18 wire format: [u32 path_len][path][u32 block_count]
+    // [block_count x u64 block_id]. Sent by the Client right after a
+    // WRITE/APPEND attempt fails, naming every block id that attempt
+    // allocated (see docs/design_faza18_abandon_blocks.md). Always ACKed
+    // once parsed: the Client's operation has already failed, and the
+    // cleanup is best-effort like DELETE_FILE's (see docs/design.md §15).
+    if (request.payload.size() < sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    uint32_t path_length = get_u32(request.payload.data());
+    size_t offset = sizeof(uint32_t);
+    if (request.payload.size() < offset + path_length + sizeof(uint32_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+    std::string path(reinterpret_cast<const char*>(request.payload.data() + offset), path_length);
+    offset += path_length;
+    uint32_t block_count = get_u32(request.payload.data() + offset);
+    offset += sizeof(uint32_t);
+    if (request.payload.size() != offset + static_cast<size_t>(block_count) * sizeof(uint64_t)) {
+        return make_error(request.request_id, ErrorCode::INVALID_REQUEST);
+    }
+
+    std::vector<BlockId> block_ids;
+    block_ids.reserve(block_count);
+    for (uint32_t i = 0; i < block_count; ++i) {
+        block_ids.push_back(get_u64(request.payload.data() + offset));
+        offset += sizeof(uint64_t);
+    }
+
+    auto result = namespace_manager_.abandon_blocks(path, block_ids);
+    if (result.is_error()) {
+        return make_error(request.request_id, result.error());
+    }
+    gc_dispatch(result.value());
+    // No persist_metadata(): pending/uncommitted blocks are never part of
+    // the persisted snapshot (see NamespaceManager::restore()), so nothing
+    // persisted changed.
     return Message{MessageType::ACK, request.request_id, {}};
 }
 

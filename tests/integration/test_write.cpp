@@ -3,17 +3,21 @@
 #include <endian.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "client/client.h"
 #include "common/config.h"
 #include "master/master.h"
 #include "network/connection.h"
+#include "network/network_server.h"
 #include "network/socket.h"
 #include "storage/storage_node.h"
 
@@ -65,6 +69,37 @@ protected:
         auto client_result = Client::create(Client::Config{"127.0.0.1", master_port, block_size});
         ASSERT_TRUE(client_result.is_ok());
         client_ = std::move(client_result.value());
+    }
+
+    // Faza 18: an extra (4th+) Storage Node on an already-running cluster —
+    // node ids continue after the first three.
+    void start_extra_storage_node(uint16_t master_port, uint16_t storage_port) {
+        StorageNodeId id = static_cast<StorageNodeId>(storage_nodes_.size() + 1);
+        StorageNode::Config storage_config{id,
+                                            storage_port,
+                                            dir_ / ("node" + std::to_string(id)),
+                                            1024ULL * 1024 * 1024,
+                                            "127.0.0.1",
+                                            "127.0.0.1",
+                                            master_port};
+        auto storage_result = StorageNode::create(storage_config);
+        ASSERT_TRUE(storage_result.is_ok());
+        storage_nodes_.push_back(std::move(storage_result.value()));
+        ASSERT_EQ(storage_nodes_.back()->start(), ErrorCode::OK);
+    }
+
+    // Counts physical block files a node holds (node_index is 0-based) —
+    // same on-disk layout test_delete.cpp's block_exists_on_disk() relies on
+    // (see BlockStorage::block_path, docs/design.md §15).
+    size_t block_files_on_disk(size_t node_index) const {
+        std::filesystem::path blocks_dir =
+            dir_ / ("node" + std::to_string(node_index + 1)) / "blocks";
+        if (!std::filesystem::exists(blocks_dir)) return 0;
+        size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(blocks_dir)) {
+            if (entry.path().extension() == ".block") ++count;
+        }
+        return count;
     }
 
     std::filesystem::path dir_;
@@ -233,4 +268,154 @@ TEST_F(WriteIntegrationTest, WriteReplicatesBlockToAllThreeNodes) {
         ASSERT_TRUE(resp.has_value());
         EXPECT_EQ(resp->type, MessageType::READ_OK) << "block missing on port " << port;
     }
+}
+
+// Faza 18: a failed WRITE must not leave its already-written replicas
+// behind — the Client sends ABANDON_BLOCKS and Master GCs them (see
+// docs/design_faza18_abandon_blocks.md). A stopped node stays "alive" in
+// Master's eyes until FailureDetector's 6s/12s thresholds pass, so it is
+// still chosen as a replica and the write to it fails.
+
+TEST_F(WriteIntegrationTest, FailedWriteLeavesNoBlockFilesOnDisk) {
+    start_cluster(40700, 40701, 40702, 40703);
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+
+    storage_nodes_[2]->stop();
+    std::vector<uint8_t> data(1000, 7);
+    EXPECT_NE(client_->write("/a.txt", data), ErrorCode::OK);
+
+    EXPECT_EQ(block_files_on_disk(0), 0u);
+    EXPECT_EQ(block_files_on_disk(1), 0u);
+}
+
+TEST_F(WriteIntegrationTest, FailedWriteKeepsPreviousFileContent) {
+    start_cluster(40710, 40711, 40712, 40713);
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+    std::vector<uint8_t> first(500, 1);
+    ASSERT_EQ(client_->write("/a.txt", first), ErrorCode::OK);
+
+    storage_nodes_[2]->stop();
+    std::vector<uint8_t> second(800, 2);
+    EXPECT_NE(client_->write("/a.txt", second), ErrorCode::OK);
+
+    auto read_result = client_->read("/a.txt");
+    ASSERT_TRUE(read_result.is_ok());
+    EXPECT_EQ(read_result.value(), first);
+    // Only the committed first version's block remains on the live nodes.
+    EXPECT_EQ(block_files_on_disk(0), 1u);
+    EXPECT_EQ(block_files_on_disk(1), 1u);
+}
+
+TEST_F(WriteIntegrationTest, FailedMultiChunkWriteLeavesNoBlockFilesOnDisk) {
+    // 4 nodes, RF=3, deterministic round-robin (replication_manager.cpp):
+    // chunk 0 -> {1,2,3} (all alive, succeeds), chunk 1 -> {4,1,2} (node 4
+    // stopped, fails). Both chunks' blocks must be cleaned up.
+    constexpr uint64_t kBlockSize = 1024;
+    start_cluster(40720, 40721, 40722, 40723, kBlockSize);
+    start_extra_storage_node(40720, 40724);
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+
+    storage_nodes_[3]->stop();
+    std::vector<uint8_t> data(2 * kBlockSize - 10, 9);
+    EXPECT_NE(client_->write("/a.txt", data), ErrorCode::OK);
+
+    for (size_t node = 0; node < 3; ++node) {
+        EXPECT_EQ(block_files_on_disk(node), 0u) << "node " << node + 1;
+    }
+}
+
+namespace {
+
+void put_u16_be(std::vector<std::byte>& buf, uint16_t value) {
+    uint16_t be = htobe16(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+void put_u32_be(std::vector<std::byte>& buf, uint32_t value) {
+    uint32_t be = htobe32(value);
+    const auto* bytes = reinterpret_cast<const std::byte*>(&be);
+    buf.insert(buf.end(), bytes, bytes + sizeof(be));
+}
+
+// Fake Storage Nodes that hold every WRITE_BLOCK for delay_ms before
+// ACKing, recording how many WRITE_BLOCKs (across all nodes sharing the
+// counters) were being served at the same moment.
+struct InFlightCounter {
+    std::atomic<int> current{0};
+    std::atomic<int> max_seen{0};
+};
+
+struct SlowWriteNode {
+    std::unique_ptr<NetworkServer> server;
+
+    static std::unique_ptr<SlowWriteNode> start(uint16_t port, int delay_ms,
+                                                InFlightCounter& counter) {
+        auto node = std::make_unique<SlowWriteNode>();
+        auto result = NetworkServer::create(port, [delay_ms, &counter](const Message& request) -> Message {
+            if (request.type == MessageType::WRITE_BLOCK) {
+                int now = ++counter.current;
+                int seen = counter.max_seen.load();
+                while (now > seen && !counter.max_seen.compare_exchange_weak(seen, now)) {
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                --counter.current;
+            }
+            return Message{MessageType::ACK, request.request_id, {}};
+        });
+        EXPECT_TRUE(result.is_ok());
+        node->server = std::move(result.value());
+        EXPECT_EQ(node->server->start(), ErrorCode::OK);
+        return node;
+    }
+};
+
+}  // namespace
+
+TEST_F(WriteIntegrationTest, WriteSendsBlockToReplicasInParallel) {
+    // Three replicas that each hold a WRITE_BLOCK for kDelayMs: with a
+    // parallel fan-out all three are in flight at once; a sequential one
+    // never has more than one outstanding.
+    constexpr int kDelayMs = 300;
+    InFlightCounter counter;
+    constexpr uint16_t kMasterPort = 40730;
+    Master::Config master_config{kMasterPort, dir_ / "master_metadata"};
+    auto master_result = Master::create(master_config);
+    ASSERT_TRUE(master_result.is_ok());
+    master_ = std::move(master_result.value());
+    ASSERT_EQ(master_->start(), ErrorCode::OK);
+
+    std::vector<std::unique_ptr<SlowWriteNode>> slow_nodes;
+    auto socket_result = Socket::create();
+    ASSERT_TRUE(socket_result.is_ok());
+    Socket socket = std::move(socket_result.value());
+    ASSERT_EQ(socket.connect("127.0.0.1", kMasterPort), ErrorCode::OK);
+    TCPConnection master_connection(std::move(socket));
+    for (uint16_t i = 1; i <= 3; ++i) {
+        uint16_t port = static_cast<uint16_t>(kMasterPort + i);
+        slow_nodes.push_back(SlowWriteNode::start(port, kDelayMs, counter));
+        // REGISTER_NODE: [u64 node_id][u32 host_len][host][u16 port][u64 capacity].
+        std::vector<std::byte> payload;
+        put_u64(payload, i);
+        const std::string host = "127.0.0.1";
+        put_u32_be(payload, static_cast<uint32_t>(host.size()));
+        payload.insert(payload.end(), reinterpret_cast<const std::byte*>(host.data()),
+                       reinterpret_cast<const std::byte*>(host.data()) + host.size());
+        put_u16_be(payload, port);
+        put_u64(payload, 1024ULL * 1024 * 1024);
+        ASSERT_TRUE(master_connection.sendMessage(
+            Message{MessageType::REGISTER_NODE, static_cast<uint64_t>(100 + i), std::move(payload)}));
+        auto resp = master_connection.receiveMessage();
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_EQ(resp->type, MessageType::ACK);
+    }
+
+    auto client_result = Client::create(Client::Config{"127.0.0.1", kMasterPort, BLOCK_SIZE});
+    ASSERT_TRUE(client_result.is_ok());
+    client_ = std::move(client_result.value());
+    ASSERT_EQ(client_->create_file("/a.txt"), ErrorCode::OK);
+
+    ASSERT_EQ(client_->write("/a.txt", std::vector<uint8_t>(100, 3)), ErrorCode::OK);
+
+    EXPECT_EQ(counter.max_seen.load(), 3) << "replicas were not written in parallel";
 }

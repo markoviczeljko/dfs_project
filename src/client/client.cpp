@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <future>
+#include <system_error>
 #include <utility>
 
 #include "common/config.h"
@@ -278,56 +280,92 @@ Result<std::vector<Client::ReplicaLocation>> Client::parse_replica_list(
     return Result<std::vector<ReplicaLocation>>::ok(std::move(replicas));
 }
 
+namespace {
+
+// One replica's share of write_chunk_to_replicas(): fresh connection,
+// WRITE_BLOCK, wait for the reply. Runs on its own thread, so it only reads
+// shared, immutable state (host, request).
+ErrorCode write_chunk_to_one_replica(const std::string& host, uint16_t port,
+                                     const Message& request) {
+    auto socket_result = Socket::create();
+    if (socket_result.is_error()) {
+        return socket_result.error();
+    }
+    Socket socket = std::move(socket_result.value());
+    if (ErrorCode err = socket.connect(host, port); err != ErrorCode::OK) {
+        return err;
+    }
+    TCPConnection node_connection(std::move(socket));
+    if (!node_connection.sendMessage(request)) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    auto response = node_connection.receiveMessage();
+    if (!response.has_value()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (response->type != MessageType::ACK) {
+        return error_from_payload(response->payload);
+    }
+    return ErrorCode::OK;
+}
+
+}  // namespace
+
 ErrorCode Client::write_chunk_to_replicas(BlockId block_id, uint64_t offset, uint64_t block_version,
                                            const uint8_t* data, size_t len,
                                            const std::vector<ReplicaLocation>& replicas) {
     // Data plane — never routed through Master, one fresh connection per
-    // replica (no pooling, see docs/design.md §11). Commit requires ALL
-    // replicas to ACK (strict 3/3, see docs/design.md §13), so abort
-    // immediately on the first failure — no point trying the remaining
-    // replicas once commit is already impossible.
+    // replica (no pooling, see docs/design.md §11). Faza 18: the replicas
+    // are written in parallel (fan-out), so a block costs about one
+    // replica round-trip instead of RF of them in sequence. Commit still
+    // requires ALL replicas to ACK (strict 3/3, see docs/design.md §13);
+    // if any fails, the caller abandons the block via ABANDON_BLOCKS so
+    // the replicas that did accept it get cleaned up.
     //
-    // One operation_id per logical chunk-write, reused across all replica
-    // sends — lets a Storage Node retry-detect this exact chunk-write
-    // regardless of which replica a retry lands on (see docs/design.md
-    // §16).
-    OperationId operation_id = next_operation_id();
-    for (const ReplicaLocation& location : replicas) {
-        auto socket_result = Socket::create();
-        if (socket_result.is_error()) {
-            return socket_result.error();
-        }
-        Socket socket = std::move(socket_result.value());
-        if (ErrorCode err = socket.connect(location.host, location.port); err != ErrorCode::OK) {
-            return err;
-        }
-        TCPConnection node_connection(std::move(socket));
+    // One operation_id per logical chunk-write, shared by all replicas —
+    // lets a Storage Node retry-detect this exact chunk-write regardless of
+    // which replica a retry lands on (see docs/design.md §16). The request
+    // (payload included) is built once, here on the calling thread —
+    // next_request_id()/next_operation_id() aren't thread-safe — and only
+    // read by the worker threads; request_id is merely echoed back by
+    // Storage Nodes, so every replica connection can reuse the same one,
+    // and the block's bytes aren't copied once per replica.
+    std::vector<std::byte> write_payload;
+    put_u64(write_payload, next_operation_id());
+    put_u64(write_payload, block_id);
+    put_u64(write_payload, offset);
+    put_u64(write_payload, block_version);
+    put_u32(write_payload, static_cast<uint32_t>(len));
+    const auto* data_bytes = reinterpret_cast<const std::byte*>(data);
+    write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
+    const Message request{MessageType::WRITE_BLOCK, next_request_id(), std::move(write_payload)};
 
-        std::vector<std::byte> write_payload;
-        put_u64(write_payload, operation_id);
-        put_u64(write_payload, block_id);
-        put_u64(write_payload, offset);
-        put_u64(write_payload, block_version);
-        put_u32(write_payload, static_cast<uint32_t>(len));
-        const auto* data_bytes = reinterpret_cast<const std::byte*>(data);
-        write_payload.insert(write_payload.end(), data_bytes, data_bytes + len);
-
-        if (!node_connection.sendMessage(
-                Message{MessageType::WRITE_BLOCK, next_request_id(), std::move(write_payload)})) {
-            return ErrorCode::INTERNAL_ERROR;
+    std::vector<std::future<ErrorCode>> results;
+    results.reserve(replicas.size());
+    ErrorCode first_error = ErrorCode::OK;
+    try {
+        for (const ReplicaLocation& location : replicas) {
+            results.push_back(std::async(std::launch::async, write_chunk_to_one_replica,
+                                         std::cref(location.host), location.port,
+                                         std::cref(request)));
         }
-        auto write_response = node_connection.receiveMessage();
-        if (!write_response.has_value()) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        if (write_response->type != MessageType::ACK) {
-            // Abort without committing — the old file version stays intact
-            // (see docs/design.md §12); already-written replicas for this
-            // attempt become orphans (GC deferred).
-            return error_from_payload(write_response->payload);
+    } catch (const std::system_error&) {
+        // Thread creation failed (resource exhaustion). Never let this
+        // escape the ErrorCode-based API: report it as a failed chunk so
+        // the caller abandons the block like any other replica failure.
+        // Replicas already launched are still waited for below.
+        first_error = ErrorCode::INTERNAL_ERROR;
+    }
+    // Wait for every replica, even after a failure — no worker may outlive
+    // `request`/`replicas`, and the caller's abandon must come after every
+    // replica that is going to accept the block already has.
+    for (auto& result : results) {
+        ErrorCode err = result.get();
+        if (first_error == ErrorCode::OK && err != ErrorCode::OK) {
+            first_error = err;
         }
     }
-    return ErrorCode::OK;
+    return first_error;
 }
 
 Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, const uint8_t* data,
@@ -336,35 +374,48 @@ Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, c
     std::vector<BlockId> block_ids;
     block_ids.reserve(chunk_count);
 
+    // Faza 18: every failure after at least one ALLOCATE_BLOCK hands the
+    // attempt's block ids back to Master (ABANDON_BLOCKS) before returning,
+    // so replicas that already accepted a chunk don't keep it forever.
+    auto fail = [&](ErrorCode err) {
+        abandon_blocks(path, block_ids);
+        return Result<std::vector<BlockId>>::err(err);
+    };
+
     for (size_t i = 0; i < chunk_count; ++i) {
         size_t chunk_offset = i * config_.block_size;
         size_t chunk_len = std::min<size_t>(config_.block_size, len - chunk_offset);
 
-        // Step 1: ask Master for a BlockId + replica locations.
+        // Step 1: ask Master for a BlockId + replica locations. If this
+        // fails, Master never handed out a usable id (it drops the pending
+        // one itself), so only earlier chunks' ids need abandoning.
         Message alloc_request{MessageType::ALLOCATE_BLOCK, next_request_id(), string_to_bytes(path)};
         auto alloc_result = call_master(alloc_request);
         if (alloc_result.is_error()) {
-            return Result<std::vector<BlockId>>::err(alloc_result.error());
+            return fail(alloc_result.error());
         }
         const Message& alloc_response = alloc_result.value();
         if (alloc_response.type != MessageType::ACK) {
-            return Result<std::vector<BlockId>>::err(error_from_payload(alloc_response.payload));
+            return fail(error_from_payload(alloc_response.payload));
         }
         if (alloc_response.payload.size() < sizeof(uint64_t) + sizeof(uint32_t)) {
-            return Result<std::vector<BlockId>>::err(ErrorCode::INTERNAL_ERROR);
+            return fail(ErrorCode::INTERNAL_ERROR);
         }
         BlockId block_id = get_u64(alloc_response.payload.data());
+        // From here on this chunk's id is part of the attempt — abandon it
+        // too on any failure, including a failed write of this very chunk.
+        block_ids.push_back(block_id);
         uint32_t replica_count = get_u32(alloc_response.payload.data() + sizeof(uint64_t));
         size_t resp_offset = sizeof(uint64_t) + sizeof(uint32_t);
 
         auto replicas_result = parse_replica_list(alloc_response.payload, resp_offset, replica_count);
         if (replicas_result.is_error()) {
-            return Result<std::vector<BlockId>>::err(replicas_result.error());
+            return fail(replicas_result.error());
         }
         // Faza 12.3: trailing [u64 version] — always 1 for a freshly
         // allocated block (see docs/design.md §16, Master::handle_allocate_block).
         if (alloc_response.payload.size() != resp_offset + sizeof(uint64_t)) {
-            return Result<std::vector<BlockId>>::err(ErrorCode::INTERNAL_ERROR);
+            return fail(ErrorCode::INTERNAL_ERROR);
         }
         uint64_t block_version = get_u64(alloc_response.payload.data() + resp_offset);
         resp_offset += sizeof(uint64_t);
@@ -375,12 +426,26 @@ Result<std::vector<BlockId>> Client::write_new_blocks(const std::string& path, c
             write_chunk_to_replicas(block_id, /*offset=*/0, block_version, data + chunk_offset,
                                      chunk_len, replicas_result.value());
         if (write_err != ErrorCode::OK) {
-            return Result<std::vector<BlockId>>::err(write_err);
+            return fail(write_err);
         }
-
-        block_ids.push_back(block_id);
     }
     return Result<std::vector<BlockId>>::ok(std::move(block_ids));
+}
+
+void Client::abandon_blocks(const std::string& path, const std::vector<BlockId>& block_ids) {
+    if (block_ids.empty()) {
+        return;
+    }
+    // [u32 path_len][path][u32 block_count][block_count x u64 block_id]
+    std::vector<std::byte> payload;
+    put_string(payload, path);
+    put_u32(payload, static_cast<uint32_t>(block_ids.size()));
+    for (BlockId block_id : block_ids) {
+        put_u64(payload, block_id);
+    }
+    // Best-effort: the reply (or a transport failure) is deliberately
+    // ignored — the caller's operation already failed with its own error.
+    (void)call_master(Message{MessageType::ABANDON_BLOCKS, next_request_id(), std::move(payload)});
 }
 
 ErrorCode Client::write(const std::string& path, const std::vector<uint8_t>& data) {
@@ -430,10 +495,16 @@ ErrorCode Client::write_impl(const std::string& path, const std::vector<uint8_t>
 
     Message commit_request{MessageType::WRITE_COMMIT, next_request_id(), std::move(commit_payload)};
     auto commit_result = call_master(commit_request);
+    // Faza 18: a failed commit leaves every block of this attempt
+    // uncommitted — abandon them. Safe even if the commit actually landed
+    // and only its reply was lost: committed ids are no longer pending, so
+    // Master skips them.
     if (commit_result.is_error()) {
+        abandon_blocks(path, block_ids);
         return commit_result.error();
     }
     if (commit_result.value().type != MessageType::ACK) {
+        abandon_blocks(path, block_ids);
         return error_from_payload(commit_result.value().payload);
     }
 
@@ -581,10 +652,15 @@ ErrorCode Client::append_impl(const std::string& path, const std::vector<uint8_t
 
     Message commit_request{MessageType::APPEND_COMMIT, next_request_id(), std::move(commit_payload)};
     auto commit_result = call_master(commit_request);
+    // Faza 18: same cleanup as write()'s failed commit, for this append's
+    // new blocks. The fill into the existing last block can't be abandoned
+    // — that block belongs to the file.
     if (commit_result.is_error()) {
+        abandon_blocks(path, new_block_ids);
         return commit_result.error();
     }
     if (commit_result.value().type != MessageType::ACK) {
+        abandon_blocks(path, new_block_ids);
         return error_from_payload(commit_result.value().payload);
     }
 
